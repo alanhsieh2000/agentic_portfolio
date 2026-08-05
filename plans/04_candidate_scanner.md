@@ -83,10 +83,7 @@ Step 1 — implement `src/scanner/candidate_scanner.py` as described, then exerc
     from src.agents.llm_s_signals import screen as screen_s
     from src.agents.llm_f_signals import screen_month
     from src.scanner.candidate_scanner import scan_with_detail
-    import duckdb
-    con = duckdb.connect('data/portfolio.duckdb')
-    df = con.execute(\"select mve_z, bm_z, mom12m_z from factors where rebalance_date >= '2024-01-01' and rebalance_date < '2025-01-01'\").fetchdf()
-    rule = generate_rule(2024, df.describe().to_dict())
+    rule = generate_rule(2024)
     s_signals = screen_s(rule, date(2024, 3, 1))
     f_signals = screen_month(2024, 3)
     result = scan_with_detail(s_signals, f_signals)
