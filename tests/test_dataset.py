@@ -42,6 +42,7 @@ from src.dataset.sec_edgar import (
     select_book_equity_asof,
 )
 from src.dataset.momentum import compute_mom12m, compute_mom12m_column
+from src.dataset.returns import build_month_ticker_grid, compute_monthly_return, compute_monthly_return_column
 
 
 def _current_fixture() -> pd.DataFrame:
@@ -643,5 +644,64 @@ def test_compute_mom12m_column_returns_none_when_no_price_reaches_far_enough_bac
     )
 
     result = compute_mom12m_column(membership, prices)
+
+    assert result.iloc[0] is None
+
+
+def test_compute_monthly_return_matches_hand_computed_value():
+    # A stock at $110 at d, $100 one month before d: return is 110/100 - 1 = 0.10.
+    assert compute_monthly_return(110.0, 100.0) == pytest.approx(0.10)
+
+
+def test_compute_monthly_return_returns_none_when_a_price_is_missing_or_denominator_non_positive():
+    assert compute_monthly_return(None, 100.0) is None
+    assert compute_monthly_return(110.0, None) is None
+    assert compute_monthly_return(float("nan"), 100.0) is None
+    assert compute_monthly_return(110.0, 0.0) is None
+
+
+def test_build_month_ticker_grid_is_the_full_cross_product():
+    grid = build_month_ticker_grid(["AAA", "BBB"], [pd.Timestamp("2020-01-01"), pd.Timestamp("2020-02-01")])
+
+    assert len(grid) == 4
+    assert set(zip(grid["rebalance_date"], grid["ticker"])) == {
+        (pd.Timestamp("2020-01-01"), "AAA"),
+        (pd.Timestamp("2020-01-01"), "BBB"),
+        (pd.Timestamp("2020-02-01"), "AAA"),
+        (pd.Timestamp("2020-02-01"), "BBB"),
+    }
+
+
+def test_compute_monthly_return_column_uses_small_fixture_price_series_with_known_values():
+    """Feeds a small fixture price series with known values (per
+    plans/01_dataset.md's Validation and Acceptance section) — structurally
+    the same shape as the mom12m fixture test, anchored at a different pair
+    of dates: for month d=2020-02-01, the anchor price is at 2020-02-01
+    itself (not one month before, unlike mom12m), and the trailing-month
+    price is at 2020-01-01.
+    """
+    grid = pd.DataFrame({"rebalance_date": pd.to_datetime(["2020-02-01"]), "ticker": ["AAA"]})
+    prices = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-01", "2020-02-01"]),
+            "ticker": ["AAA", "AAA"],
+            "adj_close": [100.0, 110.0],
+        }
+    )
+
+    result = compute_monthly_return_column(grid, prices)
+
+    assert result.iloc[0] == pytest.approx(0.10)
+
+
+def test_compute_monthly_return_column_returns_none_for_the_first_month_in_a_wide_sequence():
+    """Mirrors the documented boundary case: the very first month of the
+    wide 112-month sequence always gets a null monthly_return, since there
+    is no priced month before it within the fetch window.
+    """
+    grid = pd.DataFrame({"rebalance_date": pd.to_datetime(["2015-01-01"]), "ticker": ["AAA"]})
+    prices = pd.DataFrame({"date": pd.to_datetime(["2015-01-02"]), "ticker": ["AAA"], "adj_close": [50.0]})
+
+    result = compute_monthly_return_column(grid, prices)
 
     assert result.iloc[0] is None
