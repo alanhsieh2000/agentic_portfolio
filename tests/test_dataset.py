@@ -1,4 +1,4 @@
-"""Tests for src/dataset/membership.py.
+"""Tests for src/dataset/membership.py and src/dataset/prices.py.
 
 Per AGENTS.md, no test here calls yfinance or fetches the live Wikipedia
 page; all inputs are hand-written in-memory fixtures.
@@ -12,6 +12,11 @@ from src.dataset.membership import (
     _locate_table,
     apply_changes_asof,
     compute_rebalance_dates,
+)
+from src.dataset.prices import (
+    detect_unresolved_tickers,
+    reshape_prices_long,
+    to_yfinance_symbol,
 )
 
 
@@ -110,3 +115,85 @@ def test_compute_rebalance_dates_returns_52_month_start_dates():
     assert len(dates) == 52
     assert dates[0] == pd.Timestamp("2020-01-01")
     assert dates[-1] == pd.Timestamp("2024-04-01")
+
+
+def test_to_yfinance_symbol_translates_dot_to_dash_for_share_classes():
+    assert to_yfinance_symbol("BRK.B") == "BRK-B"
+    assert to_yfinance_symbol("BF.B") == "BF-B"
+    assert to_yfinance_symbol("AAPL") == "AAPL"
+
+
+def _raw_prices_fixture() -> pd.DataFrame:
+    """Shaped like yfinance's real multi-ticker download() output with
+    auto_adjust=False: 2-level MultiIndex columns (field, symbol), field in
+    {'Close', 'Adj Close'}. GHOST is an unresolved ticker: yfinance returns
+    it as an all-NaN column (matching its empty_df() reindexed across the
+    batch's date range), not omitted from the result entirely.
+    """
+    dates = pd.to_datetime(["2020-01-02", "2020-01-03", "2020-01-06"])
+    columns = pd.MultiIndex.from_tuples(
+        [
+            ("Close", "AAPL"), ("Close", "BRK-B"), ("Close", "GHOST"),
+            ("Adj Close", "AAPL"), ("Adj Close", "BRK-B"), ("Adj Close", "GHOST"),
+        ],
+        names=["Price", "Ticker"],
+    )
+    data = [
+        [100.0, 200.0, float("nan"), 99.0, 199.0, float("nan")],
+        [101.0, 201.0, float("nan"), 100.0, 200.0, float("nan")],
+        [102.0, 202.0, float("nan"), 101.0, 201.0, float("nan")],
+    ]
+    df = pd.DataFrame(data, index=dates, columns=columns)
+    df.index.name = "Date"
+    return df
+
+
+def test_reshape_prices_long_produces_expected_long_format_and_drops_all_null_ticker():
+    raw = _raw_prices_fixture()
+    symbol_to_ticker = {"AAPL": "AAPL", "BRK-B": "BRK.B", "GHOST": "GHOST"}
+
+    long = reshape_prices_long(raw, symbol_to_ticker)
+
+    assert list(long.columns) == ["date", "ticker", "close", "adj_close"]
+    assert set(long["ticker"]) == {"AAPL", "BRK.B"}  # GHOST dropped: all-null
+
+    aapl = long[long["ticker"] == "AAPL"].sort_values("date")
+    assert list(aapl["close"]) == [100.0, 101.0, 102.0]
+    assert list(aapl["adj_close"]) == [99.0, 100.0, 101.0]
+    # BRK-B's dash symbol must be translated back to the dotted membership ticker.
+    assert "BRK-B" not in set(long["ticker"])
+    assert "BRK.B" in set(long["ticker"])
+
+
+def test_detect_unresolved_tickers_flags_ticker_with_all_null_prices():
+    all_tickers = ["AAPL", "BRK.B", "GHOST"]
+    long_prices = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-02", "2020-01-02"]),
+            "ticker": ["AAPL", "BRK.B"],
+            "close": [100.0, 200.0],
+            "adj_close": [99.0, 199.0],
+        }
+    )
+
+    unresolved = detect_unresolved_tickers(all_tickers, long_prices)
+
+    assert list(unresolved["ticker"]) == ["GHOST"]
+    assert unresolved.loc[0, "reason"]
+
+
+def test_detect_unresolved_tickers_returns_empty_typed_frame_when_all_resolved():
+    all_tickers = ["AAPL"]
+    long_prices = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-02"]),
+            "ticker": ["AAPL"],
+            "close": [1.0],
+            "adj_close": [1.0],
+        }
+    )
+
+    unresolved = detect_unresolved_tickers(all_tickers, long_prices)
+
+    assert unresolved.empty
+    assert list(unresolved.columns) == ["ticker", "reason"]
