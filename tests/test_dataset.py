@@ -1,5 +1,6 @@
 """Tests for src/dataset/membership.py, src/dataset/prices.py,
-src/dataset/fundamentals.py, and src/dataset/sec_edgar.py.
+src/dataset/fundamentals.py, src/dataset/sec_edgar.py, and
+src/dataset/momentum.py.
 
 Per AGENTS.md, no test here calls yfinance, fetches the live Wikipedia
 page, or calls SEC EDGAR; all inputs are hand-written in-memory fixtures.
@@ -30,7 +31,7 @@ from src.dataset.fundamentals import (
     cumulative_split_ratio_after,
     find_book_equity_row,
     most_recent_book_equity_before_lag,
-    most_recent_shares_on_or_before,
+    most_recent_value_on_or_before,
     select_book_equity,
 )
 from src.dataset.sec_edgar import (
@@ -40,6 +41,7 @@ from src.dataset.sec_edgar import (
     lookup_cik,
     select_book_equity_asof,
 )
+from src.dataset.momentum import compute_mom12m, compute_mom12m_column
 
 
 def _current_fixture() -> pd.DataFrame:
@@ -237,15 +239,15 @@ def test_cumulative_split_ratio_after_empty_series_returns_one():
     assert cumulative_split_ratio_after(pd.Series(dtype="float64"), "2020-01-01") == 1.0
 
 
-def test_most_recent_shares_on_or_before_dedupes_and_picks_nearest_prior():
+def test_most_recent_value_on_or_before_dedupes_and_picks_nearest_prior():
     shares = pd.Series(
         [4.0e9, 4.1e9, 4.3e9],
         index=pd.to_datetime(["2019-01-01", "2019-06-01", "2019-06-01"]).tz_localize("America/New_York"),
     )
 
     # Duplicate 2019-06-01 rows: keep-last means 4.3e9 wins.
-    assert most_recent_shares_on_or_before(shares, "2019-12-01") == pytest.approx(4.3e9)
-    assert most_recent_shares_on_or_before(shares, "2018-01-01") is None
+    assert most_recent_value_on_or_before(shares, "2019-12-01") == pytest.approx(4.3e9)
+    assert most_recent_value_on_or_before(shares, "2018-01-01") is None
 
 
 def test_compute_mve_reproduces_aapl_trillion_dollar_sanity_check():
@@ -594,3 +596,52 @@ def test_extract_book_equity_facts_from_company_facts_finds_populated_tag():
 def test_extract_book_equity_facts_from_company_facts_returns_empty_for_missing_tag():
     assert extract_book_equity_facts_from_company_facts({"facts": {"us-gaap": {}}}, "StockholdersEquity").empty
     assert extract_book_equity_facts_from_company_facts({}, "StockholdersEquity").empty
+
+
+def test_compute_mom12m_matches_hand_computed_value():
+    # A stock at $110 one month before d, $100 twelve months before d:
+    # cumulative return over the window is 110/100 - 1 = 0.10.
+    assert compute_mom12m(110.0, 100.0) == pytest.approx(0.10)
+
+
+def test_compute_mom12m_returns_none_when_a_price_is_missing_or_denominator_non_positive():
+    assert compute_mom12m(None, 100.0) is None
+    assert compute_mom12m(110.0, None) is None
+    assert compute_mom12m(float("nan"), 100.0) is None
+    assert compute_mom12m(110.0, 0.0) is None
+
+
+def test_compute_mom12m_column_uses_small_fixture_price_series_with_known_values():
+    """Feeds a small fixture price series with known values (per
+    plans/01_dataset.md's Validation and Acceptance section) and asserts
+    the computed mom12m matches a value computed by hand: for rebalance
+    date 2021-06-01, "1 month before" is 2021-05-01 (price 110) and "12
+    months before" is 2020-06-01 (price 100), giving mom12m = 0.10.
+    """
+    membership = pd.DataFrame(
+        {"rebalance_date": pd.to_datetime(["2021-06-01"]), "ticker": ["AAA"]}
+    )
+    prices = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-06-01", "2021-05-01", "2021-06-01"]),
+            "ticker": ["AAA", "AAA", "AAA"],
+            "adj_close": [100.0, 110.0, 999.0],  # 999.0 at d itself must never be used
+        }
+    )
+
+    result = compute_mom12m_column(membership, prices)
+
+    assert result.iloc[0] == pytest.approx(0.10)
+
+
+def test_compute_mom12m_column_returns_none_when_no_price_reaches_far_enough_back():
+    membership = pd.DataFrame(
+        {"rebalance_date": pd.to_datetime(["2020-01-01"]), "ticker": ["AAA"]}
+    )
+    prices = pd.DataFrame(
+        {"date": pd.to_datetime(["2019-12-15"]), "ticker": ["AAA"], "adj_close": [50.0]}
+    )
+
+    result = compute_mom12m_column(membership, prices)
+
+    assert result.iloc[0] is None

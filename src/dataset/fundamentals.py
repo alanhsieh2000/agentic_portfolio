@@ -139,14 +139,17 @@ def cumulative_split_ratio_after(splits: pd.Series, as_of) -> float:
     return float(splits.to_numpy()[mask].prod())
 
 
-def most_recent_shares_on_or_before(shares: pd.Series | None, as_of) -> float | None:
-    """Pick the most recent raw shares-outstanding value on or before `d`
-    from get_shares_full's raw series. Returns None if `shares` is empty or
-    every value in it postdates `as_of`. Defensively dedupes the index
-    (get_shares_full can return two rows for the same date with different
-    values) by keeping the last occurrence, then sorts before using
-    Series.asof, which itself returns NaN (not an error) when `as_of`
-    predates the earliest entry.
+def most_recent_value_on_or_before(shares: pd.Series | None, as_of) -> float | None:
+    """Pick the most recent value on or before `as_of` from a date-indexed
+    Series. Returns None if `shares` is empty or every value in it postdates
+    `as_of`. Defensively dedupes the index (get_shares_full can return two
+    rows for the same date with different values) by keeping the last
+    occurrence, then sorts before using Series.asof, which itself returns
+    NaN (not an error) when `as_of` predates the earliest entry.
+
+    Despite the parameter name (this function originated for shares
+    outstanding), the logic is fully generic for any date-indexed float
+    Series — reused as-is by src/dataset/momentum.py for price lookups.
     """
     if shares is None or shares.empty:
         return None
@@ -347,13 +350,25 @@ def attach_nearest_price(membership: pd.DataFrame, prices: pd.DataFrame) -> pd.D
     rebalance date, per ticker. Yields NaN (not an error) for a ticker with
     no price row on or before that rebalance date.
 
-    NOTE for future implementers of momentum.py/returns.py: if you need the
-    identical nearest-price-on-or-before-per-ticker join, reuse this
-    function rather than reimplementing it.
+    Returns a DataFrame indexed by `membership`'s ORIGINAL index labels
+    (pd.merge_asof itself resets to a fresh RangeIndex, verified live — this
+    reattaches `m`'s labels, which correspond 1:1 with the merged output's
+    row order since merge_asof keeps every left row exactly once, in order).
+    This matters when this function is called more than once against
+    differently-shifted copies of the same `membership` (e.g.
+    src/dataset/momentum.py calling it once for "1 month before" and once
+    for "12 months before" each rebalance date): the two results can then be
+    combined via ordinary pandas index-aligned arithmetic, without relying
+    on both calls happening to produce matching row order.
+
+    NOTE for future implementers of returns.py: reuse this function rather
+    than reimplementing the same nearest-price-on-or-before-per-ticker join.
     """
     m = membership.sort_values("rebalance_date")
     p = prices[["date", "ticker", "adj_close"]].sort_values("date")
-    return pd.merge_asof(m, p, left_on="rebalance_date", right_on="date", by="ticker", direction="backward")
+    merged = pd.merge_asof(m, p, left_on="rebalance_date", right_on="date", by="ticker", direction="backward")
+    merged.index = m.index
+    return merged
 
 
 def fetch_all_shares_and_splits(
@@ -480,7 +495,7 @@ def compute_market_cap_column(
     shares/splits lookup happens exactly once per row, here.
     """
     def _row_market_cap(row):
-        shares_raw = most_recent_shares_on_or_before(shares_by_ticker.get(row.ticker), row.rebalance_date)
+        shares_raw = most_recent_value_on_or_before(shares_by_ticker.get(row.ticker), row.rebalance_date)
         return compute_market_cap(row.adj_close, shares_raw, splits_by_ticker.get(row.ticker), row.rebalance_date)
 
     return merged.apply(_row_market_cap, axis=1)
