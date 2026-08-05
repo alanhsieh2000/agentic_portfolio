@@ -1,8 +1,11 @@
-"""Tests for src/dataset/membership.py and src/dataset/prices.py.
+"""Tests for src/dataset/membership.py, src/dataset/prices.py, and
+src/dataset/fundamentals.py.
 
 Per AGENTS.md, no test here calls yfinance or fetches the live Wikipedia
 page; all inputs are hand-written in-memory fixtures.
 """
+
+import math
 
 import pandas as pd
 import pytest
@@ -17,6 +20,12 @@ from src.dataset.prices import (
     detect_unresolved_tickers,
     reshape_prices_long,
     to_yfinance_symbol,
+)
+from src.dataset.fundamentals import (
+    add_cross_sectional_z,
+    compute_mve,
+    cumulative_split_ratio_after,
+    most_recent_shares_on_or_before,
 )
 
 
@@ -197,3 +206,83 @@ def test_detect_unresolved_tickers_returns_empty_typed_frame_when_all_resolved()
 
     assert unresolved.empty
     assert list(unresolved.columns) == ["ticker", "reason"]
+
+
+def test_cumulative_split_ratio_after_multiplies_only_splits_strictly_after_as_of():
+    splits = pd.Series(
+        [2.0, 4.0, 10.0],
+        index=pd.to_datetime(["2010-06-01", "2020-08-31", "2024-06-10"]).tz_localize("America/New_York"),
+    )
+
+    assert cumulative_split_ratio_after(splits, "2009-01-01") == pytest.approx(2.0 * 4.0 * 10.0)
+    assert cumulative_split_ratio_after(splits, "2015-01-01") == pytest.approx(4.0 * 10.0)
+    assert cumulative_split_ratio_after(splits, "2021-01-01") == pytest.approx(10.0)
+    assert cumulative_split_ratio_after(splits, "2025-01-01") == pytest.approx(1.0)
+
+
+def test_cumulative_split_ratio_after_empty_series_returns_one():
+    assert cumulative_split_ratio_after(pd.Series(dtype="float64"), "2020-01-01") == 1.0
+
+
+def test_most_recent_shares_on_or_before_dedupes_and_picks_nearest_prior():
+    shares = pd.Series(
+        [4.0e9, 4.1e9, 4.3e9],
+        index=pd.to_datetime(["2019-01-01", "2019-06-01", "2019-06-01"]).tz_localize("America/New_York"),
+    )
+
+    # Duplicate 2019-06-01 rows: keep-last means 4.3e9 wins.
+    assert most_recent_shares_on_or_before(shares, "2019-12-01") == pytest.approx(4.3e9)
+    assert most_recent_shares_on_or_before(shares, "2018-01-01") is None
+
+
+def test_compute_mve_reproduces_aapl_trillion_dollar_sanity_check():
+    """Fixture mirrors the real AAPL scenario: a raw shares count from
+    before the 2020-08-31 4-for-1 split, a split-adjusted price from the
+    prices table for the same pre-split date, and one split after `as_of`.
+    """
+    price = 75.087502  # real 2020-01-02 adj_close-basis value
+    shares_raw = 4.275e9  # real pre-split raw shares outstanding
+    splits = pd.Series([4.0], index=pd.to_datetime(["2020-08-31"]).tz_localize("America/New_York"))
+    as_of = "2020-01-02"
+
+    mve = compute_mve(price, shares_raw, splits, as_of)
+
+    expected = math.log(price * shares_raw * 4.0)
+    assert mve == pytest.approx(expected)
+    market_cap = math.exp(mve)
+    assert 1.2e12 < market_cap < 1.4e12  # ~$1.284T, matching AAPL's real Jan 2020 market cap
+
+
+def test_compute_mve_returns_none_when_price_or_shares_missing():
+    assert compute_mve(None, 4.0e9, pd.Series(dtype="float64"), "2020-01-01") is None
+    assert compute_mve(75.0, None, pd.Series(dtype="float64"), "2020-01-01") is None
+    assert compute_mve(float("nan"), 4.0e9, pd.Series(dtype="float64"), "2020-01-01") is None
+
+
+def test_add_cross_sectional_z_has_mean_zero_and_variance_one():
+    df = pd.DataFrame(
+        {
+            "rebalance_date": pd.to_datetime(["2020-01-01"] * 4),
+            "ticker": ["AAA", "BBB", "CCC", "DDD"],
+            "mve": [20.0, 22.0, 24.0, 26.0],
+        }
+    )
+
+    result = add_cross_sectional_z(df, "mve", "mve_z")
+
+    assert result["mve_z"].mean() == pytest.approx(0.0, abs=1e-9)
+    assert result["mve_z"].var(ddof=1) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_add_cross_sectional_z_masks_zero_std_group_instead_of_producing_inf():
+    df = pd.DataFrame(
+        {
+            "rebalance_date": pd.to_datetime(["2020-01-01", "2020-01-01"]),
+            "ticker": ["AAA", "BBB"],
+            "mve": [20.0, 20.0],  # identical -> std == 0
+        }
+    )
+
+    result = add_cross_sectional_z(df, "mve", "mve_z")
+
+    assert result["mve_z"].isna().all()
