@@ -1,0 +1,41 @@
+strategy_task:
+  description: >
+    Develop systematic BUY/HOLD/SELL rules for S&P 500 firms at {as_of_date}.
+
+    Available characteristics (all are z-scores):
+    - mve: log firm size
+    - bm: log book-to-market (value)
+    - mom12m: 12-month momentum
+
+    Your process:
+    1. Get database schema and understand available data for {as_of_date}
+    2. Explore extreme values for each characteristic
+    3. Look for patterns and correlations
+    4. Use test_complex_condition to test different rule combinations
+    5. Develop systematic rules with specific z-score thresholds
+
+    You have COMPLETE FLEXIBILITY in creating rules. Test different combinations using AND,
+    OR, NOT.
+
+    CRITICAL: Your output must be EXPLICIT RULES with exact thresholds that can be
+    implemented in Python/pandas. You must give PRECISE THRESHOLDS - do not give thresholds
+    that are only nice or round numbers. Further, use causal masking from {as_of_date} to
+    prevent any look-ahead bias.
+
+    Focus on:
+    - Economic intuition (value, momentum, size effects)
+    - Clear, implementable thresholds
+    - Balance between signal strength and diversification
+    - Rules that make sense for ~500 firms
+
+    Output systematic rules that I can directly implement in code.
+  expected_output: >
+    Complete strategy document with:
+    1. Data exploration summary
+    2. Explicit BUY rule with z-score thresholds
+    3. Explicit SELL rule with z-score thresholds
+    4. HOLD rule (default case)
+    5. Economic rationale for each rule
+
+    Rules must be deterministic and implementable.
+  agent: strategy_agent
