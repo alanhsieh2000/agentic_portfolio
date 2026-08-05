@@ -12,3 +12,4 @@ pre-codex.sh
 .claude
 data/
 run.sh
+.pytest_cache
