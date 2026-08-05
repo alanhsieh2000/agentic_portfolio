@@ -1,0 +1,14 @@
+.env
+__pycache__/
+lib/
+.DS_Store
+.agents
+.devcontainer
+skills-lock.json
+output/
+.codex
+pre-claude.sh
+pre-codex.sh
+.claude
+data/
+run.sh
