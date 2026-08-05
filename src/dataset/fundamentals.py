@@ -29,6 +29,17 @@ of this project's 52 rebalance dates could ever satisfy the required
 project's date range; only balance_sheet (annual) ever does, and only for
 tickers/dates late enough in the window. See select_book_equity() and
 most_recent_book_equity_before_lag().
+
+Because that yfinance-based path leaves `bm` null for essentially all of
+2020-2021, `build_factors` tries src/dataset/sec_edgar.py's SEC EDGAR-based
+book equity FIRST for every ticker (deeper history, and a precise real
+`filed` date rather than a 3-month approximation), falling back to the
+yfinance-based `select_book_equity` path above only for tickers where SEC
+coverage is missing or doesn't reach this project's rebalance window (see
+sec_edgar.has_sufficient_coverage — this correctly catches, e.g., XOM's
+current ticker->CIK mapping pointing to a newly-formed successor entity
+with no pre-2025 filings, verified live and documented in
+plans/01_dataset.md).
 """
 
 from __future__ import annotations
@@ -42,6 +53,7 @@ import duckdb
 import pandas as pd
 import yfinance as yf
 
+from src.dataset import sec_edgar
 from src.dataset.membership import DEFAULT_DB_PATH
 from src.dataset.prices import DEFAULT_END, DEFAULT_START, to_yfinance_symbol
 
@@ -484,23 +496,36 @@ def compute_bm_column(
     market_cap: pd.Series,
     quarterly_bs_by_ticker: dict[str, pd.DataFrame],
     annual_bs_by_ticker: dict[str, pd.DataFrame],
+    sec_book_equity_by_ticker: dict[str, pd.DataFrame] | None = None,
     lag_months: int = 3,
 ) -> pd.Series:
     """Row-wise bm = book_equity / market_cap[row]. book_equity is looked
-    up once per row via select_book_equity; market_cap is reused from
-    compute_market_cap_column's already-computed Series, aligned by
-    position with `merged`, rather than recomputed.
+    up once per row; market_cap is reused from compute_market_cap_column's
+    already-computed Series, aligned by position with `merged`, rather than
+    recomputed.
+
+    If `sec_book_equity_by_ticker` has an entry for a row's ticker, that
+    ticker uses sec_edgar.select_book_equity_asof for EVERY row (a
+    whole-ticker decision, not mixed row-by-row within one ticker's
+    timeline, so SEC's precise filed-date timing is never inconsistently
+    blended with yfinance's 3-month approximation for the same ticker).
+    Otherwise falls through to the existing select_book_equity path.
     """
-    book_equity = merged.apply(
-        lambda row: select_book_equity(
+    sec_book_equity_by_ticker = sec_book_equity_by_ticker or {}
+
+    def _row_book_equity(row):
+        sec_facts = sec_book_equity_by_ticker.get(row.ticker)
+        if sec_facts is not None:
+            return sec_edgar.select_book_equity_asof(sec_facts, row.rebalance_date)
+        return select_book_equity(
             quarterly_bs_by_ticker.get(row.ticker, pd.DataFrame()),
             annual_bs_by_ticker.get(row.ticker, pd.DataFrame()),
             row.rebalance_date,
             row.ticker,
             lag_months,
-        ),
-        axis=1,
-    )
+        )
+
+    book_equity = merged.apply(_row_book_equity, axis=1)
     return pd.Series(
         [
             None if be is None or pd.isna(be) or mc is None or pd.isna(mc) else be / mc
@@ -567,6 +592,30 @@ def write_factors_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> Non
         con.close()
 
 
+def write_sec_fallback_table(reasons_by_ticker: dict[str, str], db_path: str = DEFAULT_DB_PATH) -> None:
+    """Write `sec_fallback_tickers(ticker VARCHAR, reason VARCHAR)` — every
+    ticker for which SEC EDGAR coverage was missing or insufficient and
+    `bm` fell back to the yfinance-based path. Mirrors prices.py's
+    `unresolved_tickers` schema and idempotent DROP-and-recreate pattern,
+    for the same reason: make the gap visible and auditable, not hidden.
+    """
+    df = pd.DataFrame(
+        {"ticker": list(reasons_by_ticker.keys()), "reason": list(reasons_by_ticker.values())}
+    )
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(db_path)
+    try:
+        con.register("sec_fallback_df", df)
+        con.execute("DROP TABLE IF EXISTS sec_fallback_tickers")
+        con.execute(
+            "CREATE TABLE sec_fallback_tickers AS "
+            "SELECT ticker::VARCHAR AS ticker, reason::VARCHAR AS reason FROM sec_fallback_df"
+        )
+        con.unregister("sec_fallback_df")
+    finally:
+        con.close()
+
+
 def build_factors(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     """Fetch, join, compute mve and bm, standardize both, write to DuckDB,
     and return the resulting factors DataFrame (mom12m/mom12m_z still
@@ -577,6 +626,14 @@ def build_factors(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     unresolved = load_unresolved_tickers(db_path)
 
     fetchable = sorted(set(membership["ticker"]) - unresolved)
+    latest_rebalance_date = membership["rebalance_date"].max()
+
+    cik_map = sec_edgar.fetch_cik_map()
+    sec_book_equity_by_ticker, sec_fallback_reasons = sec_edgar.fetch_all_sec_book_equity(
+        fetchable, cik_map, latest_rebalance_date
+    )
+    write_sec_fallback_table(sec_fallback_reasons, db_path)
+
     shares_by_ticker, splits_by_ticker, quarterly_bs_by_ticker, annual_bs_by_ticker = (
         fetch_all_ticker_fundamentals(fetchable)
     )
@@ -584,7 +641,9 @@ def build_factors(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     merged = attach_nearest_price(membership, prices)
     market_cap = compute_market_cap_column(merged, shares_by_ticker, splits_by_ticker)
     merged["mve"] = compute_mve_column(market_cap)
-    merged["bm"] = compute_bm_column(merged, market_cap, quarterly_bs_by_ticker, annual_bs_by_ticker)
+    merged["bm"] = compute_bm_column(
+        merged, market_cap, quarterly_bs_by_ticker, annual_bs_by_ticker, sec_book_equity_by_ticker
+    )
     merged["mom12m"] = None
     merged = add_cross_sectional_z(merged, "mve", "mve_z")
     merged = add_cross_sectional_z(merged, "bm", "bm_z")
@@ -593,11 +652,14 @@ def build_factors(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     factors = merged[["rebalance_date", "ticker", "mve", "bm", "mom12m", "mve_z", "bm_z", "mom12m_z"]]
     write_factors_table(factors, db_path)
     logger.info(
-        "wrote %d rows to %s::factors (mve populated for %d rows; bm populated for %d rows; mom12m pending)",
+        "wrote %d rows to %s::factors (mve populated for %d rows; bm populated for %d rows via SEC for %d "
+        "tickers, %d fell back to yfinance; mom12m pending)",
         len(factors),
         db_path,
         factors["mve"].notna().sum(),
         factors["bm"].notna().sum(),
+        len(sec_book_equity_by_ticker),
+        len(sec_fallback_reasons),
     )
     return factors
 

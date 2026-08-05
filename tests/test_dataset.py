@@ -1,8 +1,8 @@
-"""Tests for src/dataset/membership.py, src/dataset/prices.py, and
-src/dataset/fundamentals.py.
+"""Tests for src/dataset/membership.py, src/dataset/prices.py,
+src/dataset/fundamentals.py, and src/dataset/sec_edgar.py.
 
-Per AGENTS.md, no test here calls yfinance or fetches the live Wikipedia
-page; all inputs are hand-written in-memory fixtures.
+Per AGENTS.md, no test here calls yfinance, fetches the live Wikipedia
+page, or calls SEC EDGAR; all inputs are hand-written in-memory fixtures.
 """
 
 import math
@@ -32,6 +32,13 @@ from src.dataset.fundamentals import (
     most_recent_book_equity_before_lag,
     most_recent_shares_on_or_before,
     select_book_equity,
+)
+from src.dataset.sec_edgar import (
+    dedupe_to_earliest_filed,
+    extract_book_equity_facts_from_company_facts,
+    has_sufficient_coverage,
+    lookup_cik,
+    select_book_equity_asof,
 )
 
 
@@ -422,3 +429,168 @@ def test_compute_market_cap_and_compute_mve_agree():
 
     assert market_cap is not None
     assert mve == pytest.approx(math.log(market_cap))
+
+
+def test_lookup_cik_finds_known_ticker_and_returns_none_for_unknown():
+    cik_map = {"AAPL": 320193, "BRK-B": 1067983}
+
+    assert lookup_cik("AAPL", cik_map) == 320193
+    assert lookup_cik("BRK.B", cik_map) == 1067983  # dot translated to dash before lookup
+    assert lookup_cik("TWTR", cik_map) is None
+
+
+def _facts_fixture(rows: list[tuple[str, float, str]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "end": pd.to_datetime([r[0] for r in rows]),
+            "val": [r[1] for r in rows],
+            "filed": pd.to_datetime([r[2] for r in rows]),
+        }
+    )
+
+
+def test_dedupe_to_earliest_filed_keeps_earliest_filed_per_end_val():
+    """Mirrors AAPL's real verified shape: the same (end, val) fact appears
+    under multiple later filings' comparative restatements.
+    """
+    facts = _facts_fixture(
+        [
+            ("2020-03-28", 78_425_000_000.0, "2020-07-31"),
+            ("2020-03-28", 78_425_000_000.0, "2020-05-01"),
+            ("2020-03-28", 78_425_000_000.0, "2021-04-29"),
+        ]
+    )
+
+    deduped = dedupe_to_earliest_filed(facts)
+
+    assert len(deduped) == 1
+    assert deduped.iloc[0]["filed"] == pd.Timestamp("2020-05-01")
+
+
+def test_dedupe_to_earliest_filed_keeps_distinct_rows_for_true_restatements():
+    facts = _facts_fixture(
+        [
+            ("2007-09-29", 100.0, "2007-11-15"),
+            ("2007-09-29", 95.0, "2008-11-15"),  # genuine restatement: different val, same end
+        ]
+    )
+
+    deduped = dedupe_to_earliest_filed(facts)
+
+    assert len(deduped) == 2
+    assert set(deduped["val"]) == {100.0, 95.0}
+
+
+def test_dedupe_to_earliest_filed_returns_empty_for_empty_input():
+    empty = pd.DataFrame(columns=["end", "val", "filed"])
+    deduped = dedupe_to_earliest_filed(empty)
+    assert deduped.empty
+
+
+def test_select_book_equity_asof_picks_latest_end_with_filed_on_or_before_as_of():
+    facts = _facts_fixture(
+        [
+            ("2019-09-28", 90_000_000_000.0, "2019-10-31"),
+            ("2020-03-28", 78_425_000_000.0, "2020-05-01"),
+        ]
+    )
+
+    value = select_book_equity_asof(facts, "2020-06-01")
+
+    assert value == pytest.approx(78_425_000_000.0)
+
+
+def test_select_book_equity_asof_returns_none_when_no_fact_filed_on_or_before_as_of():
+    facts = _facts_fixture([("2020-03-28", 78_425_000_000.0, "2020-05-01")])
+
+    value = select_book_equity_asof(facts, "2020-04-01")
+
+    assert value is None
+
+
+def test_select_book_equity_asof_tie_breaks_restated_same_end_by_latest_filed_still_eligible():
+    facts = _facts_fixture(
+        [
+            ("2007-09-29", 100.0, "2007-11-15"),
+            ("2007-09-29", 95.0, "2008-11-15"),  # restatement, filed later
+        ]
+    )
+
+    assert select_book_equity_asof(facts, "2008-01-01") == pytest.approx(100.0)  # only the original is eligible yet
+    assert select_book_equity_asof(facts, "2009-01-01") == pytest.approx(95.0)  # restatement now eligible, wins tie
+
+
+def test_has_sufficient_coverage_true_when_earliest_end_predates_latest_rebalance():
+    facts = _facts_fixture([("2019-09-28", 90_000_000_000.0, "2019-10-31")])
+    assert has_sufficient_coverage(facts, "2024-04-01") is True
+
+
+def test_has_sufficient_coverage_false_for_entity_succession_fixture():
+    """Mirrors the verified live XOM case: the resolved CIK's only facts
+    postdate this project's latest rebalance date entirely.
+    """
+    facts = _facts_fixture(
+        [
+            ("2025-12-31", 259_386_000_000.0, "2026-02-01"),
+            ("2026-06-30", 263_000_000_000.0, "2026-08-01"),
+        ]
+    )
+
+    assert has_sufficient_coverage(facts, "2024-04-01") is False
+
+
+def test_has_sufficient_coverage_false_for_empty_facts():
+    assert has_sufficient_coverage(pd.DataFrame(columns=["end", "val", "filed"]), "2024-04-01") is False
+
+
+def test_compute_bm_via_sec_facts_reproduces_aapl_2020_03_28_figure():
+    """End-to-end-style test closing the coverage gap: AAPL's real,
+    verified SEC-reported stockholders' equity for fiscal Q2 2020
+    ($78.425B, filed 2020-05-01) combined with the same price/shares/splits
+    fixture used by test_compute_mve_reproduces_aapl_trillion_dollar_sanity_check
+    should now produce a non-null bm for a 2020 rebalance date -- something
+    the yfinance-only path never could (verified live: yfinance's balance
+    sheet data starts no earlier than ~2021-2022).
+    """
+    price = 75.087502
+    shares_raw = 4.275e9
+    splits = pd.Series([4.0], index=pd.to_datetime(["2020-08-31"]).tz_localize("America/New_York"))
+    as_of = "2020-06-01"
+    facts = _facts_fixture([("2020-03-28", 78_425_000_000.0, "2020-05-01")])
+
+    book_equity = select_book_equity_asof(facts, as_of)
+    bm = compute_bm(book_equity, price, shares_raw, splits, as_of)
+
+    assert book_equity is not None
+    assert bm is not None
+    assert 0.0 < bm < 1.0
+
+
+def test_extract_book_equity_facts_from_company_facts_finds_populated_tag():
+    """Mirrors the verified live Abbott Laboratories case: companyconcept
+    returned zero facts for StockholdersEquity, but the bulk companyfacts
+    blob has real data for the exact same tag.
+    """
+    company_facts = {
+        "facts": {
+            "us-gaap": {
+                "StockholdersEquity": {
+                    "units": {
+                        "USD": [
+                            {"end": "2019-12-31", "val": 17_778_540_000, "filed": "2020-02-19", "form": "10-K", "accn": "x"},
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    facts = extract_book_equity_facts_from_company_facts(company_facts, "StockholdersEquity")
+
+    assert len(facts) == 1
+    assert facts.iloc[0]["val"] == 17_778_540_000
+
+
+def test_extract_book_equity_facts_from_company_facts_returns_empty_for_missing_tag():
+    assert extract_book_equity_facts_from_company_facts({"facts": {"us-gaap": {}}}, "StockholdersEquity").empty
+    assert extract_book_equity_facts_from_company_facts({}, "StockholdersEquity").empty
