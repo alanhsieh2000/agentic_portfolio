@@ -16,7 +16,7 @@ We are reproducing the dataset construction described in the paper "Designing Ag
 ## Progress
 
 
-- [ ] Prototype: confirm what history `yfinance` actually returns for shares-outstanding and balance-sheet fields, for a small sample of tickers, back to 2020.
+- [x] Prototype: confirm what history `yfinance` actually returns for shares-outstanding and balance-sheet fields, for a small sample of tickers, back to 2020.
 - [ ] Build the point-in-time S&P 500 membership reconstruction from Wikipedia.
 - [ ] Build the daily price history cache for every ticker that was ever a member in the window.
 - [ ] Compute `mve` (log market value of equity) per ticker per rebalance date.
@@ -31,7 +31,15 @@ We are reproducing the dataset construction described in the paper "Designing Ag
 ## Surprises & Discoveries
 
 
-(Empty until the prototyping milestone runs. Record here, with evidence, anything unexpected about what `yfinance` actually returns — for example, if `get_shares_full` does not go back to 2020 for some tickers, or if `balance_sheet` only exposes 4 years of annual history, both of which would directly limit what `mve` and `bm` can be computed for.)
+Prototype run (Concrete Steps Step 1, expanded to 4 large-cap tickers — AAPL, MSFT, XOM, GE — since a single ticker was not enough to tell a systematic API limitation from a ticker-specific gap), run 2026-08-05:
+
+`get_shares_full(start='2015-01-01', end='2024-04-30')` behaves as expected: it honors the `end` argument and returns a real historical series reaching back to 2015-2016 for all four tickers checked (AAPL: 289 rows, 2015-10-28 to 2024-04-27; MSFT: 425 rows, 2015-10-23 to 2024-04-30; XOM: 359 rows, 2015-11-04 to 2024-04-30; GE: 336 rows, 2015-11-20 to 2024-04-30). `mve` should be computable across the full 2020-2024 rebalance window for large-cap tickers on the shares-outstanding side.
+
+`Ticker.balance_sheet` and `Ticker.quarterly_balance_sheet` do **not** behave like `get_shares_full` — they take no `start`/`end` arguments at all, and both return only a short rolling window trailing from **today's real-world date**, not from any date this plan cares about. In this environment (system date 2026-08-05), `quarterly_balance_sheet` returned only 7 quarterly columns for every ticker tested, the oldest being `2024-12-31` (AAPL, MSFT, GE) or `2024-12-31` (XOM); `balance_sheet` (annual) returned only 4-5 columns, the oldest being `2021-09-30` (AAPL), `2022-06-30` (MSFT), `2022-12-31` (XOM), or `2021-12-31` (GE). Concretely: **`yfinance` currently exposes no balance-sheet data at all — quarterly or annual — for any rebalance date before roughly late 2021**, and only annual (not quarterly) data for 2022-2023 dates. This directly contradicts this plan's Step 1 expectation ("`bs.columns` should print roughly 4 to 5 quarterly report dates" spanning the years this plan needs); the columns exist, but they are the *wrong* years for a plan whose rebalance window starts 2020-01-01.
+
+Consequence for `bm`: applying the "period ended at least three months before `d`" rule from `fundamentals.py`'s design, `bm` will be null for essentially every ticker on every rebalance date from 2020-01-01 through late 2021, and null for quarterly-lag precision (falling back to annual, coarser figures) through 2023. This is not a bug to fix in code — the plan already keeps nulls rather than imputing them — but it is a real, structural gap in how much of the 2020-2024 window this substitute data source can honestly cover for `bm`, and it should be called out explicitly wherever this project's README or later plans describe how faithfully the free-data pipeline reproduces the paper's CRSP/Compustat-backed factors. The line item for `bm` coverage should say "sparse-to-absent for 2020-2021" rather than implying full coverage.
+
+The good news: the balance-sheet equity line item itself is easy to find across all four tickers — `Common Stock Equity` and `Stockholders Equity` (among others: `Total Equity Gross Minority Interest`, `Other Equity Adjustments`) both appear consistently, so `fundamentals.py`'s alias list does not need to be large, just correctly ordered by preference.
 
 
 ## Decision Log
