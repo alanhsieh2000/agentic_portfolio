@@ -16,7 +16,7 @@ The paper reruns its fundamentals agent once per year, on the theory that broad 
 ## Progress
 
 
-- [ ] Define the Pydantic schema for LLM-S's output (a rule, plus its rationale), using the paper's own variable names (`mve`, `bm`, `mom12m`) rather than a `_z`-suffixed naming scheme.
+- [x] (2026-08-05) Define the Pydantic schema for LLM-S's output (a rule, plus its rationale), using the paper's own variable names (`mve`, `bm`, `mom12m`) rather than a `_z`-suffixed naming scheme. Implemented in `src/agents/llm_s_schema.py`: `ScreeningRule(year: int, buy_condition: str, sell_condition: str, rationale: str)`. Verified end-to-end: constructing a `ScreeningRule` with a sample buy/sell condition round-trips through `.model_dump()` correctly.
 - [ ] Write the shared, restricted condition evaluator (`src/agents/condition_eval.py`) that both rule-application and the `test_complex_condition` tool use, so what the agent tests during exploration has identical semantics to what runs in production.
 - [ ] Write the `agents.yaml`/`tasks.yaml` config and `LLMSCrew` class (CrewAI's `@CrewBase` pattern), using the paper's verbatim role/goal/backstory/description/expected_output text (Appendix C.5 of arXiv:2603.23300v1), parameterized only by `{as_of_date}`.
 - [ ] Implement the 4 tools the paper's Task attaches (`get_database_schema`, `query_firm_database`, `get_extreme_firms`, `test_complex_condition`), scoped to a single causally-masked snapshot date per crew invocation.
