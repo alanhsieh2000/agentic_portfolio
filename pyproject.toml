@@ -24,3 +24,6 @@ dependencies = [
     "stockstats>=0.6.8",
     "yfinance>=1.3.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

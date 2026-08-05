@@ -17,7 +17,7 @@ We are reproducing the dataset construction described in the paper "Designing Ag
 
 
 - [x] Prototype: confirm what history `yfinance` actually returns for shares-outstanding and balance-sheet fields, for a small sample of tickers, back to 2020.
-- [ ] Build the point-in-time S&P 500 membership reconstruction from Wikipedia.
+- [x] (2026-08-05) Build the point-in-time S&P 500 membership reconstruction from Wikipedia. Implemented in `src/dataset/membership.py`, table `sp500_membership` written to `data/portfolio.duckdb` (26,268 rows across 52 rebalance dates). Verified end-to-end: TSLA absent from the 2020-12-01 rebalance date, present from 2021-01-01, matching its real 2020-12-21 addition to the index.
 - [ ] Build the daily price history cache for every ticker that was ever a member in the window.
 - [ ] Compute `mve` (log market value of equity) per ticker per rebalance date.
 - [ ] Compute `bm` (book-to-market ratio) per ticker per rebalance date.
@@ -41,6 +41,8 @@ Consequence for `bm`: applying the "period ended at least three months before `d
 
 The good news: the balance-sheet equity line item itself is easy to find across all four tickers — `Common Stock Equity` and `Stockholders Equity` (among others: `Total Equity Gross Minority Interest`, `Other Equity Adjustments`) both appear consistently, so `fundamentals.py`'s alias list does not need to be large, just correctly ordered by preference.
 
+Membership reconstruction, run 2026-08-05: `pandas.read_html` on the live Wikipedia page returns 3 tables today (current constituents, the changes table, and an irrelevant `vte` navbox table), not 2 as this plan's prose originally implied — column-name matching (not table index) correctly skips the navbox. The changes table's columns parse as a 2-level MultiIndex, and its date column is literally named "Effective Date", not "Date" as this plan's Plan of Work section paraphrases it — `_locate_table`/`_normalize_changes_table` in `src/dataset/membership.py` match on substrings ("date") rather than exact names for exactly this reason. Missing sides of a change row (e.g. a row that only adds a ticker, with no corresponding removal) parse as float `NaN`, not empty string, so the backward-walk code checks with `pd.notna` rather than truthiness. `src/`, `tests/` had no `__init__.py` files and `pyproject.toml` had no `[tool.pytest.ini_options]` section — since this is the first code in the repository, `uv run pytest tests/test_dataset.py` could not have resolved `from src.dataset import membership` without adding `pythonpath = ["."]` under `[tool.pytest.ini_options]`; this is now in place for every future test file in the repo, not just this one.
+
 
 ## Decision Log
 
@@ -57,6 +59,9 @@ The good news: the balance-sheet equity line item itself is easy to find across 
 - Decision: persist a `returns` table — one row per ticker per rebalance date, holding that ticker's realized return over the trailing month ending at that date — as part of this plan's output, rather than leaving "what did ticker X return in month Y" to be recomputed wherever it is needed.
   Rationale: plan 5's optimizer (`plans/05_optimizer_and_allocation.md`) needs monthly returns, not daily prices, to compute expected returns and a covariance matrix at the same monthly frequency this project rebalances at, and plan 6's backtest runner (`plans/06_interactive_flow.md`) needs the realized next-month return per candidate to score each month's chosen weights. The user explicitly asked whether this data would be stored once, shared by both consumers, rather than derived twice independently, and chose the shared-table approach when asked.
   Date/Author: 2026-08-05, decided by repository owner during a plan-review follow-up question; plan author.
+- Decision: add `[tool.pytest.ini_options]` with `pythonpath = ["."]` to `pyproject.toml`, and empty `src/__init__.py` / `src/dataset/__init__.py` files, alongside implementing `src/dataset/membership.py`.
+  Rationale: this is the first code written anywhere in the repository; without the repo root on `sys.path`, `uv run pytest tests/test_dataset.py` cannot resolve `from src.dataset import membership`. This is a one-time fix that benefits every later plan's test file, not something specific to membership reconstruction.
+  Date/Author: 2026-08-05, plan author, discovered while implementing this plan's first Progress item.
 
 
 ## Outcomes & Retrospective
