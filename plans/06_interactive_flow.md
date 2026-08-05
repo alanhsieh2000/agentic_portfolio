@@ -1,0 +1,146 @@
+# Build the interactive orchestration flow
+
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This plan must be maintained in accordance with `PLANS.md` at the repository root. This plan builds on all five prior plans, each checked into this repository: `plans/01_dataset.md` (factor and price data), `plans/02_llm_s_agent.md` and `plans/03_llm_f_agent.md` (the two screening agents), `plans/04_candidate_scanner.md` (consensus logic), and `plans/05_optimizer_and_allocation.md` (weights and share allocation). This plan is the last piece: it runs all of the above together and lets a person steer the result interactively.
+
+
+## Purpose / Big Picture
+
+
+After this plan is done, a person can run one command and step through the whole pipeline this project builds, end to end, for a date of their choosing: see which stocks LLM-S and LLM-F each flagged, see the consensus candidate list the scanner produced from those two signals, see the resulting portfolio weights and share allocation under whichever of GMV, MV, or MSR they pick, and then — this is the part `README.md` specifically calls for — add or remove tickers from that candidate list by typing a request, and immediately see the weights and allocation recomputed for the edited list. The same command works two ways: pointed at a historical rebalance date within 2020-01-01 to 2024-04-30 (backtest mode, letting a person watch the paper's whole evaluation window play out and compare against the paper's own reported Sharpe ratios), or pointed at today (live mode, producing an actual current portfolio recommendation using live data).
+
+
+## Progress
+
+
+- [ ] Confirm the installed CrewAI version's current pattern for building an interactive, multi-turn flow (a CrewAI `Flow`, `@human_feedback`, or a plain Python loop calling this project's existing functions directly — decided in this plan's Concrete Steps, not assumed here).
+- [ ] Implement backtest mode: given a rebalance date in the 2020-2024 window, run LLM-S, LLM-F, the scanner, and the optimizer in sequence and display the results.
+- [ ] Implement live mode: same pipeline, but for the current date, using a freshly-fetched current S&P 500 membership snapshot rather than a stored historical one.
+- [ ] Implement the interactive candidate-editing loop: let the user add/remove tickers from the scanner's output and re-run the optimizer and allocation on the edited list.
+- [ ] Implement a simple month-over-month backtest runner that chains monthly rebalances across the full 2020-2024 window and reports the realized Sharpe ratio, for comparison against the paper's own S&P 500 baseline figure of 0.6324 over the same period.
+- [ ] Write `tests/test_interactive_flow.py` covering the candidate-editing logic and the Sharpe-ratio calculation against fixtures.
+- [ ] Manually run both backtest mode and live mode end to end at least once each.
+
+
+## Surprises & Discoveries
+
+
+(Empty until this plan is implemented. Record here whatever the CrewAI version check in Concrete Steps Step 1 reveals about the best available interactive-flow mechanism, and, once the full-window backtest runner is implemented, the actual realized Sharpe ratio this project's simplified pipeline achieves compared to the paper's reported 0.6324 S&P 500 baseline and its own screened-portfolio results — a large gap either direction is worth understanding, given the fidelity gaps already recorded in plans 1, 3, and 5, namely survivorship-adjusted-but-otherwise-approximate factor data, thin historical news coverage, and PyPortfolioOpt's simpler covariance estimators in place of the paper's five custom ones.)
+
+
+## Decision Log
+
+
+- Decision: support both a historical backtest mode and a live/current-date mode, sharing the same underlying agent and optimizer code, differing only in which membership snapshot and which dates are fed in.
+  Rationale: the user explicitly chose "backtest + live/current-date mode" over backtest-only when asked, wanting this project to be useful as an actual decision-support tool, not only a paper-replication exercise.
+  Date/Author: 2026-08-05, decided by repository owner during planning interview.
+- Decision: defer the choice of exact interactive mechanism (CrewAI `Flow` with `@human_feedback`, versus a plain Python `input()` loop calling this project's existing plan 2 through 5 functions directly) to this plan's own Concrete Steps, to be resolved by checking the installed CrewAI version's actual current support for human-in-the-loop interaction before committing to one approach.
+  Rationale: `CREWAI.md`'s freshness-check requirement exists precisely because CrewAI's interactive/human-feedback features are recent (noted as "v1.8.0+" in that file) and evolving; committing to a specific mechanism in this plan without checking the installed version first risks writing a plan section that does not match reality.
+  Date/Author: 2026-08-05, plan author.
+- Decision: score each backtest month's realized portfolio return by reading `plans/01_dataset.md`'s shared `returns` table directly (the same table plan 5's optimizer reads for expected-return/covariance estimation), rather than this plan independently deriving "next month's return" from raw prices.
+  Rationale: the user explicitly chose one shared returns table over letting this plan and plan 5 each compute "monthly return" independently, which risked the two disagreeing; this plan's backtest scorer is one of that table's two consumers, per `plans/01_dataset.md`'s Interfaces and Dependencies section.
+  Date/Author: 2026-08-05, decided by repository owner during a plan-review follow-up question.
+
+
+## Outcomes & Retrospective
+
+
+(To be filled in once this plan is implemented and validated, including the real multi-year backtest Sharpe ratio comparison called for in Surprises & Discoveries.)
+
+
+## Context and Orientation
+
+
+This plan adds `src/flow/interactive.py` (and a thin CLI entry point) to this Python 3.12, `uv`-managed repository. All commands below run from the repository root and assume all five prior plans are implemented: `data/portfolio.duckdb` is populated (plan 1), `src/agents/llm_s.py` and `src/agents/llm_f.py` and their signal functions exist (plans 2 and 3), `src/scanner/candidate_scanner.py` exists (plan 4), and `src/optimizer/portfolio.py` exists (plan 5).
+
+
+"Backtest mode" and "live mode" are defined in Purpose / Big Picture above. The one piece of new machinery this plan needs that no prior plan built is a live membership snapshot for "today" — `plans/01_dataset.md`'s `sp500_membership` table only covers 2020-01-01 through 2024-04-30. This plan's live mode calls the same Wikipedia-scraping logic from `plans/01_dataset.md`'s `src/dataset/membership.py` but for today's date specifically (which, since it walks backward from the current constituent table, is actually the simplest possible case — today's membership is just the current constituent table itself, with zero change-rows to undo).
+
+
+## Plan of Work
+
+
+Create `src/flow/interactive.py` with a function `run_pipeline(rebalance_date: date, objective: str, portfolio_value: float, db_path: str = "data/portfolio.duckdb") -> dict` that: determines whether `rebalance_date` falls within the stored 2020-2024 window or is "today" (or otherwise outside the stored window), and if it is outside the stored window, calls `src/dataset/membership.py`'s reconstruction logic fresh for that date instead of reading `sp500_membership`, and similarly fetches fresh prices/factors/news for that date rather than reading the cached historical tables (reusing the same functions from plans 1 through 3, just pointed at live data instead of the DuckDB cache); runs `generate_rule` (plan 2) for the calendar year containing `rebalance_date`, then `screen` (plan 2) for that exact date; runs `screen_month` (plan 3) for that date's month; runs `scan_with_detail` (plan 4) on both signal sets; runs `load_returns_matrix` and `compute_weights` (plan 5) with the given `objective` on the resulting candidate list; runs `load_latest_prices` and `allocate_shares` (plan 5) with the given `portfolio_value`; and returns a dict bundling every intermediate result (LLM-S's rule and signals, LLM-F's signals, the scanner's detail dict, the weights, and the allocation) so the CLI layer below can display all of it, not just the final answer — a person steering the process interactively needs to see why a ticker is or is not a candidate, not just the final number of shares.
+
+
+Create a function `edit_candidates(scan_result: dict, add: list[str], remove: list[str]) -> list[str]` that takes the `candidates` list out of `scan_with_detail`'s output, adds any tickers in `add` not already present, removes any tickers in `remove` that are present, and returns the resulting sorted list — this is deliberately simple set manipulation, matching the fact that by this point in the pipeline both agents have already spoken and the user is just overriding their combined recommendation directly, the same way `plans/04_candidate_scanner.md`'s `scan` function already accepts an arbitrary user-supplied ticker list rather than only the scanner's own output.
+
+
+Create a CLI entry point `src/flow/cli.py` (a `main()` function, wired up as a `uv run` script or plain `uv run python -m src.flow.cli` invocation — check `pyproject.toml`'s existing `[project.scripts]` conventions, if any exist by the time this plan is implemented, and follow them) that: prompts for a date (or accepts `--date today` / `--date YYYY-MM-DD` as a command-line argument), an objective (GMV/MV/MSR), and a portfolio value; calls `run_pipeline`; prints the candidate list, the branch taken (intersection/union/single-agent), the weights, and the share allocation; then enters a loop offering the user the choice to add tickers, remove tickers, change the objective, or finish — each edit re-runs `compute_weights` and `allocate_shares` (not the two LLM agents again, since the user is overriding the agents' output, not asking them to reconsider) and reprints the updated weights and allocation.
+
+
+Create `src/flow/backtest.py` with a function `run_full_backtest(objective: str, db_path: str = "data/portfolio.duckdb") -> pd.DataFrame` that chains `run_pipeline` (using the cached historical data path, not the live path) across every one of the 52 monthly rebalance dates from `plans/01_dataset.md` in the 2020-2024 window, computing each month's portfolio return by applying that month's chosen weights to each candidate ticker's `monthly_return` value at the following rebalance date, read directly from `plans/01_dataset.md`'s shared `returns` table (the same table plan 5's `load_returns_matrix` reads for its own, backward-looking estimation purpose — here the read is forward-looking on purpose, since scoring a month's chosen weights needs the return that was realized after the weights were chosen, not before), and returns a DataFrame of month-by-month portfolio returns from which an annualized Sharpe ratio can be computed (mean monthly return divided by monthly return standard deviation, multiplied by the square root of 12) — this is what produces the number to compare against the paper's own reported 0.6324 S&P 500 baseline Sharpe ratio over the same period, and against the paper's own reported screened-portfolio results, understanding that this project's simplified pipeline (approximate yfinance-derived factors, yfinance news instead of a historical news archive, PyPortfolioOpt's built-in covariance estimators instead of the paper's five custom ones, and a thinner monthly-returns sample than the paper's own estimation window) is not expected to reproduce the paper's exact numbers, only to be in the same broad neighborhood and directionally sensible (screened portfolios beating the unscreened S&P 500 baseline, as the paper claims, is the qualitative result worth checking for; matching the paper's precise 1.1867 headline Sharpe ratio is not). A candidate ticker with no `monthly_return` value at the following rebalance date (delisted mid-month, or otherwise missing) should be excluded from that month's realized-return calculation with a logged note, the same drop-and-log pattern used throughout plans 1 and 5, rather than treated as a zero return.
+
+
+## Concrete Steps
+
+
+Run every command from the repository root, with all five prior plans already implemented.
+
+
+Step 1 — check CrewAI's current interactive/human-feedback support before deciding how `src/flow/cli.py`'s editing loop is implemented:
+
+    uv run python -c "import crewai; print(crewai.__version__)"
+
+Then fetch `https://docs.crewai.com/en/concepts/flows` and search for `human_feedback` in the current docs and changelog (`https://docs.crewai.com/en/changelog`). If a stable, documented `@human_feedback` (or equivalent) pattern exists for the installed version, prefer it for the CLI editing loop; if it is missing, experimental, or clearly overkill for what is really just a plain command-line prompt loop, use a plain Python `input()`-based loop calling this plan's own `edit_candidates` function directly — record whichever choice was made, and why, in the Decision Log.
+
+
+Step 2 — implement the files in Plan of Work, then run backtest mode for one real historical month end to end:
+
+    uv run python -m src.flow.cli --date 2024-03-01 --objective MSR --value 100000
+
+Expected: printed output showing LLM-S's generated rule and rationale for 2024, LLM-F's per-ticker signals summary, the scanner's chosen branch and candidate list, the MSR weights, and a share allocation totaling close to $100,000 — followed by an interactive prompt to add/remove tickers or finish.
+
+
+Step 3 — exercise the editing loop at least once in that same run: add one ticker not already in the candidate list and remove one that is, and confirm the reprinted weights and allocation reflect exactly that edited list (spot-check that the removed ticker has zero weight and the added ticker has nonzero weight, assuming it is not immediately excluded by `load_returns_matrix` for insufficient return history).
+
+
+Step 4 — run live mode:
+
+    uv run python -m src.flow.cli --date today --objective GMV --value 100000
+
+Expected: the same shape of output as Step 2, but built from a freshly-scraped current S&P 500 membership list and freshly-fetched recent prices/news rather than anything in `data/portfolio.duckdb`'s historical tables — confirm this by checking that at least one ticker in the resulting candidate list is a company that was not yet public or not yet S&P-500-eligible in 2020 (for example, a company that IPO'd or was added to the index after 2020), which would be impossible to see in backtest mode and is direct evidence live mode is really using current, not cached, data.
+
+
+Step 5 — run the full historical backtest and compare against the paper's baseline:
+
+    uv run python -c "
+    from src.flow.backtest import run_full_backtest
+    returns = run_full_backtest('MSR')
+    import numpy as np
+    sharpe = returns.mean() / returns.std() * (12 ** 0.5)
+    print('Realized annualized Sharpe (MSR, this project):', sharpe)
+    print('Paper-reported S&P 500 baseline Sharpe, 2020-2024:', 0.6324)
+    "
+
+Record the real output number in Outcomes & Retrospective and Surprises & Discoveries, along with a candid assessment of whether it is in a directionally sensible range given the fidelity gaps already recorded elsewhere in this plan set — this step is the closest this project gets to actually validating the paper's central claim, and its result should be reported honestly whether it confirms or fails to confirm that claim.
+
+
+## Validation and Acceptance
+
+
+Run `uv run pytest tests/test_interactive_flow.py` and expect all tests to pass. Per `AGENTS.md`'s testing guidance, these tests must not call `yfinance`, any LLM, or hit the live database — they exercise `edit_candidates` (a fixture candidate list, adding and removing known tickers, asserting the exact resulting list) and the Sharpe-ratio arithmetic inside `run_full_backtest`'s calculation (feed it a small fixture Series of monthly returns with a hand-computable mean and standard deviation, and assert the resulting Sharpe ratio matches a value computed by hand).
+
+
+Acceptance for this plan is: `uv run pytest tests/test_interactive_flow.py` passes; the Concrete Steps Step 2 through Step 5 transcripts (captured for real, not fabricated) show backtest mode, live mode, the editing loop, and the full-window backtest all producing the outputs described above, with Step 5's real Sharpe-ratio comparison recorded honestly in Outcomes & Retrospective.
+
+
+## Idempotence and Recovery
+
+
+`run_pipeline` in backtest mode is a pure function of its inputs (aside from the two LLM calls it makes, which are not guaranteed deterministic across repeated calls) and makes no writes to `data/portfolio.duckdb` — safe to call repeatedly. `run_pipeline` in live mode makes fresh network calls every time it runs (by design — that is what makes it "live") and likewise writes nothing to disk, so there is no cached state to go stale or need clearing. `run_full_backtest` is read-only against `data/portfolio.duckdb` and writes nothing; if it is slow to rerun in full during development (52 months, each involving LLM calls for plan 2 and plan 3's screening), consider adding a simple on-disk cache of each month's LLM-S rule and LLM-F signals under `data/` (already gitignored) so repeated backtest runs during development do not re-spend LLM API calls on unchanged historical months — this is an optional development-convenience optimization, not a correctness requirement, and should be recorded in the Decision Log if added.
+
+
+## Artifacts and Notes
+
+
+(To be filled in with the real CLI transcripts from Concrete Steps Step 2 through Step 4, and the real Sharpe-ratio comparison from Step 5, once this plan is executed.)
+
+
+## Interfaces and Dependencies
+
+
+This plan depends on every function named in the Interfaces and Dependencies sections of `plans/01_dataset.md` through `plans/05_optimizer_and_allocation.md` — this is the integration plan that calls all of them together, and defines no new lower-level dependency beyond what those five plans already introduced (CrewAI, PyPortfolioOpt, yfinance, DuckDB, pandas). It additionally depends directly on `plans/01_dataset.md`'s `returns` table (read directly by `run_full_backtest`, not through any plan 5 function) as its source of realized next-month returns for backtest scoring — the same table plan 5 reads for its optimizer inputs, per that table's documented dual-consumer role in `plans/01_dataset.md`'s Interfaces and Dependencies section.
+
+
+At the end of this plan, the following must exist: `src/flow/interactive.py`'s `run_pipeline(rebalance_date: date, objective: str, portfolio_value: float, db_path: str = "data/portfolio.duckdb") -> dict` and `edit_candidates(scan_result: dict, add: list[str], remove: list[str]) -> list[str]`; `src/flow/cli.py`'s `main()` entry point; and `src/flow/backtest.py`'s `run_full_backtest(objective: str, db_path: str = "data/portfolio.duckdb") -> pd.DataFrame`. This is the last plan in the sequence described in `README.md` — nothing in this repository's plan set depends on this plan, so there is no further Interfaces section to satisfy beyond what a human user directly invoking `src/flow/cli.py` needs.
