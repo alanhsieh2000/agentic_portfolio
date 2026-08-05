@@ -169,6 +169,8 @@ class TestComplexConditionArgs(BaseModel):
 
 
 class TestComplexConditionTool(BaseTool):
+    __test__ = False  # not a pytest test class - pytest's collector matches on the "Test" prefix
+
     name: str = "test_complex_condition"
     description: str = (
         'Test any candidate BUY, SELL, or HOLD condition (for example "bm > 0.5 and mom12m > '
