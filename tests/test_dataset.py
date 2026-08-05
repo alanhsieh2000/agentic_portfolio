@@ -22,10 +22,16 @@ from src.dataset.prices import (
     to_yfinance_symbol,
 )
 from src.dataset.fundamentals import (
+    BookEquityLineItemNotFoundError,
     add_cross_sectional_z,
+    compute_bm,
+    compute_market_cap,
     compute_mve,
     cumulative_split_ratio_after,
+    find_book_equity_row,
+    most_recent_book_equity_before_lag,
     most_recent_shares_on_or_before,
+    select_book_equity,
 )
 
 
@@ -286,3 +292,133 @@ def test_add_cross_sectional_z_masks_zero_std_group_instead_of_producing_inf():
     result = add_cross_sectional_z(df, "mve", "mve_z")
 
     assert result["mve_z"].isna().all()
+
+
+def test_find_book_equity_row_prefers_common_stock_equity_when_present():
+    bs = pd.DataFrame(
+        {pd.Timestamp("2022-09-30"): [50.0, 50.0, 55.0, -2.0]},
+        index=["Common Stock Equity", "Stockholders Equity", "Total Equity Gross Minority Interest", "Other Equity Adjustments"],
+    )
+
+    row = find_book_equity_row(bs, "AAPL")
+
+    assert row.loc[pd.Timestamp("2022-09-30")] == 50.0
+
+
+def test_find_book_equity_row_falls_back_to_stockholders_equity():
+    bs = pd.DataFrame(
+        {pd.Timestamp("2022-09-30"): [50.0, 55.0]},
+        index=["Stockholders Equity", "Total Equity Gross Minority Interest"],
+    )
+
+    row = find_book_equity_row(bs, "XOM")
+
+    assert row.loc[pd.Timestamp("2022-09-30")] == 50.0
+
+
+def test_find_book_equity_row_falls_back_to_total_equity_gross_minority_interest():
+    bs = pd.DataFrame({pd.Timestamp("2022-09-30"): [266626.0]}, index=["Total Equity Gross Minority Interest"])
+
+    row = find_book_equity_row(bs, "XOM")
+
+    assert row.loc[pd.Timestamp("2022-09-30")] == 266626.0
+
+
+def test_find_book_equity_row_raises_loudly_when_no_alias_matches():
+    bs = pd.DataFrame({pd.Timestamp("2022-09-30"): [-7172.0]}, index=["Other Equity Adjustments"])
+
+    with pytest.raises(BookEquityLineItemNotFoundError, match="AAPL"):
+        find_book_equity_row(bs, "AAPL")
+
+
+def test_find_book_equity_row_returns_none_for_entirely_empty_balance_sheet():
+    assert find_book_equity_row(pd.DataFrame(), "ZZZZZINVALID") is None
+
+
+def test_most_recent_book_equity_before_lag_picks_latest_eligible_column():
+    row = pd.Series([50672.0, 62146.0], index=pd.to_datetime(["2022-09-30", "2023-09-30"]))
+
+    # as_of=2024-01-01, lag=3mo -> cutoff 2023-10-01; both columns eligible, latest is 2023-09-30.
+    assert most_recent_book_equity_before_lag(row, "2024-01-01", lag_months=3) == pytest.approx(62146.0)
+
+
+def test_most_recent_book_equity_before_lag_skips_nan_eligible_column_for_earlier_populated_one():
+    """Regression for the verified-live AAPL case: the most-recent eligible
+    column (2021-09-30) is itself NaN; an older eligible column
+    (2020-09-30) has a value and should be used instead of returning None.
+    """
+    row = pd.Series([40000.0, float("nan")], index=pd.to_datetime(["2020-09-30", "2021-09-30"]))
+
+    # as_of=2022-01-01, lag=3mo -> cutoff 2021-10-01; both eligible, 2021-09-30 is more recent but NaN.
+    assert most_recent_book_equity_before_lag(row, "2022-01-01", lag_months=3) == pytest.approx(40000.0)
+
+
+def test_most_recent_book_equity_before_lag_returns_none_when_no_column_satisfies_lag():
+    row = pd.Series([50672.0], index=pd.to_datetime(["2023-09-30"]))
+
+    # as_of=2023-10-01, lag=3mo -> cutoff 2023-07-01; 2023-09-30 is NOT <= cutoff.
+    assert most_recent_book_equity_before_lag(row, "2023-10-01", lag_months=3) is None
+
+
+def test_most_recent_book_equity_before_lag_returns_none_for_empty_row():
+    assert most_recent_book_equity_before_lag(None, "2024-01-01") is None
+    assert most_recent_book_equity_before_lag(pd.Series(dtype="float64"), "2024-01-01") is None
+
+
+def test_select_book_equity_prefers_quarterly_when_it_satisfies_lag():
+    quarterly_bs = pd.DataFrame({pd.Timestamp("2023-09-30"): [61000.0]}, index=["Common Stock Equity"])
+    annual_bs = pd.DataFrame({pd.Timestamp("2023-09-30"): [62146.0]}, index=["Common Stock Equity"])
+
+    value = select_book_equity(quarterly_bs, annual_bs, "2024-01-01", "AAPL", lag_months=3)
+
+    assert value == pytest.approx(61000.0)  # quarterly value used, not annual's
+
+
+def test_select_book_equity_falls_back_to_annual_when_quarterly_has_no_eligible_column():
+    quarterly_bs = pd.DataFrame({pd.Timestamp("2024-12-31"): [70000.0]}, index=["Common Stock Equity"])
+    annual_bs = pd.DataFrame({pd.Timestamp("2022-09-30"): [50672.0]}, index=["Common Stock Equity"])
+
+    # as_of=2024-01-01: quarterly's only column (2024-12-31) fails the lag rule entirely.
+    value = select_book_equity(quarterly_bs, annual_bs, "2024-01-01", "AAPL", lag_months=3)
+
+    assert value == pytest.approx(50672.0)
+
+
+def test_compute_bm_aapl_style_fixture_is_small_positive_fraction():
+    """AAPL is a documented 'growth' stock priced far above book value; bm
+    should land as a small positive number under 1. Reuses the same
+    real-scale price/shares/splits fixture as
+    test_compute_mve_reproduces_aapl_trillion_dollar_sanity_check.
+    """
+    price = 75.087502
+    shares_raw = 4.275e9
+    splits = pd.Series([4.0], index=pd.to_datetime(["2020-08-31"]).tz_localize("America/New_York"))
+    as_of = "2020-01-02"
+    book_equity = 90_488_000_000.0  # plausible AAPL FY2019-scale total equity, in dollars
+
+    bm = compute_bm(book_equity, price, shares_raw, splits, as_of)
+
+    assert bm is not None
+    assert 0.0 < bm < 1.0
+    assert bm == pytest.approx(book_equity / (price * shares_raw * 4.0))
+
+
+def test_compute_bm_returns_none_when_book_equity_missing():
+    assert compute_bm(None, 75.0, 4.275e9, pd.Series(dtype="float64"), "2020-01-02") is None
+    assert compute_bm(float("nan"), 75.0, 4.275e9, pd.Series(dtype="float64"), "2020-01-02") is None
+
+
+def test_compute_market_cap_and_compute_mve_agree():
+    """Regression for the compute_mve/compute_market_cap refactor: mve must
+    still equal log(market_cap) exactly.
+    """
+    price = 75.087502
+    shares_raw = 4.275e9
+    splits = pd.Series([4.0], index=pd.to_datetime(["2020-08-31"]).tz_localize("America/New_York"))
+    as_of = "2020-01-02"
+
+    market_cap = compute_market_cap(price, shares_raw, splits, as_of)
+    mve = compute_mve(price, shares_raw, splits, as_of)
+
+    assert market_cap is not None
+    assert mve == pytest.approx(math.log(market_cap))
