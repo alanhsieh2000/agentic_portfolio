@@ -16,7 +16,7 @@ README.md names this project's version of that agent "LLM-F" and explicitly fram
 ## Progress
 
 
-- [ ] Define the Pydantic schema for LLM-F's output (signal, confidence, rationale) per ticker per month.
+- [x] Define the Pydantic schema for LLM-F's output (signal, confidence, rationale) per ticker per month.
 - [ ] Write the news-fetching function using `yfinance`'s per-ticker `.news` accessor.
 - [ ] Write the CrewAI agent and task that turns a batch of headlines into that schema.
 - [ ] Wire in the configurable-model environment variable (`LLM_F_MODEL`).
