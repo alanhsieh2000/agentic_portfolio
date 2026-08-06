@@ -4,8 +4,15 @@ Per AGENTS.md's testing guidance, the returns-matrix drop-logic is tested
 against hand-built fixture DataFrames standing in for the `returns` table,
 isolated from the actual DuckDB read (per
 plans/05_optimizer_and_allocation.md's Validation and Acceptance section).
+`load_latest_prices`'s DB-reading half is exercised against a tiny,
+hand-built fixture DuckDB file (via `tmp_path`), not the real
+`data/portfolio.duckdb`, so this test module stays hermetic and
+deterministic regardless of whether the real dataset has been built.
 """
 
+from datetime import date
+
+import duckdb
 import pandas as pd
 import pytest
 
@@ -13,8 +20,20 @@ from src.optimizer.portfolio import (
     _covariance_input,
     apply_min_history_rule,
     compute_weights,
+    load_latest_prices,
     pivot_returns_matrix,
 )
+
+
+def _make_prices_db(db_path: str, rows: list[tuple[str, str, float, float]]) -> None:
+    """rows: list of (date, ticker, close, adj_close) tuples."""
+    con = duckdb.connect(db_path)
+    try:
+        con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+        if rows:
+            con.executemany("INSERT INTO prices VALUES (?, ?, ?, ?)", rows)
+    finally:
+        con.close()
 
 
 def _dates(n: int) -> list[pd.Timestamp]:
@@ -159,3 +178,46 @@ def test_compute_weights_mv_unreachable_target_raises_value_error():
 
     with pytest.raises(ValueError):
         compute_weights(df, "MV", target_monthly_return=1.0)
+
+
+def test_load_latest_prices_returns_nearest_on_or_before(tmp_path):
+    db_path = str(tmp_path / "prices.duckdb")
+    _make_prices_db(
+        db_path,
+        [
+            ("2024-01-01", "AAPL", 100.0, 100.0),
+            ("2024-01-15", "AAPL", 110.0, 110.0),
+            ("2024-02-01", "AAPL", 120.0, 120.0),
+        ],
+    )
+
+    result = load_latest_prices(["AAPL"], date(2024, 1, 20), db_path=db_path)
+
+    assert result["AAPL"] == pytest.approx(110.0)
+
+
+def test_load_latest_prices_is_nan_for_ticker_with_no_price_on_or_before_as_of(tmp_path):
+    db_path = str(tmp_path / "prices.duckdb")
+    _make_prices_db(db_path, [("2024-02-01", "AAPL", 120.0, 120.0)])
+
+    result = load_latest_prices(["AAPL"], date(2024, 1, 1), db_path=db_path)
+
+    assert pd.isna(result["AAPL"])
+
+
+def test_load_latest_prices_uses_adj_close_not_close(tmp_path):
+    db_path = str(tmp_path / "prices.duckdb")
+    _make_prices_db(db_path, [("2024-01-01", "AAPL", 100.0, 95.0)])  # split-adjusted, close != adj_close
+
+    result = load_latest_prices(["AAPL"], date(2024, 1, 1), db_path=db_path)
+
+    assert result["AAPL"] == pytest.approx(95.0)
+
+
+def test_load_latest_prices_empty_tickers_returns_empty_series(tmp_path):
+    db_path = str(tmp_path / "prices.duckdb")
+    _make_prices_db(db_path, [])
+
+    result = load_latest_prices([], date(2024, 1, 1), db_path=db_path)
+
+    assert result.empty

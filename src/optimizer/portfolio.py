@@ -6,8 +6,9 @@ This module reads plan 1's shared `returns` table (monthly returns,
 returns matrix that feeds PyPortfolioOpt's expected-return and
 covariance-matrix estimation - never `prices` directly for that purpose,
 per plan 5's Decision Log (one shared returns table, not an independently
-recomputed one). `prices` is used only later, for allocation-time share
-pricing (future work in this module).
+recomputed one). `prices` is used only for allocation-time share pricing
+(`load_latest_prices`), the one place in this module that still touches
+raw daily prices rather than monthly returns.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import pandas as pd
 from pypfopt import EfficientFrontier, expected_returns, risk_models
 
 from src.config.settings import settings
+from src.dataset.fundamentals import attach_nearest_price
 
 logger = logging.getLogger(__name__)
 
@@ -253,3 +255,59 @@ def compute_weights(
         _validate_efficient_return_result(weights, ef, target_monthly_return)
 
     return weights
+
+
+def _load_prices_up_to(tickers: list[str], as_of: date, db_path: str) -> pd.DataFrame:
+    """Long-format rows (['date', 'ticker', 'adj_close']) from the `prices`
+    table for `tickers`, restricted to `date <= as_of` - only the rows
+    `attach_nearest_price` could possibly need, not the whole table.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=["date", "ticker", "adj_close"])
+
+    placeholders = ", ".join(["?"] * len(tickers))
+    con = duckdb.connect(db_path)
+    try:
+        df = con.execute(
+            f"SELECT date, ticker, adj_close FROM prices WHERE ticker IN ({placeholders}) AND date <= ?",
+            [*tickers, pd.Timestamp(as_of).date()],
+        ).fetchdf()
+    finally:
+        con.close()
+    df["date"] = pd.to_datetime(df["date"])
+    df["ticker"] = df["ticker"].astype(str)
+    return df
+
+
+def load_latest_prices(tickers: list[str], as_of: date, db_path: str = settings.db_path) -> pd.Series:
+    """Most recent `adj_close` on or before `as_of` for each of `tickers`,
+    read from the `prices` table (not `returns`) - `allocate_shares` needs
+    a real per-share dollar price, which a monthly return has no unit for.
+
+    Reuses `attach_nearest_price` (src/dataset/fundamentals.py), the same
+    nearest-on-or-before-per-ticker join `src/dataset/returns.py` uses,
+    rather than reimplementing it, per that function's own docstring note.
+    Yields NaN (not an error) for a ticker with no price row on or before
+    `as_of`, matching `attach_nearest_price`'s own missing-data behavior;
+    logged so a silent NaN doesn't surface only much later at the
+    allocation step.
+    """
+    if not tickers:
+        return pd.Series(dtype=float, name="adj_close", index=pd.Index([], name="ticker"))
+
+    grid = pd.DataFrame(
+        {
+            "rebalance_date": pd.to_datetime([as_of] * len(tickers)).astype("datetime64[us]"),
+            "ticker": pd.array(tickers, dtype=str),
+        }
+    )
+    prices = _load_prices_up_to(tickers, as_of, db_path)
+    merged = attach_nearest_price(grid, prices)
+    result = merged.set_index("ticker")["adj_close"].reindex(tickers)
+    result.index.name = "ticker"
+
+    missing = result[result.isna()].index.tolist()
+    if missing:
+        logger.warning("no price on or before %s for ticker(s): %s", as_of, sorted(missing))
+
+    return result
