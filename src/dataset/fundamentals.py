@@ -578,6 +578,50 @@ def add_cross_sectional_z(df: pd.DataFrame, value_col: str, z_col: str) -> pd.Da
     return df
 
 
+def get_factor_reference_stats(
+    rebalance_date, db_path: str = DEFAULT_DB_PATH
+) -> dict[str, tuple[float, float]]:
+    """Mean and standard deviation of the S&P 500 universe's raw `mve`,
+    `bm`, `mom12m` on one `rebalance_date`, recomputed on demand from the
+    `factors` table's already-persisted raw columns rather than a separate
+    stored artifact.
+
+    This reproduces exactly what add_cross_sectional_z computed (and
+    discarded) when the `factors` table's `_z` columns were originally
+    built: DuckDB's STDDEV_SAMP uses the same ddof=1 sample-standard-
+    deviation convention as pandas' default `.std()`, so re-deriving it
+    here from the persisted raw values gives the identical number, with no
+    second copy of the same information to keep in sync. Used to
+    standardize a candidate ticker OUTSIDE the S&P 500 universe into the
+    same z-score space an LLM-S rule was written against — see
+    src/agents/external_screen.py and plans/07_external_candidate_screening.md.
+
+    Raises ValueError if no `factors` rows exist for `rebalance_date` —
+    unlike llm_s.py's resolve_as_of_date, there is no sensible nearest-date
+    fallback here: the stats must match the exact date the target rule was
+    generated against, or the resulting z-scores are meaningless.
+    """
+    as_of = pd.Timestamp(rebalance_date).date()
+    con = duckdb.connect(db_path, read_only=True)
+    try:
+        row = con.execute(
+            "SELECT AVG(mve), STDDEV_SAMP(mve), AVG(bm), STDDEV_SAMP(bm), "
+            "AVG(mom12m), STDDEV_SAMP(mom12m), COUNT(*) "
+            "FROM factors WHERE rebalance_date = ?",
+            [as_of],
+        ).fetchone()
+    finally:
+        con.close()
+    mve_mean, mve_std, bm_mean, bm_std, mom_mean, mom_std, count = row
+    if not count:
+        raise ValueError(f"No factors rows found for rebalance_date={as_of}")
+    return {
+        "mve": (mve_mean, mve_std),
+        "bm": (bm_mean, bm_std),
+        "mom12m": (mom_mean, mom_std),
+    }
+
+
 def write_factors_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> None:
     """Write `df` to the `factors` table in the DuckDB file at `db_path`,
     creating the parent directory if needed. Drops any pre-existing table
