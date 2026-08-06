@@ -19,7 +19,7 @@ from datetime import date
 import duckdb
 import numpy as np
 import pandas as pd
-from pypfopt import EfficientFrontier, expected_returns, risk_models
+from pypfopt import DiscreteAllocation, EfficientFrontier, expected_returns, risk_models
 
 from src.config.settings import settings
 from src.dataset.fundamentals import attach_nearest_price
@@ -311,3 +311,24 @@ def load_latest_prices(tickers: list[str], as_of: date, db_path: str = settings.
         logger.warning("no price on or before %s for ticker(s): %s", as_of, sorted(missing))
 
     return result
+
+
+def allocate_shares(weights: dict[str, float], latest_prices: pd.Series, total_value: float) -> tuple[dict[str, int], float]:
+    """Convert continuous `weights` (as produced by `compute_weights`) into
+    a whole-share allocation spending as close to `total_value` as
+    possible, via PyPortfolioOpt's `DiscreteAllocation.greedy_portfolio()`
+    - its default, share-by-share greedy algorithm, preferred over its
+    linear-programming alternative for typical portfolio sizes per this
+    plan's Plan of Work. Returns `(shares_per_ticker, leftover_cash)`
+    exactly as PyPortfolioOpt produces it.
+
+    `latest_prices` should come from `load_latest_prices` called with the
+    same `as_of` date used for the `load_returns_matrix` call that fed
+    `weights`, so weights and allocation prices are anchored to the same
+    date. `DiscreteAllocation` itself raises `TypeError`/`ValueError` for
+    NaN weights or prices (e.g. a ticker `load_latest_prices` couldn't find
+    a price for) - not caught here, per this plan's exception-propagation
+    philosophy elsewhere in `compute_weights`.
+    """
+    allocation = DiscreteAllocation(weights, latest_prices, total_portfolio_value=total_value)
+    return allocation.greedy_portfolio()

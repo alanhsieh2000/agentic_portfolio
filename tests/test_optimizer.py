@@ -18,6 +18,7 @@ import pytest
 
 from src.optimizer.portfolio import (
     _covariance_input,
+    allocate_shares,
     apply_min_history_rule,
     compute_weights,
     load_latest_prices,
@@ -221,3 +222,32 @@ def test_load_latest_prices_empty_tickers_returns_empty_series(tmp_path):
     result = load_latest_prices([], date(2024, 1, 1), db_path=db_path)
 
     assert result.empty
+
+
+def test_allocate_shares_matches_target_weights_within_one_share():
+    """Per plans/05_optimizer_and_allocation.md's Validation and Acceptance
+    section: one $100 stock, one $50 stock, 50/50 weights, $1000 total.
+    """
+    weights = {"A": 0.5, "B": 0.5}
+    latest_prices = pd.Series({"A": 100.0, "B": 50.0})
+
+    allocation, leftover_cash = allocate_shares(weights, latest_prices, 1000.0)
+
+    implied_value = sum(shares * latest_prices[ticker] for ticker, shares in allocation.items())
+    for ticker, weight in weights.items():
+        target_value = weight * 1000.0
+        actual_value = allocation.get(ticker, 0) * latest_prices[ticker]
+        assert abs(actual_value - target_value) <= latest_prices[ticker]
+    assert implied_value + leftover_cash == pytest.approx(1000.0)
+
+
+def test_allocate_shares_exact_fit_leaves_zero_leftover_cash():
+    allocation, leftover_cash = allocate_shares({"A": 0.5, "B": 0.5}, pd.Series({"A": 100.0, "B": 50.0}), 1000.0)
+
+    assert allocation == {"A": 5, "B": 10}
+    assert leftover_cash == pytest.approx(0.0)
+
+
+def test_allocate_shares_raises_on_nan_price():
+    with pytest.raises((TypeError, ValueError)):
+        allocate_shares({"A": 1.0}, pd.Series({"A": float("nan")}), 1000.0)
