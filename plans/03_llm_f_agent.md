@@ -21,8 +21,9 @@ README.md names this project's version of that agent "LLM-F" and explicitly fram
 - [x] Write the CrewAI agent and task that turns a batch of headlines into that schema.
 - [x] Wire in the configurable-model environment variable (`LLM_F_MODEL`).
 - [x] Measure and record actual `yfinance` news coverage across the 2020-2024 backtest window (this is the single biggest open risk in this plan and must be measured, not assumed).
-- [ ] Write `tests/test_llm_f.py` covering the news-to-signal plumbing against fixtures (not real LLM calls).
+- [x] Write `tests/test_llm_f.py` covering the news-to-signal plumbing against fixtures (not real LLM calls).
 - [x] Manually run the agent for at least one real ticker and month and sanity-check the output.
+- [ ] Write `src/agents/llm_f_signals.py`'s `screen_month(year, month, db_path)` (required by Interfaces and Dependencies below, but not separately itemized when this checklist was first drafted) and run Concrete Steps Step 3 for one real month.
 
 
 ## Surprises & Discoveries
