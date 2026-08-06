@@ -10,7 +10,6 @@ kick it off (making exactly one LLM call), and return the resulting
 from __future__ import annotations
 
 import logging
-import os
 from datetime import date
 
 import duckdb
@@ -18,14 +17,12 @@ import duckdb
 from src.agents.llm_s_crew.crew import LLMSCrew
 from src.agents.llm_s_crew.tools import load_snapshot
 from src.agents.llm_s_schema import ScreeningRule
+from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "data/portfolio.duckdb"
-DEFAULT_MODEL = "anthropic/claude-sonnet-4-5"
 
-
-def resolve_as_of_date(year: int, db_path: str = DEFAULT_DB_PATH) -> date:
+def resolve_as_of_date(year: int, db_path: str = settings.db_path) -> date:
     """The causal-masking snapshot date for `year`: the most recent
     `factors` rebalance date in December of `year - 1` (matching the
     paper's own "December 2023 for test dates in 2024" framing). Falls
@@ -57,7 +54,7 @@ def resolve_as_of_date(year: int, db_path: str = DEFAULT_DB_PATH) -> date:
     return earliest
 
 
-def generate_rule(year: int, model: str | None = None, db_path: str = DEFAULT_DB_PATH) -> ScreeningRule:
+def generate_rule(year: int, model: str | None = None, db_path: str = settings.db_path) -> ScreeningRule:
     """Produce one year's LLM-S screening rule: resolve the causally-
     masked snapshot date, load it, build `LLMSCrew` around it, and kick
     off the crew (exactly one LLM call). Not deterministic across repeated
@@ -67,7 +64,7 @@ def generate_rule(year: int, model: str | None = None, db_path: str = DEFAULT_DB
     """
     as_of_date = resolve_as_of_date(year, db_path)
     snapshot = load_snapshot(db_path, as_of_date)
-    resolved_model = model or os.environ.get("LLM_S_MODEL", DEFAULT_MODEL)
+    resolved_model = model or settings.llm_s_model
 
     llm_s_crew = LLMSCrew(snapshot=snapshot, as_of_date=as_of_date, model=resolved_model)
     result = llm_s_crew.crew().kickoff(inputs={"as_of_date": as_of_date.isoformat(), "year": year})

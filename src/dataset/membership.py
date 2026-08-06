@@ -16,10 +16,11 @@ import duckdb
 import pandas as pd
 import requests
 
+from src.config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-DEFAULT_DB_PATH = "data/portfolio.duckdb"
 USER_AGENT = "agentic-portfolio-dataset-builder/0.1 (educational research project)"
 
 
@@ -32,7 +33,7 @@ class MembershipTableNotFoundError(RuntimeError):
     """
 
 
-def _fetch_html(url: str = WIKIPEDIA_URL, timeout: float = 30.0) -> str:
+def _fetch_html(url: str = WIKIPEDIA_URL, timeout: float = settings.http_timeout_seconds) -> str:
     """Download the raw page HTML. The only network I/O in this module."""
     response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
     response.raise_for_status()
@@ -76,7 +77,9 @@ def _locate_table(tables: list[pd.DataFrame], required: list[str], table_name: s
     )
 
 
-def fetch_membership_tables(url: str = WIKIPEDIA_URL, timeout: float = 30.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_membership_tables(
+    url: str = WIKIPEDIA_URL, timeout: float = settings.http_timeout_seconds
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Fetch the page and return (raw_current_table, raw_changes_table),
     located by column-name inspection rather than table index.
     """
@@ -172,7 +175,9 @@ def apply_changes_asof(current_members: pd.DataFrame, changes: pd.DataFrame, as_
     return pd.DataFrame(sorted(members.items()), columns=["ticker", "security"])
 
 
-def compute_rebalance_dates(start: str = "2020-01-01", end: str = "2024-04-30") -> list[pd.Timestamp]:
+def compute_rebalance_dates(
+    start: str = settings.rebalance_start, end: str = settings.rebalance_end
+) -> list[pd.Timestamp]:
     """Return the first trading day of every month from `start` through
     `end` inclusive, as pandas Timestamps.
 
@@ -209,7 +214,7 @@ def reconstruct_membership(
     return pd.concat(frames, ignore_index=True)
 
 
-def write_membership_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> None:
+def write_membership_table(df: pd.DataFrame, db_path: str = settings.db_path) -> None:
     """Write `df` to the sp500_membership table in the DuckDB file at
     `db_path`, creating the parent directory if needed. Drops any
     pre-existing table first, so re-running this is always safe.
@@ -231,7 +236,7 @@ def write_membership_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> 
         con.close()
 
 
-def build_membership_table(db_path: str = DEFAULT_DB_PATH, url: str = WIKIPEDIA_URL) -> pd.DataFrame:
+def build_membership_table(db_path: str = settings.db_path, url: str = WIKIPEDIA_URL) -> pd.DataFrame:
     """Fetch, normalize, reconstruct across all rebalance dates, write to
     DuckDB, and return the resulting DataFrame.
     """

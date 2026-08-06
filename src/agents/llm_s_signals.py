@@ -12,13 +12,12 @@ import pandas as pd
 
 from src.agents.llm_s_apply import apply_rule
 from src.agents.llm_s_schema import ScreeningRule
+from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = "data/portfolio.duckdb"
 
-
-def screen(rule: ScreeningRule, rebalance_date: date, db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def screen(rule: ScreeningRule, rebalance_date: date, db_path: str = settings.db_path) -> pd.DataFrame:
     """`rule` applied to every ticker in the `factors` table on
     `rebalance_date`. Rows with a null `mve_z`, `bm_z`, or `mom12m_z`
     cannot be evaluated against a numeric rule and are excluded entirely

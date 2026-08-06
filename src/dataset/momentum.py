@@ -27,8 +27,8 @@ import logging
 import duckdb
 import pandas as pd
 
+from src.config.settings import settings
 from src.dataset.fundamentals import (
-    DEFAULT_DB_PATH,
     add_cross_sectional_z,
     attach_nearest_price,
     load_membership,
@@ -65,7 +65,7 @@ def compute_mom12m(price_1mo_before: float | None, price_12mo_before: float | No
     return (price_1mo_before / price_12mo_before) - 1.0
 
 
-def load_prices_for_join(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_prices_for_join(db_path: str = settings.db_path) -> pd.DataFrame:
     """columns ['date', 'ticker', 'adj_close'] — identical shape to
     fundamentals.py's load_prices_for_join (duplicated here rather than
     imported, since fundamentals.py's version is a private-ish helper
@@ -81,7 +81,7 @@ def load_prices_for_join(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     return df
 
 
-def load_factors(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_factors(db_path: str = settings.db_path) -> pd.DataFrame:
     """Read the existing `factors` table written by
     fundamentals.py's build_factors. Raises FactorsTableMissingError if it
     doesn't exist yet — a structural precondition for this module, not
@@ -125,7 +125,7 @@ def compute_mom12m_column(membership: pd.DataFrame, prices: pd.DataFrame) -> pd.
     )
 
 
-def build_momentum_factors(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def build_momentum_factors(db_path: str = settings.db_path) -> pd.DataFrame:
     """Compute mom12m/mom12m_z and merge them into the existing `factors`
     table (preserving mve/bm/mve_z/bm_z), then write the combined table
     back. Returns the resulting DataFrame.

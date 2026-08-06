@@ -37,9 +37,10 @@ import logging
 import duckdb
 import pandas as pd
 
-from src.dataset.fundamentals import DEFAULT_DB_PATH, attach_nearest_price
+from src.config.settings import settings
+from src.dataset.fundamentals import attach_nearest_price
 from src.dataset.membership import compute_rebalance_dates
-from src.dataset.prices import DEFAULT_END, DEFAULT_START, load_ticker_universe
+from src.dataset.prices import load_ticker_universe
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def compute_monthly_return(price_at_d: float | None, price_one_month_before: flo
     return (price_at_d / price_one_month_before) - 1.0
 
 
-def load_prices_for_join(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_prices_for_join(db_path: str = settings.db_path) -> pd.DataFrame:
     """columns ['date', 'ticker', 'adj_close'] — identical shape to
     fundamentals.py's/momentum.py's own load_prices_for_join (duplicated
     here rather than imported, for the same reason momentum.py already
@@ -115,7 +116,7 @@ def compute_monthly_return_column(grid: pd.DataFrame, prices: pd.DataFrame) -> p
     )
 
 
-def write_returns_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> None:
+def write_returns_table(df: pd.DataFrame, db_path: str = settings.db_path) -> None:
     """Write `df` to the `returns` table in the DuckDB file at `db_path`.
     Drops any pre-existing table first, so re-running this is always safe.
     """
@@ -135,7 +136,7 @@ def write_returns_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> Non
         con.close()
 
 
-def build_returns(db_path: str = DEFAULT_DB_PATH, start: str = DEFAULT_START, end: str = DEFAULT_END) -> pd.DataFrame:
+def build_returns(db_path: str = settings.db_path, start: str = settings.fetch_start, end: str = settings.fetch_end) -> pd.DataFrame:
     """Compute monthly_return for every (month, ticker) pair across the
     wider 112-month sequence and the full ticker universe, write to
     DuckDB, and return the resulting DataFrame.

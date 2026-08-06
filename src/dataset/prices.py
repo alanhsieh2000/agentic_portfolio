@@ -18,13 +18,9 @@ import duckdb
 import pandas as pd
 import yfinance as yf
 
-from src.dataset.membership import DEFAULT_DB_PATH
+from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_START = "2015-01-01"
-DEFAULT_END = "2024-04-30"
-DEFAULT_BATCH_SIZE = 100
 
 UNRESOLVED_REASON = (
     "yfinance returned no non-null close/adj_close values for this ticker "
@@ -145,7 +141,7 @@ def detect_unresolved_tickers(all_tickers: list[str], long_prices: pd.DataFrame)
     """
     present = set(long_prices["ticker"]) if not long_prices.empty else set()
     missing = sorted(set(all_tickers) - present)
-    reason = UNRESOLVED_REASON.format(start=DEFAULT_START, end=DEFAULT_END)
+    reason = UNRESOLVED_REASON.format(start=settings.fetch_start, end=settings.fetch_end)
     return pd.DataFrame({"ticker": missing, "reason": [reason] * len(missing)})
 
 
@@ -166,10 +162,10 @@ def _fetch_batch(symbols: list[str], start: str, end: str) -> pd.DataFrame:
 
 def fetch_price_history(
     symbols: list[str],
-    start: str = DEFAULT_START,
-    end: str = DEFAULT_END,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    pause_seconds: float = 1.0,
+    start: str = settings.fetch_start,
+    end: str = settings.fetch_end,
+    batch_size: int = settings.price_batch_size,
+    pause_seconds: float = settings.yfinance_price_pause_seconds,
 ) -> pd.DataFrame:
     """Fetch `symbols` in chunks of `batch_size`, pausing briefly between
     batches as cheap insurance against rate-limiting, and concatenate the
@@ -188,7 +184,7 @@ def fetch_price_history(
     return pd.concat(frames, axis=1) if frames else pd.DataFrame()
 
 
-def load_ticker_universe(db_path: str = DEFAULT_DB_PATH) -> list[str]:
+def load_ticker_universe(db_path: str = settings.db_path) -> list[str]:
     """Return the sorted, deduplicated list of every ticker that appears in
     sp500_membership at any rebalance date — original Wikipedia-style
     ticker strings, not yfinance symbols.
@@ -209,7 +205,7 @@ def load_ticker_universe(db_path: str = DEFAULT_DB_PATH) -> list[str]:
     return tickers
 
 
-def write_prices_tables(prices_df: pd.DataFrame, unresolved_df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> None:
+def write_prices_tables(prices_df: pd.DataFrame, unresolved_df: pd.DataFrame, db_path: str = settings.db_path) -> None:
     """Write `prices_df` to table `prices` and `unresolved_df` to table
     `unresolved_tickers` in the DuckDB file at `db_path`, creating the
     parent directory if needed. Drops any pre-existing tables first, so
@@ -243,10 +239,10 @@ def write_prices_tables(prices_df: pd.DataFrame, unresolved_df: pd.DataFrame, db
 
 
 def build_price_history(
-    db_path: str = DEFAULT_DB_PATH,
-    start: str = DEFAULT_START,
-    end: str = DEFAULT_END,
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    db_path: str = settings.db_path,
+    start: str = settings.fetch_start,
+    end: str = settings.fetch_end,
+    batch_size: int = settings.price_batch_size,
 ) -> pd.DataFrame:
     """Fetch, reshape, detect unresolved tickers, write to DuckDB, and
     return the resulting long-format prices DataFrame.

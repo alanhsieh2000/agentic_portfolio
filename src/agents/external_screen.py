@@ -26,8 +26,8 @@ import pandas as pd
 
 from src.agents.llm_s_apply import apply_rule
 from src.agents.llm_s_schema import ScreeningRule
+from src.config.settings import settings
 from src.dataset.fundamentals import (
-    DEFAULT_DB_PATH,
     compute_bm,
     compute_mve,
     fetch_balance_sheets,
@@ -162,7 +162,7 @@ def screen_external_candidate(
     rule: ScreeningRule,
     raw_factors: dict[str, float | None],
     rebalance_date,
-    db_path: str = DEFAULT_DB_PATH,
+    db_path: str = settings.db_path,
 ) -> str:
     """`"buy"`/`"sell"`/`"hold"` for one candidate ticker OUTSIDE the S&P
     500 universe, standardizing `raw_factors` against that universe's

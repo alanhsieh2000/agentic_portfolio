@@ -13,6 +13,7 @@ dependencies = [
     "pandas>=3.0.3",
     "parsel>=1.11.0",
     "pydantic[email,timezone]>=2.12.5",
+    "pydantic-settings>=2.14.2",
     "pyportfolioopt>=1.6.0",
     "pytest>=9.0.3",
     "python-dotenv>=1.2.2",

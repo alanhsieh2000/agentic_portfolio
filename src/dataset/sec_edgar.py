@@ -36,13 +36,12 @@ confidently-wrong empty result.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
 
+from src.config.settings import settings
 from src.dataset.prices import to_yfinance_symbol
 
 logger = logging.getLogger(__name__)
@@ -58,11 +57,12 @@ BOOK_EQUITY_XBRL_TAGS = [
 
 
 class SecUserAgentMissingError(RuntimeError):
-    """SEC_UA is unset/blank in the environment. Checked at first use (not
-    import time), so importing this module doesn't require .env already
-    loaded. Never silently falls back to a generic User-Agent -- verified
-    live that SEC returns HTTP 403 for a missing/generic User-Agent, which
-    would otherwise masquerade as "no data" for every single ticker.
+    """SEC_UA is unset/blank (via src.config.settings.settings, which loads
+    .env at its own import time). The blank check itself still only fires
+    at first use (_sec_headers's first real call), not at import time.
+    Never silently falls back to a generic User-Agent -- verified live that
+    SEC returns HTTP 403 for a missing/generic User-Agent, which would
+    otherwise masquerade as "no data" for every single ticker.
     """
 
 
@@ -83,12 +83,10 @@ class SecTickerMapShapeError(RuntimeError):
 
 
 def _sec_headers() -> dict[str, str]:
-    """Reads SEC_UA from the environment (loads .env once via
-    load_dotenv() if not already loaded). Raises SecUserAgentMissingError
-    if unset/blank.
+    """Reads SEC_UA from src.config.settings.settings (which loads .env at
+    import time). Raises SecUserAgentMissingError if unset/blank.
     """
-    load_dotenv()
-    ua = os.environ.get("SEC_UA", "").strip()
+    ua = settings.sec_ua.strip()
     if not ua:
         raise SecUserAgentMissingError(
             "SEC_UA is unset or blank. SEC requires a descriptive User-Agent "
@@ -98,7 +96,7 @@ def _sec_headers() -> dict[str, str]:
     return {"User-Agent": ua}
 
 
-def fetch_cik_map(session: requests.Session | None = None, timeout: float = 30.0) -> dict[str, int]:
+def fetch_cik_map(session: requests.Session | None = None, timeout: float = settings.http_timeout_seconds) -> dict[str, int]:
     """One GET of SEC's full ticker->CIK file, covering every CURRENTLY
     SEC-registered ticker (verified live: ~10,398 tickers, all uppercase,
     dashes not dots for share classes -- identical convention to
@@ -128,7 +126,7 @@ def fetch_cik_map(session: requests.Session | None = None, timeout: float = 30.0
 
 
 def fetch_book_equity_facts(
-    cik: int, tag: str, session: requests.Session, headers: dict[str, str], timeout: float = 30.0
+    cik: int, tag: str, session: requests.Session, headers: dict[str, str], timeout: float = settings.http_timeout_seconds
 ) -> pd.DataFrame:
     """One GET of companyconcept for one (cik, tag). Returns an empty
     DataFrame (ordinary absence, verified live to be SEC's real response)
@@ -158,7 +156,9 @@ def fetch_book_equity_facts(
     return df[["end", "val", "filed", "form", "accn"]]
 
 
-def fetch_company_facts(cik: int, session: requests.Session, headers: dict[str, str], timeout: float = 30.0) -> dict:
+def fetch_company_facts(
+    cik: int, session: requests.Session, headers: dict[str, str], timeout: float = settings.http_timeout_seconds
+) -> dict:
     """One GET of the bulk companyfacts endpoint for one CIK -- used only
     as a recovery path when companyconcept (the normally-preferred,
     smaller, targeted endpoint) returns zero facts for every alias tag.
@@ -302,7 +302,7 @@ def fetch_all_sec_book_equity(
     cik_map: dict[str, int],
     latest_rebalance_date,
     session: requests.Session | None = None,
-    pause_seconds: float = 0.15,
+    pause_seconds: float = settings.sec_pause_seconds,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
     """Fetch-once-per-ticker: resolve CIK, try BOOK_EQUITY_XBRL_TAGS in
     order (first tag with any facts wins), check has_sufficient_coverage.

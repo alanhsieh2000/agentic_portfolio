@@ -53,9 +53,9 @@ import duckdb
 import pandas as pd
 import yfinance as yf
 
+from src.config.settings import settings
 from src.dataset import sec_edgar
-from src.dataset.membership import DEFAULT_DB_PATH
-from src.dataset.prices import DEFAULT_END, DEFAULT_START, to_yfinance_symbol
+from src.dataset.prices import to_yfinance_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ class BookEquityLineItemNotFoundError(RuntimeError):
 
 
 def fetch_shares_and_splits(
-    ticker: str, start: str = DEFAULT_START, end: str = DEFAULT_END
+    ticker: str, start: str = settings.fetch_start, end: str = settings.fetch_end
 ) -> tuple[pd.Series, pd.Series]:
     """The only function in this module that performs network I/O.
 
@@ -226,7 +226,7 @@ def find_book_equity_row(balance_sheet: pd.DataFrame, ticker: str) -> pd.Series 
 
 
 def most_recent_book_equity_before_lag(
-    book_equity_row: pd.Series | None, as_of, lag_months: int = 3
+    book_equity_row: pd.Series | None, as_of, lag_months: int = settings.book_equity_lag_months
 ) -> float | None:
     """Among `book_equity_row`'s columns (period-end Timestamps -> values)
     whose period-end date is <= `as_of` minus `lag_months` months (the
@@ -263,7 +263,11 @@ def most_recent_book_equity_before_lag(
 
 
 def select_book_equity(
-    quarterly_bs: pd.DataFrame, annual_bs: pd.DataFrame, as_of, ticker: str, lag_months: int = 3
+    quarterly_bs: pd.DataFrame,
+    annual_bs: pd.DataFrame,
+    as_of,
+    ticker: str,
+    lag_months: int = settings.book_equity_lag_months,
 ) -> float | None:
     """Try quarterly first, fall back to annual.
 
@@ -303,7 +307,7 @@ def compute_bm(
     return None if market_cap is None else book_equity / market_cap
 
 
-def load_membership(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_membership(db_path: str = settings.db_path) -> pd.DataFrame:
     """columns ['rebalance_date', 'ticker'] — every (date, ticker) pair
     that actually needs an mve value; this is already exactly the set of
     (ticker, rebalance_date) pairs that were real members, not the full
@@ -318,7 +322,7 @@ def load_membership(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     return df
 
 
-def load_prices_for_join(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def load_prices_for_join(db_path: str = settings.db_path) -> pd.DataFrame:
     """columns ['date', 'ticker', 'adj_close'] — only what's needed for the
     nearest-price-on-or-before join, not the full `prices` table.
     """
@@ -331,7 +335,7 @@ def load_prices_for_join(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
     return df
 
 
-def load_unresolved_tickers(db_path: str = DEFAULT_DB_PATH) -> set[str]:
+def load_unresolved_tickers(db_path: str = settings.db_path) -> set[str]:
     """Tickers prices.py already recorded as having zero usable price rows
     anywhere in the fetch window. Empty set if the table is absent.
     """
@@ -372,7 +376,7 @@ def attach_nearest_price(membership: pd.DataFrame, prices: pd.DataFrame) -> pd.D
 
 
 def fetch_all_shares_and_splits(
-    tickers: list[str], pause_seconds: float = 0.25
+    tickers: list[str], pause_seconds: float = settings.yfinance_fundamentals_pause_seconds
 ) -> tuple[dict[str, pd.Series], dict[str, pd.Series]]:
     """Fetch-once-per-ticker: one get_shares_full + one .splits call per
     ticker, reused across every rebalance date that ticker appears on.
@@ -427,7 +431,7 @@ def fetch_balance_sheets(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def fetch_all_ticker_fundamentals(
-    tickers: list[str], pause_seconds: float = 0.25
+    tickers: list[str], pause_seconds: float = settings.yfinance_fundamentals_pause_seconds
 ) -> tuple[dict[str, pd.Series], dict[str, pd.Series], dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Fetch-once-per-ticker for both mve's inputs (shares, splits) and
     bm's inputs (quarterly/annual balance sheet), sharing exactly one
@@ -462,7 +466,7 @@ def fetch_all_ticker_fundamentals(
             continue
 
         try:
-            shares = t.get_shares_full(start=DEFAULT_START, end=DEFAULT_END)
+            shares = t.get_shares_full(start=settings.fetch_start, end=settings.fetch_end)
             shares_by_ticker[ticker] = shares if shares is not None else pd.Series(dtype="float64")
             splits_by_ticker[ticker] = t.splits
         except Exception:
@@ -512,7 +516,7 @@ def compute_bm_column(
     quarterly_bs_by_ticker: dict[str, pd.DataFrame],
     annual_bs_by_ticker: dict[str, pd.DataFrame],
     sec_book_equity_by_ticker: dict[str, pd.DataFrame] | None = None,
-    lag_months: int = 3,
+    lag_months: int = settings.book_equity_lag_months,
 ) -> pd.Series:
     """Row-wise bm = book_equity / market_cap[row]. book_equity is looked
     up once per row; market_cap is reused from compute_market_cap_column's
@@ -579,7 +583,7 @@ def add_cross_sectional_z(df: pd.DataFrame, value_col: str, z_col: str) -> pd.Da
 
 
 def get_factor_reference_stats(
-    rebalance_date, db_path: str = DEFAULT_DB_PATH
+    rebalance_date, db_path: str = settings.db_path
 ) -> dict[str, tuple[float, float]]:
     """Mean and standard deviation of the S&P 500 universe's raw `mve`,
     `bm`, `mom12m` on one `rebalance_date`, recomputed on demand from the
@@ -622,7 +626,7 @@ def get_factor_reference_stats(
     }
 
 
-def write_factors_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> None:
+def write_factors_table(df: pd.DataFrame, db_path: str = settings.db_path) -> None:
     """Write `df` to the `factors` table in the DuckDB file at `db_path`,
     creating the parent directory if needed. Drops any pre-existing table
     first, so re-running this is always safe, and so a future build.py can
@@ -651,7 +655,7 @@ def write_factors_table(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH) -> Non
         con.close()
 
 
-def write_sec_fallback_table(reasons_by_ticker: dict[str, str], db_path: str = DEFAULT_DB_PATH) -> None:
+def write_sec_fallback_table(reasons_by_ticker: dict[str, str], db_path: str = settings.db_path) -> None:
     """Write `sec_fallback_tickers(ticker VARCHAR, reason VARCHAR)` — every
     ticker for which SEC EDGAR coverage was missing or insufficient and
     `bm` fell back to the yfinance-based path. Mirrors prices.py's
@@ -675,7 +679,7 @@ def write_sec_fallback_table(reasons_by_ticker: dict[str, str], db_path: str = D
         con.close()
 
 
-def build_factors(db_path: str = DEFAULT_DB_PATH) -> pd.DataFrame:
+def build_factors(db_path: str = settings.db_path) -> pd.DataFrame:
     """Fetch, join, compute mve and bm, standardize both, write to DuckDB,
     and return the resulting factors DataFrame (mom12m/mom12m_z still
     NULL — a separate, later checklist item).
