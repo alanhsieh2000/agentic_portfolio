@@ -13,16 +13,18 @@ After this plan is done, a person can run one command for a chosen rebalance dat
 ## Progress
 
 
-- [ ] Implement the two-agent consensus rule (intersection, falling back to union when the intersection is too small).
-- [ ] Implement single-agent fallback mode for when only LLM-S or only LLM-F signals are available or requested.
-- [ ] Write `tests/test_candidate_scanner.py` covering both the two-agent consensus rule and the single-agent fallback against small hand-built fixtures.
-- [ ] Manually run the scanner against one real rebalance date using real LLM-S and LLM-F output and sanity-check the resulting candidate count.
+- [x] Implement the two-agent consensus rule (intersection, falling back to union when the intersection is too small).
+- [x] Implement single-agent fallback mode for when only LLM-S or only LLM-F signals are available or requested.
+- [x] Write `tests/test_candidate_scanner.py` covering both the two-agent consensus rule and the single-agent fallback against small hand-built fixtures.
+- [x] Manually run the scanner against one real rebalance date using real LLM-S and LLM-F output and sanity-check the resulting candidate count.
 
 
 ## Surprises & Discoveries
 
 
-(Empty until this plan is implemented. Record here anything about how often the intersection-versus-union fallback actually triggers on real 2020-2024 data — the paper's own framing suggests the fallback should be rare, since LLM-S and LLM-F are each screening a ~500-stock universe down to a much smaller buy set, so their intersection is usually large enough on its own; if the fallback triggers on most rebalance dates in practice, that is worth recording and thinking about.)
+**Real 2024-03-01 run: `branch == "intersection"` fired, not the fallback.** LLM-S's buy set (159 tickers) and LLM-F's buy set (9 tickers) overlapped in exactly 6 tickers - `len(intersection) > 1`, so no fallback was needed. This is a single data point, not a frequency measurement across many dates (that would require running this expensive real pipeline repeatedly, which this plan's Concrete Steps only calls for once) - a real measurement of how often the fallback triggers across the full 2020-2024 window is left to whichever later plan (6's interactive flow, most likely) actually runs the full backtest across all 52 rebalance dates and can cheaply tally branch outcomes as a byproduct.
+
+**Real `generate_signal`/`screen_month` LLM-F calls were far slower this session than in `plans/03_llm_f_agent.md`'s own validation session** - a strictly sequential `screen_month(2024, 3)` run (identical code, identical `LLM_F_MODEL=anthropic/claude-opus-4-8`, same Azure proxy) took over an hour to complete roughly 15 of the ~64 needed real LLM calls (versus completing all 64 in well under 20 minutes in the prior session), with no errors, timeouts, or rate-limit messages in the log - the process was confirmed alive and making genuine forward progress the whole time via `TaskOutput`, just far slower per call. This looks like environment/endpoint-side latency variance (possibly host load on the shared Azure AI Foundry deployment), not a bug in this project's code - `plans/03_llm_f_agent.md`'s own implementation and tests are unchanged and still pass. Given the impracticality of waiting several more hours for a purely sequential run, this plan's Concrete Steps Step 1 validation was instead completed with a one-off, non-production validation script (not checked into `src/`) that parallelizes the same `fetch_headlines`/`generate_signal` calls across a small thread pool (10 workers) - this cut the LLM-F phase from an extrapolated multi-hour runtime down to about 20 minutes, with identical per-ticker logic to the real `screen_month`, just executed concurrently rather than one ticker at a time. This is a one-time validation-script choice, not a change to `src/agents/llm_f_signals.py`'s actual `screen_month`, which remains the plain sequential loop `plans/03_llm_f_agent.md` specifies - if this endpoint-latency issue recurs and `screen_month` itself needs to be faster for regular use (e.g. plan 6's interactive flow running it across many months), that would be a deliberate, separate design decision for whichever plan hits that need, not an unplanned change smuggled in here.
 
 
 ## Decision Log
@@ -39,7 +41,9 @@ After this plan is done, a person can run one command for a chosen rebalance dat
 ## Outcomes & Retrospective
 
 
-(To be filled in once this plan is implemented and validated.)
+This plan is complete. `src/scanner/candidate_scanner.py`'s `scan`/`scan_with_detail` implement the paper's exact consensus rule (intersection, falling back to union when `len(intersection) <= 1`) plus the README-required single-agent "and/or" mode, as pure deterministic set arithmetic with no dependency beyond `pandas`. `tests/test_candidate_scanner.py` (6 tests) covers all 5 required cases from Validation and Acceptance plus the additional zero-overlap-still-union case, using only hand-built fixtures - no database, no network, no LLM. A real end-to-end run against 2024-03-01 (real LLM-S rule + real LLM-S signals + real LLM-F signals across the full ~504-ticker S&P 500 membership) produced a plausible, substantially-narrowed 6-ticker candidate list via the `intersection` branch, with real recognizable tickers (ACN, AMZN, MU, NFLX, NVDA, NXPI).
+
+The one operational surprise (see Surprises & Discoveries) was this session's LLM-F call latency through the Azure proxy being far slower than in the prior `plans/03_llm_f_agent.md` validation session, worked around with a one-off parallelized validation script rather than any change to `screen_month` itself. The paper's own claim that the intersection is trivial (<=1) roughly 50% of the time was not observed in this single real data point (the intersection had 6 tickers), but one date is not enough evidence to confirm or refute that claim at scale - left for whichever later plan runs the full 52-date backtest to measure properly.
 
 
 ## Context and Orientation
@@ -112,7 +116,21 @@ Acceptance for this plan is: `uv run pytest tests/test_candidate_scanner.py` pas
 ## Artifacts and Notes
 
 
-(To be filled in with the real candidate-scan transcript from Concrete Steps, and the fallback-frequency measurement from Surprises & Discoveries, once this plan is executed across multiple real rebalance dates.)
+Concrete Steps Step 1's real transcript — ran 2026-08-06 with `LLM_S_MODEL=anthropic/claude-opus-4-8`/`LLM_F_MODEL=anthropic/claude-opus-4-8` (see Surprises & Discoveries for why the LLM-F half ran via a parallelized one-off script rather than `screen_month` directly - same per-ticker logic, just concurrent):
+
+    RULE (real generate_rule(2024)): buy_condition='(mom12m > 0.25 and bm > -0.3) or mom12m > 1.0',
+      sell_condition='mom12m < -0.65 or (bm > 0.4 and mom12m < -0.3)', with a full economic rationale
+      (momentum-primary strategy with a value guardrail, referencing real 2023 mega-cap names).
+    LLM-S signal counts (screen(rule, date(2024, 3, 1)), real 480-firm 2023-12-01 snapshot):
+      {'hold': 204, 'buy': 159, 'sell': 120}
+    LLM-F signal counts (real 2024-03 headlines, real full 504-ticker membership):
+      {'hold': 491, 'buy': 9, 'sell': 4}
+    BRANCH: intersection
+    SIZES: {'branch': 'intersection', 'buy_s_size': 159, 'buy_f_size': 9,
+             'intersection_size': 6, 'union_size': 162}
+    CANDIDATES: ['ACN', 'AMZN', 'MU', 'NFLX', 'NVDA', 'NXPI']
+
+6 tickers out of a ~504-stock universe (about 1.2%) - substantially narrowed, exactly matching the paper's own framing, and every ticker is a recognizable real company (Accenture, Amazon, Micron, Netflix, Nvidia, NXP Semiconductors) rather than an implausible or degenerate result. The intersection branch fired naturally (6 > 1), so the union fallback was not exercised in this one real run - see Surprises & Discoveries for why a real fallback-frequency measurement needs more than one date's worth of data.
 
 
 ## Interfaces and Dependencies
