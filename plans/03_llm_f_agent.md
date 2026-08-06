@@ -23,7 +23,7 @@ README.md names this project's version of that agent "LLM-F" and explicitly fram
 - [x] Measure and record actual `yfinance` news coverage across the 2020-2024 backtest window (this is the single biggest open risk in this plan and must be measured, not assumed).
 - [x] Write `tests/test_llm_f.py` covering the news-to-signal plumbing against fixtures (not real LLM calls).
 - [x] Manually run the agent for at least one real ticker and month and sanity-check the output.
-- [ ] Write `src/agents/llm_f_signals.py`'s `screen_month(year, month, db_path)` (required by Interfaces and Dependencies below, but not separately itemized when this checklist was first drafted) and run Concrete Steps Step 3 for one real month.
+- [x] Write `src/agents/llm_f_signals.py`'s `screen_month(year, month, db_path)` (required by Interfaces and Dependencies below, but not separately itemized when this checklist was first drafted) and run Concrete Steps Step 3 for one real month.
 
 
 ## Surprises & Discoveries
@@ -66,7 +66,11 @@ README.md names this project's version of that agent "LLM-F" and explicitly fram
 ## Outcomes & Retrospective
 
 
-(To be filled in once this plan is implemented and validated, including the actual measured news-coverage numbers from the Progress checklist's coverage-measurement step.)
+This plan is complete. LLM-F exists end-to-end: `fetch_headlines` (`src/agents/news.py`) sources headlines from a hybrid of the ingested Hugging Face archive (`src/dataset/news_archive.py`'s `news_articles_hf` table, the primary source for any 2020-01 through 2024-04 month) and live `yfinance.news` (fallback for months outside that range); `generate_signal` (`src/agents/llm_f.py`, backed by `LLMFCrew` in `src/agents/llm_f_crew/`, prompts separated into YAML per `LLMSCrew`'s pattern) turns a batch of headlines into a `SentimentSignal`; `screen_month` (`src/agents/llm_f_signals.py`) runs this across an entire month's S&P 500 membership.
+
+The single biggest open risk this plan flagged at the outset — `yfinance.news`'s historical coverage — was measured, not assumed, and turned out to be total: zero historical reach at all, confirmed live. The Hugging Face archive substitutes real (if sparse, ~6.5% ticker-month coverage) historical signal for exactly the months yfinance could never have answered. A full real run of `screen_month(2024, 3)` against the actual ~500-ticker universe produced a plausible, non-degenerate split (491 hold / 10 buy / 3 sell), with only 64 tickers needing a real LLM call — the rest resolved instantly via the empty-headlines path, keeping the full-universe run cheap enough to actually execute rather than needing a contrived subset. `uv run pytest tests/test_llm_f.py` (8 tests) and `tests/test_news_archive.py` (3 tests) pass with no network or LLM access.
+
+Not addressed by this plan, left for later plans per its own scope: persisting `screen_month`'s per-month signals for backtest stability (`plans/06_interactive_flow.md`'s responsibility, per Idempotence and Recovery below) and the intersection-based consensus between LLM-F and LLM-S (`plans/04_candidate_scanner.md`'s responsibility, confirmed by reading the reference paper's Section 5.2).
 
 
 ## Context and Orientation
@@ -202,7 +206,17 @@ Concrete Steps Step 2's transcript — ran 2026-08-06 with `LLM_F_MODEL=anthropi
 
 The rationale visibly and specifically references the actual fetched headline content (the EU probe, iPhone sales drop, Tim Cook's China visit, the AI-conference counterpoint) rather than generic boilerplate — the acceptance bar this step's Expected Output calls for. Also verified separately: `generate_signal(ticker, year, month, [])` returns `signal='hold', confidence=0.0` with no LLM call at all, for an out-of-archive-range, no-live-news month (`AAPL`, 2020-01).
 
-Step 3's transcript (`screen_month` full-month run) remains pending — that requires implementing `src/agents/llm_f_signals.py` (required by Interfaces and Dependencies below, though not separately itemized in the Progress checklist above) plus Progress item 6's test coverage, both out of scope for this pass.
+Concrete Steps Step 3's transcript — ran 2026-08-06 with `LLM_F_MODEL=anthropic/claude-opus-4-8` against the real, full ~500-ticker 2024-03-01 membership (no subset slicing needed: only 64 of 504 tickers had any archive coverage for 2024-03, so only 64 real LLM calls were made; the other 440 returned `hold`/`0.0` instantly via the empty-headlines path):
+
+    from src.agents.llm_f_signals import screen_month
+    signals = screen_month(2024, 3)
+    print(signals['signal'].value_counts())
+    # signal
+    # hold    491
+    # buy      10
+    # sell      3
+
+A plausible, non-degenerate three-way split (AAPL correctly `sell`, matching Step 2's transcript above; ACN `buy`). `uv run pytest tests/test_llm_f.py` (8 tests, including 2 new `screen_month` tests against a hand-built `sp500_membership`/`news_articles_hf` fixture with `generate_signal` monkeypatched, mirroring how `tests/test_llm_s.py` tests `screen`) passes with `ANTHROPIC_API_KEY` unset, confirming no test depends on network or LLM access.
 
 
 ## Interfaces and Dependencies
