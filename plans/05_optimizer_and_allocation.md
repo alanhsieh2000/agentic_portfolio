@@ -16,7 +16,7 @@ After this plan is done, a person can hand this tool a list of tickers (whether 
 ## Progress
 
 
-- [ ] Implement the trailing monthly-returns matrix loader (with a minimum-history drop rule) that feeds expected-return and covariance-matrix estimation.
+- [x] Implement the trailing monthly-returns matrix loader (with a minimum-history drop rule) that feeds expected-return and covariance-matrix estimation.
 - [ ] Implement the three weight-optimization functions (GMV, MV, MSR) using PyPortfolioOpt, fed by monthly returns rather than daily prices.
 - [ ] Implement a separate latest-price lookup (from the `prices` table) for the allocation step, independent of the returns matrix.
 - [ ] Implement the discrete share-allocation step using PyPortfolioOpt's `DiscreteAllocation`.
@@ -26,8 +26,9 @@ After this plan is done, a person can hand this tool a list of tickers (whether 
 
 ## Surprises & Discoveries
 
+`load_returns_matrix` is implemented in `src/optimizer/portfolio.py`, split into a DB-reading half (`_load_window_dates`, `_load_returns_long`) and two pure, independently-testable halves (`pivot_returns_matrix`, `apply_min_history_rule`), per this plan's own Validation and Acceptance hint to isolate the drop-logic from the actual database read. Verified against the real `data/portfolio.duckdb`: for 8 long-established large caps (AAPL, MSFT, JPM, XOM, JNJ, PG, KO, DIS) as of 2024-03-01, all 60 months of the lookback window are present and non-null, and a nonexistent ticker is correctly dropped and logged with 0 months of history. Covered by `tests/test_optimizer.py` (min-months drop, recent-IPO leading nulls kept, internal-gap drop, pre-`as_of`-delisting trailing nulls kept).
 
-(Empty until this plan is implemented. Record here anything about PyPortfolioOpt's actual behavior on real market data worth knowing — for example, if `max_sharpe` or `efficient_return` fails to converge or raises on certain small or highly-correlated candidate sets, which is a real, documented PyPortfolioOpt behavior worth having a fallback for once observed rather than guessed at in advance.)
+(Remaining to observe once `compute_weights` is implemented: whether `max_sharpe` or `efficient_return` fails to converge or raises on certain small or highly-correlated candidate sets, a real, documented PyPortfolioOpt behavior worth having a fallback for once observed rather than guessed at in advance.)
 
 
 ## Decision Log
