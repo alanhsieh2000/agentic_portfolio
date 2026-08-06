@@ -24,13 +24,16 @@ The paper reruns its fundamentals agent once per year, on the theory that broad 
 - [x] (2026-08-05) Write the deterministic rule-application function that takes a produced rule and a set of per-stock factor values and returns a buy/sell/hold signal per stock. Implemented `apply_rule(rule: ScreeningRule, factor_row: dict) -> str` in `src/agents/llm_s_apply.py`, checking `buy_condition` first (via the shared `condition_eval.evaluate_condition`) then `sell_condition`, defaulting to `"hold"`. Verified end-to-end: returns `"buy"`/`"sell"`/`"hold"` correctly for rows matching only the buy condition, only the sell condition, or neither, and resolves buy-takes-precedence when a row (pathologically) matches both.
 - [x] (2026-08-05) Write `screen(rule, rebalance_date, db_path=...)` in `src/agents/llm_s_signals.py`, mapping `factors`'s `_z` columns to the bare `mve`/`bm`/`mom12m` keys and applying `apply_rule` per ticker. Verified end-to-end: against a hand-built fixture DuckDB table with one null-`mve_z` row, correctly excludes that row and returns the right buy/sell/hold signal for each of the remaining three; against the real `data/portfolio.duckdb` for `2024-03-01`, returns a plausible three-way split (2 buy / 131 sell / 350 hold) with real, recognizable ticker symbols.
 - [x] (2026-08-05) Write `tests/test_llm_s.py` covering the evaluator, rule application, `screen`, and the 4 tools against a small fixture table (not rule generation itself, which needs a real LLM call). 10 tests, all passing (`uv run pytest tests/test_llm_s.py`), covering every Validation and Acceptance required case; full repo suite (`uv run pytest tests/`) still passes at 62/62. Minor fixup along the way: added `__test__ = False` to `TestComplexConditionTool` since pytest's collector otherwise misidentifies it as a test class from its `Test`-prefixed name.
-- [ ] Manually run the agent for at least one real year and sanity-check the rule it produces against the paper's own worked 2024 example.
+- [x] (2026-08-06) Manually run the agent for at least one real year and sanity-check the rule it produces against the paper's own worked 2024 example. Ran `generate_rule(2024)` with `LLM_S_MODEL=anthropic/claude-opus-4-8` against the real 2023-12-01 snapshot (480 firms). Verified end-to-end: the verbose CrewAI trace shows the agent calling `get_database_schema` once, `get_extreme_firms` six times, `query_firm_database` twice, and `test_complex_condition` roughly a dozen times to iteratively test candidate thresholds before finalizing — it explored rather than shortcut to an answer. Produced `buy_condition='(mom12m > 0.55 and mve > -0.9) or (bm > 0.2 and mom12m > -0.15)'`, `sell_condition='mom12m < -0.85 or (bm > 0.4 and mom12m < -0.5)'`, with precise (non-round) thresholds in range, referencing only `mve`/`bm`/`mom12m`. Structurally matches the paper's worked 2024 example (undervalued-plus-momentum BUY logic, momentum/value-trap SELL logic) without needing an exact numeric match, per this plan's own acceptance bar. Applied the rule via `screen(rule, date(2024, 3, 1))` against real data: 106 buy / 71 sell / 306 hold, with recognizable real tickers (NVDA, MSFT, NFLX, MU) in the buy set — a plausible three-way split. `uv run pytest tests/test_llm_s.py` still passes (10/10) after the run.
 
 
 ## Surprises & Discoveries
 
 
 (Record here anything about how the chosen LLM actually behaves — for example, if it produces rules referencing factors other than the three it was given, or thresholds far outside the standardized [-3, 3]-ish range one would expect from mean-0/variance-1 data, both of which would need a decision about whether to reject and retry the generation. Also record here whether the agent actually calls its 4 tools before answering, or tries to shortcut straight to a final rule without exploring the data.)
+
+- Discovery (2026-08-06): with `LLM_S_MODEL=anthropic/claude-opus-4-8`, the agent called all 4 tools, used `test_complex_condition` heavily (roughly a dozen calls) to compare candidate BUY/SELL thresholds by match count/percentage before settling on a final rule, and explicitly checked (and reported in its rationale) that the BUY and SELL sets did not overlap. It also flagged two rows (`BNY`, `ECHO`) as likely data artifacts (implausible `bm` z-scores of 20.47 and 6.45) and adjusted its size threshold (`mve > -0.9`) specifically to exclude the corresponding extreme-negative-`mve` tail — this is exploratory judgment the plan's tools enable but don't explicitly prompt for. All thresholds landed in the expected roughly `[-1, 1]` range, well within `[-3, 3]`, and only `mve`/`bm`/`mom12m` were referenced. No code or prompt changes were needed to get this behavior — `LLM_S_MODEL` alone was sufficient to point the existing implementation at a different Anthropic model.
+- Discovery (2026-08-06): CrewAI's native Anthropic integration (not LiteLLM, which isn't installed in this repo) resolves any `anthropic/claude-...` model string through the real `anthropic` Python SDK, which itself falls back to reading `ANTHROPIC_BASE_URL` from the environment when `crew.py` doesn't set an explicit `base_url`. This means a custom Anthropic-compatible endpoint (e.g. this environment's proxy) works with zero code changes — just exporting `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` in the shell before the run. Also: neither `llm_s.py` nor `crew.py` call `load_dotenv()`, so `.env` must be sourced into the shell explicitly (`set -a && source .env && set +a`) — it is not auto-loaded.
 
 - Discovery (2026-08-05): the earlier draft of this plan specified both a subpackage `src/agents/llm_s/` (holding the CrewAI machinery) and a flat module `src/agents/llm_s.py` (the `generate_rule` entry point) as siblings under `src/agents/`. Python cannot have a package and a module of the same name in the same parent package — confirmed empirically (`from src.agents.llm_s import generate_rule` raised `ImportError`, because the package's `__init__.py` silently shadows the module). Fixed by renaming the subpackage to `src/agents/llm_s_crew/` throughout this plan, keeping `src/agents/llm_s.py` as the flat entry point plan 4/6 already depend on. The equivalent future rename applies to plan 3's `LLMFCrew` (`src/agents/llm_f_crew/`, not `src/agents/llm_f/`) for the identical reason, since plan 3 will have the same `llm_f.py`/`llm_f_crew/` naming collision once it gets its own C.5-style rewrite.
 - Discovery (2026-08-05): `src/agents/llm_s_signals.py`'s `screen` function was fully specified in Plan of Work and promised to plan 4 in Interfaces and Dependencies, but the earlier rewrite of this plan dropped it from both the Progress checklist and the Validation and Acceptance required-test-cases list (the intro paragraph there already mentioned `screen`, but no bullet actually required a test for it). Fixed by adding both back before implementing `screen`.
@@ -66,7 +69,7 @@ The paper reruns its fundamentals agent once per year, on the theory that broad 
 ## Outcomes & Retrospective
 
 
-(To be filled in once this plan is implemented and validated.)
+This plan is complete. LLM-S generates a rule via one real LLM call per year, exploring a causally-masked snapshot through its 4 tools rather than being handed a pre-computed summary, and the resulting rule applies deterministically to real data with no LLM involvement at screening time. The one manual-run item (real LLM call, not unit-testable) confirmed the design works end-to-end against Anthropic Claude, including against a non-default model pointed at via `LLM_S_MODEL` and a custom `ANTHROPIC_BASE_URL`, with no code changes required for either.
 
 
 ## Context and Orientation
@@ -359,7 +362,39 @@ Acceptance for this plan is: `uv run pytest tests/test_llm_s.py` passes; the Con
 ## Artifacts and Notes
 
 
-(To be filled in with the real generated `ScreeningRule` transcript and signal counts from Concrete Steps once this plan is executed.)
+Real `ScreeningRule` generated 2026-08-06 via `generate_rule(2024)` with `LLM_S_MODEL=anthropic/claude-opus-4-8`, against the real 2023-12-01 snapshot (480 firms):
+
+```
+year=2024
+buy_condition='(mom12m > 0.55 and mve > -0.9) or (bm > 0.2 and mom12m > -0.15)'
+sell_condition='mom12m < -0.85 or (bm > 0.4 and mom12m < -0.5)'
+rationale="Data exploration on the 2023-12-01 causally-masked snapshot (480 S&P 500 firms, all
+characteristics as cross-sectional z-scores) revealed the following. SIZE (mve) is strongly
+right-skewed: mega-caps AAPL (3.96), MSFT (3.89), GOOG/GOOGL (~3.44), AMZN (3.37), NVDA (3.12) and
+META (2.83) dominate the right tail, while the extreme negative mve names (ECHO -4.25, BNY -3.08)
+are distressed/data-artifact firms that also carry corrupt bm values. VALUE (bm) is extremely
+right-skewed with two clear outliers (BNY 20.47, ECHO 6.45) that are artifacts; the real value
+cluster is banks/financials and old-economy cyclicals. MOMENTUM (mom12m) is the strongest and
+best-populated signal for late 2023, with the Magnificent-Seven/AI complex in the right tail and
+clean-energy/broken-growth names in the left tail. Momentum is chosen as the dominant BUY engine,
+with a size floor to exclude distressed artifact names, plus a secondary value-without-collapse
+leg for diversification. SELL targets deep-negative-momentum falling knives and high-bm value
+traps whose price is also declining. BUY matches 117 firms (~24%), SELL 83 firms (~17%),
+non-overlapping, verified via test_complex_condition."
+```
+
+Applying this rule via `screen(rule, date(2024, 3, 1))` against real `data/portfolio.duckdb` data:
+
+```
+signal
+hold    306
+buy     106
+sell     71
+```
+
+Sample buy tickers: NFLX, NTAP, NVDA, NOW, MU, MSFT, NVR, NWSA, PHM, PH.
+
+Full verbose CrewAI trace (tool calls, intermediate reasoning) captured at generation time; not checked into the repo, but reproducible by re-running Concrete Steps Step 2 with the same `LLM_S_MODEL`.
 
 
 ## Interfaces and Dependencies
