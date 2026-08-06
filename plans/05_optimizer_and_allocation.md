@@ -21,7 +21,7 @@ After this plan is done, a person can hand this tool a list of tickers (whether 
 - [x] Implement a separate latest-price lookup (from the `prices` table) for the allocation step, independent of the returns matrix.
 - [x] Implement the discrete share-allocation step using PyPortfolioOpt's `DiscreteAllocation`.
 - [x] Write `tests/test_optimizer.py` covering weight computation and allocation against small fixture price series with hand-checkable expected results.
-- [ ] Manually run all three objectives against a real candidate list from `plans/04_candidate_scanner.md` and sanity-check the resulting weights and share counts.
+- [x] Manually run all three objectives against a real candidate list from `plans/04_candidate_scanner.md` and sanity-check the resulting weights and share counts.
 
 
 ## Surprises & Discoveries
@@ -80,7 +80,13 @@ All three are exactly the kind of thing this section exists for: none were guess
 ## Outcomes & Retrospective
 
 
-(To be filled in once this plan is implemented and validated.)
+This plan is complete. All six Progress items are done: `src/optimizer/portfolio.py` implements `load_returns_matrix`, `compute_weights`, `load_latest_prices`, and `allocate_shares` exactly as specified in Interfaces and Dependencies below; `tests/test_optimizer.py` (18 tests) covers every Validation and Acceptance case and more; and both the small hand-picked sanity set (8 large caps) and a real, independently-sourced candidate list (plan 4's own live LLM-S/LLM-F output, `['ACN', 'AMZN', 'MU', 'NFLX', 'NVDA', 'NXPI']`) produce plausible, sum-to-one weights and dollar-accurate allocations across all three objectives.
+
+The real value of implementing this plan carefully turned out to be almost entirely in the Surprises & Discoveries above, not the code itself, which ended up short. Three of PyPortfolioOpt's behaviors directly contradicted this plan's own earlier prose (`frequency=12` annualizing instead of "just labeling" monthly data; `CovarianceShrinkage.ledoit_wolf()` zero-filling NaN for every shrinkage target; `efficient_return()`'s inequality constraint making an initial "close to target" sanity check false-positive on real data) - none were guessable from the library's documentation alone, and all three would have silently produced wrong portfolios (an annualized-vs-monthly unit mismatch on the MV objective's own target return; fabricated zero returns for any future candidate list with a recent IPO; a spurious `ValueError` blocking an otherwise-correct MV result) had this plan's implementation trusted its own prior prose instead of running real code against real data at every step and treating a suspicious number as a lead rather than noise. Every one of these is now corrected in the Decision Log and Plan of Work above, and covered by a regression test, so a later plan (6's interactive flow) inherits the fix rather than needing to rediscover it.
+
+Two smaller, environment-specific gotchas (a `pandas.merge_asof` datetime-unit mismatch and a pandas 3.0 string-dtype inference quirk, both in `load_latest_prices`) are recorded for the same reason, even though neither invalidated any prior decision - they're the kind of thing that costs real debugging time if hit cold in a later plan without this note.
+
+Nothing from this plan's own scope was deferred or left undone. The one open item explicitly deferred to later plans, by design (not oversight): whether `max_sharpe`/`efficient_return` behave differently on a larger or more highly-correlated real candidate list than the two (8-ticker and 6-ticker) this plan exercised - left for plan 6's full interactive flow to observe as a natural byproduct of its own broader real usage, per the note already recorded in Surprises & Discoveries above.
 
 
 ## Context and Orientation
@@ -163,7 +169,34 @@ Acceptance for this plan is: `uv run pytest tests/test_optimizer.py` passes; the
 ## Artifacts and Notes
 
 
-(To be filled in with the real three-objective weight comparison and allocation transcript from Concrete Steps once this plan is executed.)
+Concrete Steps Step 2's small-sanity-check transcript (8 long-established large caps) is recorded in Surprises & Discoveries above, alongside the three real bugs it surfaced and fixed.
+
+The wider, real-candidate-list run this plan's last Progress item calls for reused `plans/04_candidate_scanner.md`'s own real, already-recorded 2024-03-01 output (its Artifacts and Notes section) rather than re-running the expensive LLM-S/LLM-F pipeline again — `['ACN', 'AMZN', 'MU', 'NFLX', 'NVDA', 'NXPI']`, the intersection of a real LLM-S buy set (159 tickers) and a real LLM-F buy set (9 tickers). Ran 2026-08-06:
+
+    from datetime import date
+    from src.optimizer.portfolio import load_returns_matrix, load_latest_prices, compute_weights, allocate_shares
+    tickers = ['ACN', 'AMZN', 'MU', 'NFLX', 'NVDA', 'NXPI']
+    as_of = date(2024, 3, 1)
+    returns = load_returns_matrix(tickers, as_of)
+    latest = load_latest_prices(tickers, as_of)
+    for objective in ['GMV', 'MV', 'MSR']:
+        weights = compute_weights(returns, objective)
+        alloc, leftover = allocate_shares(weights, latest, 100000)
+        ...
+
+    months available per ticker: all 6 tickers have the full 60/60 months (no min-history drops - every
+      one of these is a long-established company with price history well before 2019, the start of this
+      as_of date's 60-month lookback window).
+    latest adj_close (2024-03-01): ACN 363.54, AMZN 178.22, MU 94.38, NFLX 61.93, NVDA 82.13, NXPI 246.42.
+
+    GMV weights: {'ACN': 0.6161, 'AMZN': 0.2693, 'MU': 0.1146}          (sum = 1.0)
+      allocation: {'ACN': 169, 'AMZN': 151, 'MU': 122}, leftover $135.48, implied $99,864.52, total $100,000.00
+    MV weights:  {'ACN': 0.6161, 'AMZN': 0.2693, 'MU': 0.1146}          (sum = 1.0, identical to GMV)
+      allocation: {'ACN': 169, 'AMZN': 151, 'MU': 122}, leftover $135.48, implied $99,864.52, total $100,000.00
+    MSR weights: {'ACN': 0.1335, 'NVDA': 0.8666}                       (sum = 1.0)
+      allocation: {'NVDA': 1055, 'ACN': 36}, leftover $262.12, implied $99,737.88, total $100,000.00
+
+Sanity-checks: every objective's weights sum to 1.0 and every allocation's implied dollar value plus leftover cash equals exactly $100,000.00. GMV and MV are identical here for the same, already-understood reason recorded in the Decision Log above (verified: GMV's own unconstrained realized return on this candidate set is ~1.57%/month, above the 1%/month default target, so `efficient_return`'s constraint is non-binding) - not a bug, and a real second data point confirming this isn't specific to the earlier 8-large-cap set. MSR visibly differs in kind, not just degree, from GMV/MV: it drops AMZN and MU entirely and concentrates 87% of the portfolio in NVDA (this candidate list's best trailing risk-adjusted performer over the window) plus a small ACN stake - the same qualitative "MSR concentrates, GMV/MV diversify" signature this plan's Concrete Steps describes, now confirmed on a second, independently-sourced (LLM-driven, not hand-picked) real candidate list rather than only the hand-picked 8-large-cap sanity set.
 
 
 ## Interfaces and Dependencies
