@@ -1,0 +1,13 @@
+sentiment_task:
+  description: >
+    Read the following news headlines about {ticker}, published in {month}, and decide whether
+    the aggregate tone of this news suggests BUY, SELL, or HOLD for the stock. Provide a
+    confidence level between 0 and 1, and a rationale that visibly references specific content
+    from the headlines below - do not write generic boilerplate.
+
+    Headlines:
+    {headlines}
+  expected_output: >
+    A SentimentSignal for ticker {ticker}, month {month}: a signal (buy, sell, or hold), a
+    confidence level between 0 and 1, and a rationale grounded in the specific headlines provided.
+  agent: sentiment_agent
