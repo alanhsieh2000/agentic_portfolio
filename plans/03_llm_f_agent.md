@@ -20,7 +20,7 @@ README.md names this project's version of that agent "LLM-F" and explicitly fram
 - [ ] Write the news-fetching function using `yfinance`'s per-ticker `.news` accessor.
 - [ ] Write the CrewAI agent and task that turns a batch of headlines into that schema.
 - [ ] Wire in the configurable-model environment variable (`LLM_F_MODEL`).
-- [ ] Measure and record actual `yfinance` news coverage across the 2020-2024 backtest window (this is the single biggest open risk in this plan and must be measured, not assumed).
+- [x] Measure and record actual `yfinance` news coverage across the 2020-2024 backtest window (this is the single biggest open risk in this plan and must be measured, not assumed).
 - [ ] Write `tests/test_llm_f.py` covering the news-to-signal plumbing against fixtures (not real LLM calls).
 - [ ] Manually run the agent for at least one real ticker and month and sanity-check the output.
 
@@ -28,7 +28,15 @@ README.md names this project's version of that agent "LLM-F" and explicitly fram
 ## Surprises & Discoveries
 
 
-(Empty until this plan is implemented. The single most important thing to record here, with hard evidence, is what `yfinance`'s `.news` accessor actually returns for headline dates in, say, 2020 or 2021 — if it returns mostly or entirely recent-dated headlines regardless of the ticker's history, that is the fidelity gap flagged in the Decision Log below made concrete, and it directly limits how meaningful LLM-F's signal is for the historical backtest years versus the live/current mode.)
+**`yfinance.Ticker(ticker).news` has zero historical reach — confirmed, not just suspected.** Verified live on 2026-08-06 for `AAPL`, `MSFT`, `XOM`, `F`: each returned exactly 10 items, and every single item across all 4 tickers was dated `2026-08-05` (i.e. the day before the call, the most recent trading day) — none older. The response shape itself has also changed since this plan was written: the publish date lives at `item['content']['pubDate']` (ISO 8601 with a `Z` suffix), not a top-level `publish_date`/`providerPublishTime` field. Concretely, this means `fetch_headlines` as originally scoped (querying live `yfinance.news` for a historical month like 2021-03) will always return an empty list for every backtest month — this is not a partial-coverage gap, it is total. The fidelity risk flagged in the Decision Log below is confirmed in its strongest form.
+
+**The Hugging Face archive (`KrossKinetic/SP500-Financial-News-Articles-Time-Series`) does have real, dated 2020-2024 coverage, but it is sparse and uneven.** Downloaded and ingested into `data/portfolio.duckdb::news_articles_hf` via the new `src/dataset/news_archive.py` (see Decision Log entry below for why this was added to this plan's scope). Measured facts:
+
+- 4,589 total rows, 469 distinct tickers, real `publish_date` values spanning 2006-12-04 through 2024-04-20 (confirmed via `DESCRIBE`/`min`/`max` on the actual downloaded Parquet file, not the dataset card's advertised schema). No null `publish_date` or `symbol` values.
+- 2,621 of the 4,589 rows (57%) fall inside this project's actual rebalance window (`settings.rebalance_start`/`rebalance_end` = 2020-01-01 through 2024-04-30) — the archive is weighted toward exactly the years this project needs, consistent with it being the same dataset the reference paper used (its end date, April 2024, matches `settings.fetch_end`/`rebalance_end` almost exactly).
+- Joined against the real per-month S&P 500 universe (`sp500_membership`, 52 rebalance months, 26,268 total (ticker, month) pairs 2020-01 through 2024-04): every one of the 52 months has at least some archive coverage (no calendar gaps), and 405 of the 580 tickers that were ever S&P 500 members in that window (70%) have at least one article somewhere in it.
+- But per-(ticker, month) coverage is thin: only 1,708 of 26,268 pairs (6.5%) have ≥1 archive article in that exact calendar month. A given ticker in a given month usually still has zero headlines from this archive — consistent with most tickers capping out at ~10 articles across the entire 18-year source dataset.
+- Monthly volume within the window is heavily skewed toward its later end, not even: 16 articles in 2020-01 versus 171 in 2024-04 (roughly 10x growth), so the 2020 portion of the backtest is thinner than the 2023-2024 portion even within the archive's own covered range.
 
 
 ## Decision Log
@@ -43,6 +51,9 @@ README.md names this project's version of that agent "LLM-F" and explicitly fram
 - Decision: default LLM-F to Anthropic Claude via the same `LLM_F_MODEL` environment-variable pattern as LLM-S's `LLM_S_MODEL` in `plans/02_llm_s_agent.md`, independently configurable so a user could, for example, run LLM-S on Claude and LLM-F on a different provider.
   Rationale: matches the user's stated default-plus-configurable preference from the interview, applied consistently to both agents.
   Date/Author: 2026-08-05, plan author.
+- Decision: add `src/dataset/news_archive.py` (downloads and ingests the Hugging Face dataset `KrossKinetic/SP500-Financial-News-Articles-Time-Series` into a new `news_articles_hf` table in `data/portfolio.duckdb`, no new dependency needed — `requests` downloads the Parquet file locally, then DuckDB's built-in Parquet reader loads it, avoiding any reliance on DuckDB's `httpfs` extension auto-install) and use it as the **primary** source in `fetch_headlines` for any (ticker, month) inside the archive's covered range (2020-01 through 2024-04), falling back to live `yfinance.news` only for months outside that range (i.e. a genuinely live/current-month run). This supersedes, without deleting, the yfinance-only decision above.
+  Rationale: measured directly (see Surprises & Discoveries) rather than assumed, per this plan's own stated requirement. `yfinance.news` has zero historical reach at all — verified live, every returned item across 4 sample tickers was dated the day of the call, none older — so it cannot answer any 2020-2024 backtest month by itself. The HF archive does have real dated coverage across the full backtest window (every one of the 52 rebalance months has some coverage), even though per-ticker-month coverage is sparse (6.5% of pairs). A sparse-but-real historical signal for some ticker-months is strictly better than a live source that can supply zero signal for any of them; the existing "empty headlines -> hold, confidence 0.0" path already handles the (majority) case where neither source has anything, so this hybrid adds coverage without fabricating signal where none exists.
+  Date/Author: 2026-08-06, measured and decided this session, per user's request to evaluate the specific dataset named in the reference paper (arXiv:2603.23300, page 19).
 
 
 ## Outcomes & Retrospective
@@ -69,7 +80,7 @@ This plan uses CrewAI exactly as described in `plans/02_llm_s_agent.md`'s Contex
 Create `src/agents/llm_f_schema.py` defining a Pydantic model `SentimentSignal` with fields: `ticker: str`, `month: str` (an ISO `"YYYY-MM"` string), `signal: str` (one of `"buy"`, `"sell"`, `"hold"`, enforced with a Pydantic `Literal` type rather than a bare `str`), `confidence: float` (0 to 1), and `rationale: str`.
 
 
-Create `src/agents/news.py` with a function `fetch_headlines(ticker: str, year: int, month: int, limit: int = 20) -> list[dict]` that calls `yfinance.Ticker(ticker).news` and filters the results to those whose publish date (check the exact field name in the installed `yfinance` version's response shape — this has changed across `yfinance` releases, and the code must fail with a clear error naming what fields it did find if the expected date field is absent, rather than silently returning an empty list that looks identical to "no news that month") falls within the given year and month, returning at most `limit` items, each as a dict with at minimum a `title` and a `publish_date`. If `yfinance` returns zero headlines for a ticker/month, that is a valid, expected outcome (not every stock makes news every month) and must be represented as an empty list, not an exception.
+Create `src/agents/news.py` with a function `fetch_headlines(ticker: str, year: int, month: int, limit: int = 20) -> list[dict]` that, per the Decision Log's hybrid-source decision (measured this plan, see Surprises & Discoveries): first queries `data/portfolio.duckdb::news_articles_hf` (populated by `src/dataset/news_archive.py`) for rows matching `ticker` and that calendar month; if the requested `(year, month)` falls outside the archive's covered range (2020-01 through 2024-04 as measured — check the table's actual `min(publish_date)`/`max(publish_date)` rather than hardcoding these bounds, in case the archive is re-ingested with different coverage later), fall back to calling `yfinance.Ticker(ticker).news` and filtering to that month (verified live: the real field is nested at `item["content"]["pubDate"]`, ISO 8601 with a `Z` suffix, not a top-level `publish_date` — and, per Surprises & Discoveries, this live call only ever returns items dated the day of the call, so in practice this fallback path only ever produces anything for the actual current month, not historical ones). Returns at most `limit` items, each as a dict with at minimum a `title` and a `publish_date`. If neither source returns anything for a ticker/month, that is a valid, expected outcome (confirmed common: only 6.5% of (ticker, month) pairs in the real S&P 500 universe have any archive coverage at all) and must be represented as an empty list, not an exception.
 
 
 Create `src/agents/llm_f.py` with a function `generate_signal(ticker: str, year: int, month: int, headlines: list[dict], model: str | None = None) -> SentimentSignal`. If `headlines` is empty, skip the LLM call entirely and return a `SentimentSignal` with `signal="hold"`, `confidence=0.0`, and a `rationale` stating plainly that no news was found for that ticker and month — calling an LLM with nothing to reason about would either waste a call or invite the model to fabricate sentiment from nothing, neither of which is acceptable. Otherwise, build a CrewAI `Agent` with a role along the lines of "financial news sentiment analyst," instruct it, in the Task description, to read the provided headlines for the given ticker and month and decide whether the aggregate tone suggests buying, selling, or holding the stock, with an explicit confidence level and rationale — this is deliberately a holistic judgment call by the LLM, not a decomposition into positive/negative probability scores the way FinBERT itself would produce them, matching README's framing of LLM-F as replacing FinBERT's role rather than reimplementing FinBERT's specific mechanism. Set `response_format=SentimentSignal` on the Task/Agent per whatever the installed CrewAI version's current API calls for. Resolve the LLM string as `os.environ.get("LLM_F_MODEL", "anthropic/claude-sonnet-4-5")` (or the current recommended Claude model string at implementation time), independently of `LLM_S_MODEL`.
@@ -141,13 +152,32 @@ Acceptance for this plan is: `uv run pytest tests/test_llm_f.py` passes; the Con
 ## Artifacts and Notes
 
 
-(To be filled in with the real news-coverage measurement transcript and generated-signal example from Concrete Steps once this plan is executed.)
+Concrete Steps Step 1's measurement transcript (yfinance side) — ran 2026-08-06:
+
+    uv run python -c "
+    import yfinance as yf
+    for ticker in ['AAPL', 'MSFT', 'XOM', 'F']:
+        news = yf.Ticker(ticker).news
+        print(ticker, 'total items:', len(news))
+    "
+    # AAPL total items: 10, MSFT total items: 10, XOM total items: 10, F total items: 10
+    # every item across all 4 tickers: content.pubDate == '2026-08-05T...' (the call date) - no exceptions.
+
+HF archive coverage measurement (this session's addition to Step 1, same underlying risk) — ran 2026-08-06 against the ingested `news_articles_hf` table joined to `sp500_membership`:
+
+    archive rows in [2020-01-01, 2024-04-30]: 2621 (of 4589 total, 57%)
+    (ticker, month) pairs in sp500_membership: 26268
+    (ticker, month) pairs with >=1 archive article that month: 1708 (6.5%)
+    distinct tickers in universe: 580; distinct tickers with >=1 article in window: 405 (70%)
+    monthly article counts: 16 in 2020-01 ramping to 171 in 2024-04 (see Surprises & Discoveries for the full table)
+
+The `generate_signal`/`screen_month` example transcripts (Concrete Steps Steps 2-3) remain pending — those require implementing `src/agents/llm_f.py`/`src/agents/llm_f_signals.py` (Progress items 2-4, 6-7), which is out of scope for this measurement pass.
 
 
 ## Interfaces and Dependencies
 
 
-This plan depends on `plans/01_dataset.md`'s `sp500_membership` table in `data/portfolio.duckdb` for the ticker universe per month. This plan depends on `yfinance` (already in `pyproject.toml`) for news, and `crewai` for the agent machinery, and on whichever LLM provider environment variable is set (`ANTHROPIC_API_KEY` by default, matching `LLM_F_MODEL`'s default).
+This plan depends on `plans/01_dataset.md`'s `sp500_membership` table in `data/portfolio.duckdb` for the ticker universe per month. This plan depends on `yfinance` (already in `pyproject.toml`) for live/current-month news, and `crewai` for the agent machinery, and on whichever LLM provider environment variable is set (`ANTHROPIC_API_KEY` by default, matching `LLM_F_MODEL`'s default). This plan also depends on `src/dataset/news_archive.py`'s `news_articles_hf` table in `data/portfolio.duckdb` (built by running that module; downloads `data/news_archive_source.parquet` from the Hugging Face dataset `KrossKinetic/SP500-Financial-News-Articles-Time-Series` on first run, cached thereafter) as the primary historical-news source for `fetch_headlines`, per the hybrid-source Decision Log entry above.
 
 
 At the end of this plan, the following must exist and be usable by later plans exactly as described:
