@@ -7,12 +7,39 @@ plans/05_optimizer_and_allocation.md's Validation and Acceptance section).
 """
 
 import pandas as pd
+import pytest
 
-from src.optimizer.portfolio import apply_min_history_rule, pivot_returns_matrix
+from src.optimizer.portfolio import (
+    _covariance_input,
+    apply_min_history_rule,
+    compute_weights,
+    pivot_returns_matrix,
+)
 
 
 def _dates(n: int) -> list[pd.Timestamp]:
     return list(pd.date_range("2019-04-01", periods=n, freq="MS"))
+
+
+def _three_ticker_fixture() -> pd.DataFrame:
+    """24 months, hand-built so the covariance structure is checkable by
+    hand: STABLE has near-zero variance and near-zero covariance with the
+    other two; RISKY_A and RISKY_B have substantial variance and, because
+    they oscillate on different periods (2 months vs. 3 months over a
+    24-month span - a common multiple, so the pattern is exact and
+    deterministic), a small but genuinely non-zero covariance with each
+    other rather than the (near-)perfect correlation an earlier draft of
+    this fixture accidentally produced (verified empirically: a perfectly
+    negatively-correlated RISKY_A/RISKY_B pair lets the optimizer cancel
+    almost all variance with any 50/50 split of the two, making GMV's
+    result degenerate/flat across many weight combinations rather than
+    favoring STABLE - not what this fixture is meant to test).
+    """
+    idx = pd.date_range("2020-01-01", periods=24, freq="MS")
+    stable = [0.005 + (0.0002 if i % 2 == 0 else -0.0002) for i in range(24)]
+    risky_a = [0.01 + (0.05 if i % 2 == 0 else -0.05) for i in range(24)]
+    risky_b = [0.01 + (0.04 if i % 3 == 0 else -0.02) for i in range(24)]
+    return pd.DataFrame({"STABLE": stable, "RISKY_A": risky_a, "RISKY_B": risky_b}, index=idx)
 
 
 def test_pivot_returns_matrix_reindexes_missing_ticker_to_all_null_column():
@@ -75,3 +102,60 @@ def test_apply_min_history_rule_keeps_ticker_delisted_before_as_of():
 
     assert list(result.columns) == ["DELISTED"]
     assert result["DELISTED"].notna().sum() == 25
+
+
+def test_covariance_input_unchanged_when_every_column_is_complete():
+    df = _three_ticker_fixture()
+
+    result = _covariance_input(df)
+
+    pd.testing.assert_frame_equal(result, df)
+
+
+def test_covariance_input_drops_incomplete_rows_for_partial_history_ticker():
+    df = _three_ticker_fixture()
+    partial = df.copy()
+    partial.loc[partial.index[:10], "RISKY_B"] = None  # simulated recent IPO
+
+    result = _covariance_input(partial)
+
+    assert len(result) == len(df) - 10
+    assert result.isna().sum().sum() == 0
+
+
+def test_compute_weights_gmv_favors_near_zero_variance_ticker():
+    df = _three_ticker_fixture()
+
+    weights = compute_weights(df, "GMV")
+
+    assert weights["STABLE"] > 0.8
+    assert sum(weights.values()) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_compute_weights_invalid_objective_raises_value_error():
+    df = _three_ticker_fixture()
+
+    with pytest.raises(ValueError):
+        compute_weights(df, "BOGUS")
+
+
+def test_compute_weights_mv_below_gmv_return_matches_gmv_since_constraint_is_non_binding():
+    """`efficient_return`'s constraint is `return >= target`, an inequality:
+    when GMV's own unconstrained return already clears a low target, the
+    constraint doesn't bind and MV legitimately returns the same weights
+    as GMV - this is real, verified PyPortfolioOpt behavior (see
+    plans/05_optimizer_and_allocation.md's Decision Log), not a bug.
+    """
+    df = _three_ticker_fixture()
+
+    gmv_weights = compute_weights(df, "GMV")
+    mv_weights = compute_weights(df, "MV", target_monthly_return=0.003)
+
+    assert mv_weights == pytest.approx(gmv_weights, abs=1e-6)
+
+
+def test_compute_weights_mv_unreachable_target_raises_value_error():
+    df = _three_ticker_fixture()
+
+    with pytest.raises(ValueError):
+        compute_weights(df, "MV", target_monthly_return=1.0)

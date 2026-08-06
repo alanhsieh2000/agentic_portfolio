@@ -18,10 +18,14 @@ from datetime import date
 import duckdb
 import numpy as np
 import pandas as pd
+from pypfopt import EfficientFrontier, expected_returns, risk_models
 
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+VALID_OBJECTIVES = ("GMV", "MV", "MSR")
+MV_RETURN_TOLERANCE = 1e-4
 
 
 def _load_window_dates(as_of: date, lookback_months: int, db_path: str) -> list[pd.Timestamp]:
@@ -148,3 +152,104 @@ def load_returns_matrix(
     long_df = _load_returns_long(tickers, window_dates, db_path)
     wide = pivot_returns_matrix(long_df, tickers, window_dates)
     return apply_min_history_rule(wide, min_months)
+
+
+def _covariance_input(returns_matrix: pd.DataFrame) -> pd.DataFrame:
+    """The sub-window of `returns_matrix` where every column has real data.
+
+    `risk_models.CovarianceShrinkage.ledoit_wolf()` calls `np.nan_to_num` on
+    its input for every shrinkage target, silently treating a missing month
+    as a zero return rather than a gap - fine for `mean_historical_return`
+    (which uses each column's own non-null count) but a real fabrication
+    risk here, since `load_returns_matrix` deliberately keeps a
+    recent-IPO/pre-delisting ticker with leading/trailing nulls. Dropping to
+    the complete-overlap window instead means every covariance term is
+    computed only from genuinely paired observations. Logged when this
+    actually shrinks the window; a no-op when every column has full history.
+    """
+    complete = returns_matrix.dropna()
+    if len(complete) < len(returns_matrix):
+        partial_tickers = sorted(returns_matrix.columns[returns_matrix.isna().any()])
+        logger.info(
+            "covariance window shrunk from %d to %d month(s) due to partial-history ticker(s) %s",
+            len(returns_matrix),
+            len(complete),
+            partial_tickers,
+        )
+    return complete
+
+
+def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFrontier, target_monthly_return: float) -> None:
+    """Positively verify an `efficient_return()` result rather than assuming
+    silence means success. Per this plan's Decision Log, PyPortfolioOpt's
+    own documentation warns that a technically-feasible but numerically
+    "unreasonable" target return makes `efficient_return()` fail silently
+    and return weird weights, with no exception raised - a real risk with
+    this project's monthly 1% target against a thin monthly sample.
+
+    The realized-return check is deliberately one-sided (>= target, not
+    "close to" target): `efficient_return()`'s constraint is an inequality
+    (`return >= target_return`), so whenever the unconstrained
+    minimum-variance point's own return already clears the target, that
+    constraint is non-binding and the correctly-returned weights are the
+    GMV weights themselves, with a realized return legitimately *above*
+    the target rather than equal to it (verified empirically against real
+    data: an 8-large-cap candidate set's GMV point alone already returns
+    ~1.2%/month, comfortably above a 1%/month target). Only a realized
+    return meaningfully *below* target indicates an actual problem.
+
+    Raises `ValueError` describing whichever check failed.
+    """
+    if any(pd.isna(w) for w in weights.values()):
+        raise ValueError(f"efficient_return produced NaN weight(s), likely a silent solver failure: {weights}")
+
+    total = sum(weights.values())
+    if abs(total - 1.0) > 1e-3:
+        raise ValueError(f"efficient_return produced weights summing to {total!r}, not ~1.0: {weights}")
+
+    realized_return, _, _ = ef.portfolio_performance()
+    if realized_return < target_monthly_return - MV_RETURN_TOLERANCE:
+        raise ValueError(
+            f"efficient_return's realized monthly return {realized_return!r} is below "
+            f"target_monthly_return={target_monthly_return!r} (tolerance {MV_RETURN_TOLERANCE}); "
+            "PyPortfolioOpt may have failed silently on an unreasonable target."
+        )
+
+
+def compute_weights(
+    returns_matrix: pd.DataFrame,
+    objective: str,
+    target_monthly_return: float = 0.01,
+) -> dict[str, float]:
+    """GMV/MV/MSR portfolio weights from `returns_matrix` (as produced by
+    `load_returns_matrix`), per plan 5's Decision Log and Plan of Work.
+
+    `mu` and `cov_matrix` are estimated with `frequency=1` (not `12`) so
+    they stay in true monthly units, directly comparable to
+    `target_monthly_return` - PyPortfolioOpt's `frequency` parameter is an
+    annualization multiplier, not a period-of-input flag; passing `12` to
+    already-monthly data would silently annualize it instead (see this
+    plan's Decision Log for the empirical verification of this).
+    """
+    if objective not in VALID_OBJECTIVES:
+        raise ValueError(f"objective must be one of {VALID_OBJECTIVES}, got {objective!r}")
+
+    mu = expected_returns.mean_historical_return(returns_matrix, returns_data=True, frequency=1)
+    cov_matrix = risk_models.CovarianceShrinkage(
+        _covariance_input(returns_matrix), returns_data=True, frequency=1
+    ).ledoit_wolf()
+
+    ef = EfficientFrontier(mu, cov_matrix)
+    if objective == "GMV":
+        ef.min_volatility()
+    elif objective == "MSR":
+        ef.max_sharpe()
+    else:
+        ef.efficient_return(target_return=float(target_monthly_return))
+
+    weights = dict(ef.clean_weights())
+
+    if objective == "MV":
+        _validate_efficient_return_result(weights, ef, target_monthly_return)
+
+    return weights
