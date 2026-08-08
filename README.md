@@ -22,6 +22,25 @@ Environment variables this project depends on:
 - `LLM_S_MODEL` (optional) — overrides the default Claude model LLM-S uses (`anthropic/claude-sonnet-4-5`).
 - `DB_PATH` (optional) — overrides the default DuckDB file location (`data/portfolio.duckdb`).
 
+# Backtest Mode
+
+The backtest period is from 2020-01-01 to 2024-04-30. There are 2 stages:
+
+- Stage 1
+  - LLM-S generate scan rules on 2019-12-31, and these rules are then applied to S&P 500 members at that time to get the candidates set $S_{2020}$. Repeating the same process for the following years, that will give us $S_{year}$, where $year = 2020..2024$.
+  - LLM-F generate sentiment scores from exponentially-decreasing weighted sum of positive probability minus negative probability of 2019 December news articles for each S&P 500 members on 2019-12-31, and these sentiment scores divide S&P 500 members into buy group for score > 0.1, sell group for score < -0.1, and hold group for others. Buy and sell groups together consist the candidates set $F_0$. Repeating the same process for the following months, that will give us $F_{t}$, where $t = 1..52$.
+  - For LLM-S only selection, the portfolio set $P_{t} = S_{2020 + \lfloor (t-1) / 12 \rfloor}$, where $t = 1..52$.
+  - For LLM-F only selection, the portfolio set $P_{t} = F_{t}$, where $t = 1..52$.
+  - For LLM-S + LLM-F selection, the portfolio set $P_{t} = S_{2020 + \lfloor (t-1) / 12 \rfloor} \cap F_{t}$, where $t = 1..52$. If any intersection is empty, the respective portfolio set $P_{t} = S_{2020 + \lfloor (t-1) / 12 \rfloor} \cup F_{t}$.
+- Stage 2
+  - EfficientFrontier of PyPortfolioOpt is used to optimize weights of the portfolio set $P_{t}$. That will give us weights $\hat{w}_{t,j}$, where $j = 1..\lvert P_t \rvert$, and $t = 1..52$. The required parameters expected_returns and cov_matrix are calculated from 60 most recent monthly returns of each company in the portfolio set and then are annualized before given to EfficientFrontier. In case that 60 months data is unavailable, at least 24 months data should be used. Companies with less than 24 monthly returns should be removed from the portfolio set.
+  - The annualized expected_returns and weights $\hat{w}_{t,j}$ can give us the gross return of the portfolio at time t. By using pypfopt.objective_functions.transaction_cost(), we may take the transaction cost into consideration just like what the paper did. We can assume $\hat{w}_{0,j} = 0$ for all $j$. That will give us the net returns $r_t$, where $t = 1..52$.
+  - The sharpe ratio, mean, variance of $r_t$ will give us Sharpe Ratio, Returns and Variance as the Table 1 of the paper.
+  - By running the optimization for GMV, MV (12% target return), MSR, we will have all results to compare with.
+  - Both transaction cost and risk-free rate which we need for the Stage 2 calculation are configurable constants and have default values as 10 basis point and 2%.
+
+# Live Mode
+
 # Acknowledgements and Citation
 
 - "Designing Agentic AI-Based Screening for Portfolio Investment", https://arxiv.org/abs/2603.23300v1.
