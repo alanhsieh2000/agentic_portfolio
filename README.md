@@ -41,6 +41,17 @@ The backtest period is from 2020-01-01 to 2024-04-30. There are 2 stages:
 
 # Live Mode
 
+After we use the Backtest Mode to find effective and efficient values for hyper-paraments and see a promising result, we will be ready to use the Live Mode.
+
+- LLM-S generate scan rules using currently available fundamental data of S&P 500 members and stores them in memory/rules.json, if the file is missing or rules in the file are out of date. The system decides whether LLM-S is needed or not automatically and shows the progress. When the timestamp of the latest rules is in the previous year or even earlier, they are out of date.
+- These LLM-S rules are applied to the current S&P 500 members to generate the candidate set $S$. $S$ should be stored in memory/candidates.json. If the file is missing or $S$ in the file is out of date, the system refreshes them automatically and shows the progress. When the timestamp of the latest $S$ is in the previous season or even earlier, the are out of date. Seasons are defined as 1/1 - 3/31, 4/1 - 6/30, 7/1 - 9/30, 10/1 - 12/31. The system should make a summary for each candidate in $S$ and store this information in memory/S-summary.md. The old memory/S-summary.md will be removed.
+- LLM-F generate sentiment scores from exponentially-decreasing weighted sum of positive probability minus negative probability of the most recent 30 days for each candidate in $S$ and stores the candidate set $S \cap F$ in memory/candidates.json. If the file is missing or $S \cap F$ in the file is out of date, the system refreshes them automatically and shows the progress. When the timestamp of the latest $S \cap F$ is earlier than 30 days ago, the are out of date. The system should make a summary for each candidate in $S \cap F$ and store this information in memory/F-summary.md. The old memory/F-summary.md will be removed.
+- Users can ask the system to analyze candidates, including ETF. The system should use the current LLM-S rules, look up the most recent 30-day news, use LLM-F to generate sentiment scores, and make a summary for candidates. This information should be stored in memory/analysis.md. New analyzed summaries will be appended to the end, and summaries with timestamp older than 30 days will be removed from the file.
+- Users can ask the system to add candidates to the candidate set $U$. $U$ should be stored in memory/candidates.json. For added candidates, the system will move summaries associate with them from memory/analysis.md to memory/U-summary.md.
+- Users can ask the system to remove candidates from any candidate set, including $S$, $S \cap F$, and $U$. The system should also update memory/S-, F-, U-summary.md accordingly.
+- Users can ask the system to calculate weights for GMV, MSR, MV, using $S$, $S \cap F$, $U$, $S \cup U$, $(S \cap F) \cup U$. The system will report summaries and store them as output/GMV-, MSR-, MV-{set}-portfolio-{date}.md, where {set} is 'S', 'SF', 'U', 'SU', or 'SFU'.
+- Users can ask the system to remember risk free rate and/or target return rate. The system will store them in memory/long-term.md. These information will be used to replace default values in Live Mode.
+
 # Acknowledgements and Citation
 
 - "Designing Agentic AI-Based Screening for Portfolio Investment", https://arxiv.org/abs/2603.23300v1.
