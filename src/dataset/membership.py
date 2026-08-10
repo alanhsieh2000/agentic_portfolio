@@ -236,13 +236,24 @@ def write_membership_table(df: pd.DataFrame, db_path: str = settings.db_path) ->
         con.close()
 
 
+def fetch_and_normalize_membership(url: str = WIKIPEDIA_URL) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch and normalize Wikipedia's current-constituents and changes
+    tables in one call, returning (current, changes) ready for
+    `apply_changes_asof` or `reconstruct_membership`. Extracted out of
+    `build_membership_table` so a caller needing membership as of a single
+    out-of-band date (e.g. `src/dataset/backfill_snapshot.py`, which
+    backfills a pre-2020-01-01 snapshot per `plans/08_consistency_review.md`
+    finding 4) does not need to duplicate the fetch-then-normalize steps.
+    """
+    raw_current, raw_changes = fetch_membership_tables(url)
+    return _normalize_current_table(raw_current), _normalize_changes_table(raw_changes)
+
+
 def build_membership_table(db_path: str = settings.db_path, url: str = WIKIPEDIA_URL) -> pd.DataFrame:
     """Fetch, normalize, reconstruct across all rebalance dates, write to
     DuckDB, and return the resulting DataFrame.
     """
-    raw_current, raw_changes = fetch_membership_tables(url)
-    current = _normalize_current_table(raw_current)
-    changes = _normalize_changes_table(raw_changes)
+    current, changes = fetch_and_normalize_membership(url)
     rebalance_dates = compute_rebalance_dates()
     membership = reconstruct_membership(current, changes, rebalance_dates)
     write_membership_table(membership, db_path)
