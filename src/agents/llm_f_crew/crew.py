@@ -1,8 +1,11 @@
 """LLMFCrew: a single-agent, single-task CrewAI crew that reads a batch of
-news headlines about one ticker/month and produces a `SentimentSignal`,
-defined in `config/agents.yaml` and `config/tasks.yaml`. The headlines
-text and LLM string are attached here in Python (via `.crew().kickoff`'s
-`inputs`, not by subclassing), since YAML cannot express either.
+news headlines about one ticker/month and produces a `HeadlineSentimentBatch`
+(one `HeadlineSentiment` per headline), defined in `config/agents.yaml` and
+`config/tasks.yaml`. The headlines text and LLM string are attached here in
+Python (via `.crew().kickoff`'s `inputs`, not by subclassing), since YAML
+cannot express either. `src/agents/llm_f.py`'s `generate_signal` combines
+this batch into a `SentimentSignal` via `compute_decayed_score` - this crew
+never produces a `SentimentSignal` itself.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 
-from src.agents.llm_f_schema import SentimentSignal
+from src.agents.llm_f_schema import HeadlineSentimentBatch
 
 
 @CrewBase
@@ -34,7 +37,7 @@ class LLMFCrew:
 
     @task
     def sentiment_task(self) -> Task:
-        return Task(config=self.tasks_config["sentiment_task"], output_pydantic=SentimentSignal)
+        return Task(config=self.tasks_config["sentiment_task"], output_pydantic=HeadlineSentimentBatch)
 
     @crew
     def crew(self) -> Crew:

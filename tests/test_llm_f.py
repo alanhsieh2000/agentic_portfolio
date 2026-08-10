@@ -1,5 +1,5 @@
 """Tests for src/agents/news.py's `fetch_headlines`,
-src/agents/llm_f.py's `generate_signal`, and
+src/agents/llm_f.py's `generate_signal`/`compute_decayed_score`, and
 src/agents/llm_f_signals.py's `screen_month`.
 
 Per AGENTS.md, no test here calls yfinance's live API or any LLM. The
@@ -11,14 +11,20 @@ plans/03_llm_f_agent.md's Surprises & Discoveries), with `yf.Ticker`
 patched so no network call happens. `screen_month`'s tests monkeypatch
 `generate_signal` itself (mirroring how `tests/test_llm_s.py` tests
 `screen` against a fixture `factors` table) so its DB-plumbing/DataFrame
-shape is verified without any LLM call.
+shape is verified without any LLM call. `generate_signal`'s LLM-call path
+is exercised with `LLMFCrew` itself monkeypatched to a fake crew returning
+a hand-built `HeadlineSentimentBatch`, per plans/08_consistency_review.md
+finding 5's redesign away from a holistic LLM judgment call.
 """
+
+from datetime import date
 
 import duckdb
 import pytest
 
-from src.agents.llm_f import generate_signal
-from src.agents.llm_f_schema import SentimentSignal
+from src.agents import llm_f
+from src.agents.llm_f import compute_decayed_score, generate_signal
+from src.agents.llm_f_schema import HeadlineSentiment, HeadlineSentimentBatch, SentimentSignal
 from src.agents.llm_f_signals import screen_month
 from src.agents.news import fetch_headlines
 
@@ -141,7 +147,117 @@ def test_generate_signal_returns_hold_without_llm_call_when_headlines_empty():
     assert signal.ticker == "AAPL"
     assert signal.month == "2024-03"
     assert signal.signal == "hold"
-    assert signal.confidence == 0.0
+    assert signal.score == 0.0
+
+
+def test_compute_decayed_score_weights_recent_headline_more_than_stale_one():
+    """Two headlines in the same month, one strongly positive dated at
+    month-end (full weight), one strongly negative dated 7 days earlier
+    (half-life away, so half weight): the recent positive headline should
+    dominate, pulling the score positive overall.
+    """
+    headlines = [
+        {"title": "old bad news", "publish_date": "2024-03-24"},
+        {"title": "fresh good news", "publish_date": "2024-03-31"},
+    ]
+    sentiments = [
+        HeadlineSentiment(index=0, positive_probability=0.0, negative_probability=0.9),
+        HeadlineSentiment(index=1, positive_probability=0.9, negative_probability=0.0),
+    ]
+
+    score = compute_decayed_score(headlines, sentiments, month_end=date(2024, 3, 31))
+
+    # weight(old) = 0.5 ** (7/7) = 0.5, weight(fresh) = 0.5 ** (0/7) = 1.0
+    expected = (0.5 * -0.9 + 1.0 * 0.9) / (0.5 + 1.0)
+    assert score == pytest.approx(expected)
+    assert score > 0
+
+
+def test_compute_decayed_score_matches_input_order_via_index_not_position():
+    headlines = [
+        {"title": "first", "publish_date": "2024-03-31"},
+        {"title": "second", "publish_date": "2024-03-31"},
+    ]
+    # Deliberately returned out of order and reversed relative to `headlines`.
+    sentiments = [
+        HeadlineSentiment(index=1, positive_probability=1.0, negative_probability=0.0),
+        HeadlineSentiment(index=0, positive_probability=0.0, negative_probability=1.0),
+    ]
+
+    score = compute_decayed_score(headlines, sentiments, month_end=date(2024, 3, 31))
+
+    # Equal weights (both dated exactly on month_end): (-1.0 + 1.0) / 2 = 0.0.
+    assert score == pytest.approx(0.0)
+
+
+def test_compute_decayed_score_empty_headlines_returns_zero():
+    assert compute_decayed_score([], [], month_end=date(2024, 3, 31)) == 0.0
+
+
+def test_compute_decayed_score_raises_on_index_mismatch():
+    headlines = [{"title": "only one", "publish_date": "2024-03-31"}]
+    sentiments = [HeadlineSentiment(index=1, positive_probability=0.5, negative_probability=0.5)]
+
+    with pytest.raises(ValueError, match="indices"):
+        compute_decayed_score(headlines, sentiments, month_end=date(2024, 3, 31))
+
+
+class _FakeTask:
+    def __init__(self, batch):
+        self.pydantic = batch
+
+
+class _FakeCrew:
+    def __init__(self, batch):
+        self._batch = batch
+
+    def kickoff(self, inputs):
+        return _FakeTask(self._batch)
+
+
+class _FakeLLMFCrew:
+    def __init__(self, batch, model=None):
+        self._batch = batch
+        self.model = model
+
+    def crew(self):
+        return _FakeCrew(self._batch)
+
+
+def test_generate_signal_derives_buy_signal_from_score_above_threshold(monkeypatch):
+    batch = HeadlineSentimentBatch(
+        headlines=[HeadlineSentiment(index=0, positive_probability=0.9, negative_probability=0.0)]
+    )
+    monkeypatch.setattr(llm_f, "LLMFCrew", lambda model: _FakeLLMFCrew(batch, model))
+
+    signal = generate_signal("AAPL", 2024, 3, [{"title": "great news", "publish_date": "2024-03-31"}])
+
+    assert signal.score == pytest.approx(0.9)
+    assert signal.signal == "buy"
+
+
+def test_generate_signal_derives_sell_signal_from_score_below_threshold(monkeypatch):
+    batch = HeadlineSentimentBatch(
+        headlines=[HeadlineSentiment(index=0, positive_probability=0.0, negative_probability=0.9)]
+    )
+    monkeypatch.setattr(llm_f, "LLMFCrew", lambda model: _FakeLLMFCrew(batch, model))
+
+    signal = generate_signal("AAPL", 2024, 3, [{"title": "bad news", "publish_date": "2024-03-31"}])
+
+    assert signal.score == pytest.approx(-0.9)
+    assert signal.signal == "sell"
+
+
+def test_generate_signal_derives_hold_signal_from_score_within_threshold(monkeypatch):
+    batch = HeadlineSentimentBatch(
+        headlines=[HeadlineSentiment(index=0, positive_probability=0.5, negative_probability=0.45)]
+    )
+    monkeypatch.setattr(llm_f, "LLMFCrew", lambda model: _FakeLLMFCrew(batch, model))
+
+    signal = generate_signal("AAPL", 2024, 3, [{"title": "mixed news", "publish_date": "2024-03-31"}])
+
+    assert signal.score == pytest.approx(0.05)
+    assert signal.signal == "hold"
 
 
 def _build_membership_and_archive_db(db_path, membership_rows, archive_rows) -> None:
@@ -175,7 +291,7 @@ def test_screen_month_resolves_rebalance_date_and_returns_ticker_signal_frame(tm
     def fake_generate_signal(ticker, year, month, headlines, model=None):
         month_str = f"{year:04d}-{month:02d}"
         signal = "buy" if headlines else "hold"
-        return SentimentSignal(ticker=ticker, month=month_str, signal=signal, confidence=0.5, rationale="x")
+        return SentimentSignal(ticker=ticker, month=month_str, signal=signal, score=0.2 if headlines else 0.0)
 
     monkeypatch.setattr("src.agents.llm_f_signals.generate_signal", fake_generate_signal)
 
