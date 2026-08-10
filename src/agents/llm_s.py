@@ -25,11 +25,18 @@ logger = logging.getLogger(__name__)
 def resolve_as_of_date(year: int, db_path: str = settings.db_path) -> date:
     """The causal-masking snapshot date for `year`: the most recent
     `factors` rebalance date in December of `year - 1` (matching the
-    paper's own "December 2023 for test dates in 2024" framing). Falls
-    back to the earliest available rebalance date if none exists before
-    `year` started - the `year=2020` edge case, since this project's data
-    starts 2020-01-01 with no prior-December snapshot - logging a warning
-    because that year's rule is then not truly causally masked.
+    paper's own "December 2023 for test dates in 2024" framing, and
+    README.md's Backtest Mode Stage 1 statement that S_2020 is generated
+    from a 2019-12-31 snapshot). For `year=2020` this requires a real
+    2019-12-31 row in `factors`, which `src/dataset/backfill_snapshot.py`
+    adds on top of the regular 2020-01-01..2024-04-30 build (see
+    plans/08_consistency_review.md finding 4 and plans/01_dataset.md's
+    Decision Log) - run `uv run python -m src.dataset.backfill_snapshot`
+    once, after the regular dataset build, to populate it. Falls back to
+    the earliest available rebalance date if that backfill has not been
+    run (or, in principle, for any other year with no prior-December
+    snapshot), logging a warning because that year's rule is then not
+    truly causally masked.
     """
     con = duckdb.connect(db_path, read_only=True)
     try:
