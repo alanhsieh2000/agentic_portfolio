@@ -1,7 +1,13 @@
 """Single source of truth for every environment-configurable runtime value
 in this project: the DuckDB path, fetch/rebalance date windows, batch
 sizes, rate-limit pause seconds, HTTP timeouts, the book-equity reporting
-lag, the LLM model name, and the `SEC_UA`/Anthropic environment variables.
+lag, the transaction cost and risk-free rate used by Backtest Mode Stage 2,
+the LLM model name, and the `SEC_UA`/Anthropic environment variables.
+
+`transaction_cost_bps` and `risk_free_rate` are consumed by
+`plans/06_interactive_flow.md`'s backtest runner (not yet implemented as
+of this field's addition - see that plan's Progress section), per
+`README.md`'s Backtest Mode Stage 2 defaults of 10 basis points and 2%.
 
 `Settings` is a `pydantic_settings.BaseSettings` subclass, loaded once as
 the module-level singleton `settings` below. Field names match env var
@@ -51,6 +57,9 @@ class Settings(BaseSettings):
     yfinance_fundamentals_pause_seconds: float = 0.25
 
     book_equity_lag_months: int = 3
+
+    transaction_cost_bps: float = 10.0
+    risk_free_rate: float = 0.02
 
     llm_s_model: str = "anthropic/claude-sonnet-4-5"
 

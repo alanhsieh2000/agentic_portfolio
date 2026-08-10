@@ -181,13 +181,14 @@ def _covariance_input(returns_matrix: pd.DataFrame) -> pd.DataFrame:
     return complete
 
 
-def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFrontier, target_monthly_return: float) -> None:
+def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFrontier, target_annual_return: float) -> None:
     """Positively verify an `efficient_return()` result rather than assuming
     silence means success. Per this plan's Decision Log, PyPortfolioOpt's
     own documentation warns that a technically-feasible but numerically
     "unreasonable" target return makes `efficient_return()` fail silently
     and return weird weights, with no exception raised - a real risk with
-    this project's monthly 1% target against a thin monthly sample.
+    this project's annual 12% target against a thin monthly sample
+    annualized up to estimate it.
 
     The realized-return check is deliberately one-sided (>= target, not
     "close to" target): `efficient_return()`'s constraint is an inequality
@@ -195,10 +196,8 @@ def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFr
     minimum-variance point's own return already clears the target, that
     constraint is non-binding and the correctly-returned weights are the
     GMV weights themselves, with a realized return legitimately *above*
-    the target rather than equal to it (verified empirically against real
-    data: an 8-large-cap candidate set's GMV point alone already returns
-    ~1.2%/month, comfortably above a 1%/month target). Only a realized
-    return meaningfully *below* target indicates an actual problem.
+    the target rather than equal to it. Only a realized return meaningfully
+    *below* target indicates an actual problem.
 
     Raises `ValueError` describing whichever check failed.
     """
@@ -210,10 +209,10 @@ def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFr
         raise ValueError(f"efficient_return produced weights summing to {total!r}, not ~1.0: {weights}")
 
     realized_return, _, _ = ef.portfolio_performance()
-    if realized_return < target_monthly_return - MV_RETURN_TOLERANCE:
+    if realized_return < target_annual_return - MV_RETURN_TOLERANCE:
         raise ValueError(
-            f"efficient_return's realized monthly return {realized_return!r} is below "
-            f"target_monthly_return={target_monthly_return!r} (tolerance {MV_RETURN_TOLERANCE}); "
+            f"efficient_return's realized annual return {realized_return!r} is below "
+            f"target_annual_return={target_annual_return!r} (tolerance {MV_RETURN_TOLERANCE}); "
             "PyPortfolioOpt may have failed silently on an unreasonable target."
         )
 
@@ -221,24 +220,32 @@ def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFr
 def compute_weights(
     returns_matrix: pd.DataFrame,
     objective: str,
-    target_monthly_return: float = 0.01,
+    target_annual_return: float = 0.12,
 ) -> dict[str, float]:
     """GMV/MV/MSR portfolio weights from `returns_matrix` (as produced by
-    `load_returns_matrix`), per plan 5's Decision Log and Plan of Work.
+    `load_returns_matrix`), per plan 5's Decision Log and Plan of Work, and
+    per README.md's Backtest Mode Stage 2 spec (annualized expected_returns
+    and cov_matrix, 12% annual MV target return) as resolved by
+    `plans/08_consistency_review.md` findings 6 and 7.
 
-    `mu` and `cov_matrix` are estimated with `frequency=1` (not `12`) so
-    they stay in true monthly units, directly comparable to
-    `target_monthly_return` - PyPortfolioOpt's `frequency` parameter is an
-    annualization multiplier, not a period-of-input flag; passing `12` to
-    already-monthly data would silently annualize it instead (see this
-    plan's Decision Log for the empirical verification of this).
+    `mu` and `cov_matrix` are estimated with `frequency=12`, PyPortfolioOpt's
+    annualization multiplier, so a monthly `returns_matrix` (as produced by
+    `load_returns_matrix`) is turned into true annualized figures directly
+    comparable to `target_annual_return`. This makes every quantity
+    `EfficientFrontier` reports (`mu`, `cov_matrix`, and `efficient_return`'s
+    realized return) annual, not monthly - the realized per-month portfolio
+    return used elsewhere in this project (e.g. backtest scoring) is
+    computed separately, directly from the shared `returns` table's monthly
+    figures, and is unaffected by this annualization since `compute_weights`
+    only ever returns weights, never a return figure of its own except
+    through `_validate_efficient_return_result`'s internal check above.
     """
     if objective not in VALID_OBJECTIVES:
         raise ValueError(f"objective must be one of {VALID_OBJECTIVES}, got {objective!r}")
 
-    mu = expected_returns.mean_historical_return(returns_matrix, returns_data=True, frequency=1)
+    mu = expected_returns.mean_historical_return(returns_matrix, returns_data=True, frequency=12)
     cov_matrix = risk_models.CovarianceShrinkage(
-        _covariance_input(returns_matrix), returns_data=True, frequency=1
+        _covariance_input(returns_matrix), returns_data=True, frequency=12
     ).ledoit_wolf()
 
     ef = EfficientFrontier(mu, cov_matrix)
@@ -247,12 +254,12 @@ def compute_weights(
     elif objective == "MSR":
         ef.max_sharpe()
     else:
-        ef.efficient_return(target_return=float(target_monthly_return))
+        ef.efficient_return(target_return=float(target_annual_return))
 
     weights = dict(ef.clean_weights())
 
     if objective == "MV":
-        _validate_efficient_return_result(weights, ef, target_monthly_return)
+        _validate_efficient_return_result(weights, ef, target_annual_return)
 
     return weights
 

@@ -169,7 +169,7 @@ def test_compute_weights_mv_below_gmv_return_matches_gmv_since_constraint_is_non
     df = _three_ticker_fixture()
 
     gmv_weights = compute_weights(df, "GMV")
-    mv_weights = compute_weights(df, "MV", target_monthly_return=0.003)
+    mv_weights = compute_weights(df, "MV", target_annual_return=0.03)
 
     assert mv_weights == pytest.approx(gmv_weights, abs=1e-6)
 
@@ -178,7 +178,7 @@ def test_compute_weights_mv_unreachable_target_raises_value_error():
     df = _three_ticker_fixture()
 
     with pytest.raises(ValueError):
-        compute_weights(df, "MV", target_monthly_return=1.0)
+        compute_weights(df, "MV", target_annual_return=1.0)
 
 
 def test_load_latest_prices_returns_nearest_on_or_before(tmp_path):
