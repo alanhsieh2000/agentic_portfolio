@@ -275,10 +275,11 @@ def standardize_raw_factors(
     its raw value is missing, or its reference std is 0 or missing
     (mirroring `add_cross_sectional_z`'s existing zero-std guard):
     omitting the key, rather than inventing a placeholder number, means
-    `condition_eval.evaluate_condition` naturally raises "missing from the
-    supplied values" if a rule's condition needs that factor, which
-    `screen_external_candidate` below turns into an explicit
-    `"insufficient_data"` result instead of a wrong signal.
+    `condition_eval.evaluate_condition` (called with `missing_ok=True` by
+    `screen_external_candidate` below) treats any rule clause needing that
+    factor as indeterminate rather than evaluating it against a fabricated
+    value — see `screen_external_candidate`'s docstring for how that
+    indeterminacy resolves into a real buy/sell/hold signal.
     """
     standardized: dict[str, float] = {}
     for factor, value in raw.items():
@@ -303,15 +304,23 @@ def screen_external_candidate(
     the exact same, unmodified `apply_rule`
     (`src/agents/llm_s_apply.py`) the in-universe `screen()` function uses.
 
-    Returns `"insufficient_data"` (never raises, never guesses a signal)
-    if `rule`'s buy/sell conditions reference a factor this candidate is
-    missing after standardization — e.g. an ETF with no `bm` proxy
-    supplied, screened against a rule whose buy_condition needs `bm`.
+    A candidate missing a factor `rule`'s conditions reference (e.g. an
+    ETF with no `bm` proxy, like a preferred-stock fund — see
+    plans/07_external_candidate_screening.md's Decision Log) still gets a
+    real `"buy"`/`"sell"`/`"hold"`: `apply_rule` is called with
+    `missing_ok=True`, so a clause needing the missing factor becomes
+    indeterminate rather than blocking the whole rule, and the rest of the
+    rule's `and`/`or` structure still decides the outcome from whatever
+    factors the candidate does have. `"insufficient_data"` (never raised
+    to the caller) is now only a defensive fallback for a condition that
+    fails to evaluate for a structural reason unrelated to missing data
+    (e.g. a malformed condition an already-validated `ScreeningRule`
+    should never actually contain).
     """
     stats = get_factor_reference_stats(rebalance_date, db_path)
     standardized = standardize_raw_factors(raw_factors, stats)
     try:
-        return apply_rule(rule, standardized)
+        return apply_rule(rule, standardized, missing_ok=True)
     except ValueError:
         logger.info(
             "insufficient standardized data to evaluate rule against %s for rebalance_date=%s",

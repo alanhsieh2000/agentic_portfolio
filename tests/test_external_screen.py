@@ -135,14 +135,37 @@ def test_aggregate_price_to_book_returns_none_for_empty_input():
     assert aggregate_price_to_book([]) is None
 
 
-def test_screen_external_candidate_returns_insufficient_data_for_missing_factor(tmp_path):
+def test_screen_external_candidate_degrades_gracefully_for_missing_factor(tmp_path):
+    """A candidate missing a factor a rule's condition needs (e.g. an ETF
+    with no bm proxy, like PFFA) no longer gets blanket-rejected as
+    "insufficient_data" — the missing-factor clause becomes indeterminate,
+    and with nothing else here to decide buy_condition (its only clause
+    needs bm) or sell_condition (mom12m=0.0 doesn't satisfy < -0.5), this
+    resolves to a real "hold", per plans/07_external_candidate_screening.md's
+    Decision Log.
+    """
     db_path = _fixture_factors_db(tmp_path)
     rule = _rule(buy_condition="bm > 0.5", sell_condition="mom12m < -0.5")
 
-    # An ETF-shaped candidate with no bm proxy supplied, screened against a
-    # rule whose buy_condition needs bm.
     signal = screen_external_candidate(
         rule, {"mve": 3.0, "bm": None, "mom12m": 0.0}, date(2024, 3, 1), db_path=db_path
     )
 
-    assert signal == "insufficient_data"
+    assert signal == "hold"
+
+
+def test_screen_external_candidate_missing_factor_does_not_block_other_clause(tmp_path):
+    """A PFFA-shaped candidate (bm missing) whose buy_condition has a
+    bm-free clause that genuinely fires now gets a real "buy" instead of
+    being screened out just because the rule also mentions bm elsewhere.
+    """
+    db_path = _fixture_factors_db(tmp_path)
+    rule = _rule(buy_condition="mve > 0.5 or bm > 0.9", sell_condition="mom12m < -0.5")
+
+    # Raw mve=3.0 standardizes to (3.0 - 2.0) / 1.0 = 1.0 -> satisfies "mve > 0.5"
+    # on its own, without ever needing the missing bm.
+    signal = screen_external_candidate(
+        rule, {"mve": 3.0, "bm": None, "mom12m": 0.0}, date(2024, 3, 1), db_path=db_path
+    )
+
+    assert signal == "buy"

@@ -43,6 +43,49 @@ def test_evaluate_condition_rejects_unsafe_syntax():
         evaluate_condition("__import__('os').system('echo hi')", {"mve": 0, "bm": 0, "mom12m": 0})
 
 
+def test_evaluate_condition_missing_ok_false_still_raises():
+    """The default (missing_ok=False) is byte-for-byte the pre-existing
+    behavior: a missing name still raises immediately, even though
+    missing_ok=True (tested below) now exists as an opt-in.
+    """
+    with pytest.raises(ValueError, match="bm"):
+        evaluate_condition("bm > 0.5", {"mve": 0, "mom12m": 0})
+
+
+def test_evaluate_condition_missing_ok_true_resolves_to_false_when_undecidable():
+    assert evaluate_condition("bm > 0.5", {"mve": 0, "mom12m": 0}, missing_ok=True) is False
+
+
+def test_evaluate_condition_missing_ok_true_and_still_false_from_other_clause():
+    # bm is missing, but mve < 0 already decides the `and` False on its own.
+    assert evaluate_condition("bm > 0.5 and mve < 0", {"mve": -1.0, "mom12m": 0}, missing_ok=True) is False
+
+
+def test_evaluate_condition_missing_ok_true_or_still_true_from_other_clause():
+    # bm is missing, but mom12m > 0 already decides the `or` True on its own.
+    assert evaluate_condition("bm > 0.5 or mom12m > 0", {"mve": 0, "mom12m": 1.0}, missing_ok=True) is True
+
+
+def test_evaluate_condition_missing_ok_true_real_rule_shape_resolves_on_bm_free_branch():
+    # Mirrors plans/07_external_candidate_screening.md's real 2024 rule shape:
+    # bm is missing (e.g. PFFA), but the first or-branch alone (needing only
+    # mve/mom12m) already decides the whole `or` True, short-circuiting
+    # before the second, bm-needing branch is ever reached.
+    condition = "(mom12m > 0.55 and mve > -0.9) or (bm > 0.2 and mom12m > -0.15)"
+    values = {"mve": -0.5, "mom12m": 0.6}
+    assert evaluate_condition(condition, values, missing_ok=True) is True
+
+
+def test_evaluate_condition_missing_ok_true_falls_to_false_when_only_bm_branch_could_fire():
+    # Same rule shape, but now the bm-free first branch is False, so the
+    # only way to reach "buy" is the second branch, which genuinely needs
+    # the missing bm — indeterminate, and with nothing else to decide it,
+    # coerces to False rather than raising.
+    condition = "(mom12m > 0.55 and mve > -0.9) or (bm > 0.2 and mom12m > -0.15)"
+    values = {"mve": -0.95, "mom12m": 0.6}
+    assert evaluate_condition(condition, values, missing_ok=True) is False
+
+
 def _rule(buy_condition: str, sell_condition: str) -> ScreeningRule:
     return ScreeningRule(year=2024, buy_condition=buy_condition, sell_condition=sell_condition, rationale="test")
 
