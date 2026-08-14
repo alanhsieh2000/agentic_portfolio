@@ -14,6 +14,7 @@ import duckdb
 import pytest
 
 from src.agents.external_screen import (
+    aggregate_price_to_book,
     screen_external_candidate,
     standardize_raw_factors,
 )
@@ -102,6 +103,36 @@ def test_screen_external_candidate_returns_correct_signal(tmp_path):
     )
 
     assert signal == "buy"
+
+
+def test_aggregate_price_to_book_matches_hand_computed_harmonic_mean():
+    # weight_sum = 1.0; inv_sum = 0.5/2.0 + 0.5/4.0 = 0.375; result = 1.0 / 0.375 = 8/3.
+    result = aggregate_price_to_book([(0.5, 2.0), (0.5, 4.0)])
+
+    assert result == pytest.approx(8 / 3)
+
+
+def test_aggregate_price_to_book_skips_zero_pb_pair():
+    # The (0.5, 0) pair is skipped entirely (undefined ratio), leaving only
+    # (0.5, 3.0): weight_sum = 0.5, inv_sum = 0.5 / 3.0, result = 3.0.
+    result = aggregate_price_to_book([(0.5, 0.0), (0.5, 3.0)])
+
+    assert result == pytest.approx(3.0)
+
+
+def test_aggregate_price_to_book_returns_none_when_negative_book_dominates():
+    # A dominant negative-pb holding (e.g. a real AbbVie-like case) can push
+    # the implied aggregate book value (inv_sum) non-positive: here
+    # 0.9 / -10 + 0.1 / 2.0 = -0.04. There is no economically meaningful
+    # ratio to report in that case, so this must return None, not a
+    # sign-flipped or otherwise misleading number.
+    result = aggregate_price_to_book([(0.9, -10.0), (0.1, 2.0)])
+
+    assert result is None
+
+
+def test_aggregate_price_to_book_returns_none_for_empty_input():
+    assert aggregate_price_to_book([]) is None
 
 
 def test_screen_external_candidate_returns_insufficient_data_for_missing_factor(tmp_path):

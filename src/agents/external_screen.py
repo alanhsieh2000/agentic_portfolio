@@ -23,6 +23,7 @@ import logging
 import math
 
 import pandas as pd
+import yfinance as yf
 
 from src.agents.llm_s_apply import apply_rule
 from src.agents.llm_s_schema import ScreeningRule
@@ -102,8 +103,132 @@ def compute_raw_factors_for_ticker(ticker: str, as_of_date) -> dict[str, float |
     return {"mve": mve, "bm": bm, "mom12m": mom12m}
 
 
+def aggregate_price_to_book(weighted_pb: list[tuple[float, float]]) -> float | None:
+    """Weighted-harmonic-mean price-to-book across (weight, price_to_book)
+    pairs for a fund's holdings — `sum(weight) / sum(weight / pb)`, the
+    same "aggregate price / aggregate book" method index providers use to
+    combine a valuation ratio across many holdings, rather than a plain
+    average of the ratios themselves. A plain average is not equivalent:
+    it would let one extreme or negative-book-equity holding (e.g. AbbVie's
+    real, well-documented `priceToBook` of roughly -75, from its own
+    negative book equity) dominate the result out of proportion to its
+    actual portfolio weight, whereas this method weights each holding's
+    contribution to the fund's *aggregate* book value, not its ratio.
+
+    Pairs with `pb == 0` are skipped (undefined ratio). Returns None if
+    nothing usable remains, or if the implied aggregate book value
+    (`sum(weight / pb)`) comes out non-positive — in that case there is no
+    economically meaningful price-to-book to report, not a number worth
+    returning anyway.
+    """
+    usable = [(w, pb) for w, pb in weighted_pb if pb]
+    weight_sum = sum(w for w, _ in usable)
+    inv_sum = sum(w / pb for w, pb in usable)
+    if weight_sum <= 0 or inv_sum <= 0:
+        return None
+    return weight_sum / inv_sum
+
+
+def estimate_price_to_book_from_holdings(ticker: str) -> tuple[float | None, float]:
+    """Best-effort aggregate price-to-book for an ETF from its top ~10
+    disclosed holdings, for use when `Ticker.info` lacks `priceToBook`
+    directly (verified live, 2026-08-14: true for preferred-stock,
+    derivative-income, and actively-managed growth funds — see
+    plans/07_external_candidate_screening.md). Returns `(estimate,
+    coverage)`, where `coverage` is the total holding-weight actually used
+    — necessarily partial, since only the top ~10 holdings are disclosed
+    by `get_funds_data()`, not the full portfolio.
+
+    Only holdings that resolve as ordinary common equities
+    (`quoteType == "EQUITY"`) with a numeric `priceToBook` count. If fewer
+    than half of the fund's disclosed top holdings resolve that way — the
+    case for a preferred-stock fund like PFFA, whose holdings are
+    individual preferred-share issues that mostly don't even resolve as
+    ordinary tickers via `yfinance`, and for which "price-to-book" has no
+    standard meaning in the first place (preferred shares trade relative to
+    par/liquidation value, not book equity) — this returns `(None, 0.0)`
+    rather than a lone-holding-driven, unrepresentative estimate.
+
+    Never raises: any fetch failure (network, missing fund data) degrades
+    to `(None, 0.0)`, matching this module's other network-calling
+    functions' error handling.
+    """
+    try:
+        top_holdings = yf.Ticker(to_yfinance_symbol(ticker)).get_funds_data().top_holdings
+    except Exception:
+        logger.warning("get_funds_data() failed for %s; no holdings-based bm estimate", ticker, exc_info=True)
+        return None, 0.0
+    if top_holdings is None or top_holdings.empty:
+        return None, 0.0
+
+    weighted_pb: list[tuple[float, float]] = []
+    usable_count = 0
+    for symbol, row in top_holdings.iterrows():
+        weight = float(row["Holding Percent"])
+        try:
+            info = yf.Ticker(str(symbol)).info
+        except Exception:
+            continue
+        if info.get("quoteType") != "EQUITY":
+            continue
+        pb = info.get("priceToBook")
+        if pb is None or pd.isna(pb):
+            continue
+        weighted_pb.append((weight, pb))
+        usable_count += 1
+
+    if usable_count < len(top_holdings) / 2:
+        return None, 0.0
+    estimate = aggregate_price_to_book(weighted_pb)
+    coverage = sum(w for w, _ in weighted_pb) if estimate is not None else 0.0
+    return estimate, coverage
+
+
+def _auto_fetch_etf_aum(ticker: str) -> float | None:
+    """`Ticker.info['totalAssets']`, falling back to `'netAssets'` — both
+    verified live (2026-08-14) to be present and mutually consistent for
+    9/9 real ETFs tested across distinct fund categories, so this is safe
+    to trust as a default. Returns None on any fetch failure or absence.
+    """
+    try:
+        info = yf.Ticker(to_yfinance_symbol(ticker)).info
+    except Exception:
+        logger.warning("Ticker.info fetch failed for %s; aum will be null", ticker, exc_info=True)
+        return None
+    aum = info.get("totalAssets")
+    if aum is None:
+        aum = info.get("netAssets")
+    return float(aum) if aum is not None and not pd.isna(aum) else None
+
+
+def _auto_fetch_etf_price_to_book(ticker: str) -> float | None:
+    """`Ticker.info['priceToBook']` if present; otherwise
+    `estimate_price_to_book_from_holdings`'s best-effort estimate from the
+    fund's top disclosed holdings (logged at INFO level, including its
+    coverage, so the fallback firing is visible); otherwise None — e.g. for
+    a preferred-stock fund, where neither source has a usable value.
+    """
+    try:
+        info = yf.Ticker(to_yfinance_symbol(ticker)).info
+    except Exception:
+        logger.warning("Ticker.info fetch failed for %s; price_to_book will be null", ticker, exc_info=True)
+        info = {}
+    pb = info.get("priceToBook")
+    if pb is not None and not pd.isna(pb):
+        return float(pb)
+    estimate, coverage = estimate_price_to_book_from_holdings(ticker)
+    if estimate is not None:
+        logger.info(
+            "%s: Ticker.info lacks priceToBook; using holdings-based estimate %.3f (coverage=%.1f%% of AUM)",
+            ticker,
+            estimate,
+            coverage * 100,
+        )
+    return estimate
+
+
 def compute_raw_factors_for_etf(
-    ticker: str, as_of_date, aum: float | None, price_to_book: float | None
+    ticker: str, as_of_date, aum: float | None = None, price_to_book: float | None = None
 ) -> dict[str, float | None]:
     """Raw `mve`, `bm`, `mom12m` for one ETF, where `mve`/`bm` in the
     single-company sense this project otherwise uses do not apply (no
@@ -114,13 +239,21 @@ def compute_raw_factors_for_etf(
     price_to_book` (the fund's aggregate portfolio price-to-book ratio,
     inverted to match this project's book-to-market convention).
 
-    `aum` and `price_to_book` are supplied by the caller rather than
-    fetched automatically: live `yfinance` coverage of these two fields
-    for ETFs is unverified (see plans/07_external_candidate_screening.md's
-    Progress checklist), so this function does not silently guess or scrape
-    a third-party site for them. `mom12m` is computed identically to a
-    stock's — ordinary price momentum applies to any priced instrument.
+    `aum` and `price_to_book` are auto-fetched (via `_auto_fetch_etf_aum`/
+    `_auto_fetch_etf_price_to_book`) whenever the caller omits them —
+    verified live (see plans/07_external_candidate_screening.md) that AUM
+    is reliably available for any ETF and price-to-book for most, with a
+    holdings-based fallback recovering most of the rest. A caller that
+    supplies either argument explicitly (e.g. a trusted manually-looked-up
+    figure) is unaffected — auto-fetch only fires for an omitted argument,
+    so this remains fully overridable. `mom12m` is computed identically to
+    a stock's — ordinary price momentum applies to any priced instrument.
     """
+    if aum is None:
+        aum = _auto_fetch_etf_aum(ticker)
+    if price_to_book is None:
+        price_to_book = _auto_fetch_etf_price_to_book(ticker)
+
     mve = math.log(aum) if aum is not None and aum > 0 else None
     bm = (1.0 / price_to_book) if price_to_book else None
 
