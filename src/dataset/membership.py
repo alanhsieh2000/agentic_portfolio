@@ -21,6 +21,7 @@ from src.config.settings import settings
 logger = logging.getLogger(__name__)
 
 WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+CHANGES_URL = "https://en.wikipedia.org/wiki/Historical_components_of_the_S%26P_500"
 USER_AGENT = "agentic-portfolio-dataset-builder/0.1 (educational research project)"
 
 
@@ -58,7 +59,9 @@ def _flatten_column(col: object) -> str:
     return str(col).strip()
 
 
-def _locate_table(tables: list[pd.DataFrame], required: list[str], table_name: str) -> pd.DataFrame:
+def _locate_table(
+    tables: list[pd.DataFrame], required: list[str], table_name: str, source_url: str = WIKIPEDIA_URL
+) -> pd.DataFrame:
     """Return the first table whose flattened columns cover every substring
     in `required`. Matching is substring-based and case-insensitive because
     the real column is named "Effective Date", not the "Date" the plan's
@@ -71,22 +74,37 @@ def _locate_table(tables: list[pd.DataFrame], required: list[str], table_name: s
             return table
     raise MembershipTableNotFoundError(
         f"Could not find the {table_name!r} table among {len(tables)} tables parsed "
-        f"from {WIKIPEDIA_URL}. Looked for columns containing every one of {required}. "
+        f"from {source_url}. Looked for columns containing every one of {required}. "
         f"Columns found in each candidate table: "
         f"{[[_flatten_column(c) for c in t.columns] for t in tables]}"
     )
 
 
 def fetch_membership_tables(
-    url: str = WIKIPEDIA_URL, timeout: float = settings.http_timeout_seconds
+    url: str = WIKIPEDIA_URL, changes_url: str = CHANGES_URL, timeout: float = settings.http_timeout_seconds
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fetch the page and return (raw_current_table, raw_changes_table),
-    located by column-name inspection rather than table index.
+    """Fetch (raw_current_table, raw_changes_table), located by column-name
+    inspection rather than table index.
+
+    As of 2026-08-11 (Wikipedia revision 1368903137, "move to [[Historical
+    components of the S&P 500]]"), the changes table no longer lives on the
+    same page as the current-constituents table — it was split out to its
+    own article. Both tables are looked for on `url` first (so this keeps
+    working unmodified if Wikipedia ever merges them back onto one page);
+    only if the changes table isn't found there does this fall back to a
+    second fetch of `changes_url`.
     """
     html = _fetch_html(url, timeout=timeout)
     tables = pd.read_html(io.StringIO(html))
-    current = _locate_table(tables, required=["symbol", "date added"], table_name="current constituents")
-    changes = _locate_table(tables, required=["date", "added", "removed"], table_name="selected changes")
+    current = _locate_table(tables, required=["symbol", "date added"], table_name="current constituents", source_url=url)
+    try:
+        changes = _locate_table(tables, required=["date", "added", "removed"], table_name="selected changes", source_url=url)
+    except MembershipTableNotFoundError:
+        changes_html = _fetch_html(changes_url, timeout=timeout)
+        changes_tables = pd.read_html(io.StringIO(changes_html))
+        changes = _locate_table(
+            changes_tables, required=["date", "added", "removed"], table_name="selected changes", source_url=changes_url
+        )
     return current, changes
 
 
