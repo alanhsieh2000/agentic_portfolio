@@ -26,6 +26,7 @@ from datetime import date
 
 from src.agents.llm_f_signals import screen_month
 from src.agents.llm_s import generate_rule
+from src.agents.llm_s_schema import ScreeningRule
 from src.agents.llm_s_signals import screen
 from src.config.settings import settings
 from src.flow.live import build_live_snapshot
@@ -83,27 +84,32 @@ def compute_weights_and_allocation(
     return weights, allocation
 
 
-def run_pipeline_against(
+def run_scan(
     rebalance_date: date,
-    objective: str,
-    portfolio_value: float,
     selection: str,
     db_path: str,
-    mode: str,
+    rule: ScreeningRule | None = None,
 ) -> dict:
-    """The shared sequence behind both modes: LLM-S (`generate_rule` +
-    `screen`) and/or LLM-F (`screen_month`) per `selection`, the scanner
-    (`scan_with_detail`), and the optimizer
-    (`compute_weights_and_allocation`) - all reading `db_path`, whichever
-    database that is. Exposed (not module-private) so a CLI session opened
-    with `open_pipeline_session` can call this once for the initial run
-    and then call `compute_weights_and_allocation` directly on its own for
-    every subsequent edit, without repeating LLM-S/LLM-F/the scanner.
+    """LLM-S (`generate_rule` + `screen`) and/or LLM-F (`screen_month`) per
+    `selection`, then the scanner (`scan_with_detail`) - the part of the
+    pipeline before the optimizer. Returns a dict with `rule`,
+    `llm_s_signals`, `llm_f_signals`, `scan_detail`.
+
+    `rule` lets a caller that manages its own already-generated
+    `ScreeningRule` skip the `generate_rule` call entirely - used by
+    `src/flow/backtest.py`'s `run_full_backtest`, which must call
+    `generate_rule` at most once per calendar year across a 52-month run
+    (see that module's docstring for why a fresh LLM-S call per *month*
+    would be a correctness bug, not just a wasted one) rather than once
+    per call to this function. Left `None` (the default), `generate_rule`
+    is still called exactly when `selection` needs LLM-S, matching every
+    other caller's existing behavior.
     """
-    rule = None
+    if rule is None and selection in ("llm_s_only", "llm_s_and_f"):
+        rule = generate_rule(rebalance_date.year, db_path=db_path)
+
     llm_s_signals = None
     if selection in ("llm_s_only", "llm_s_and_f"):
-        rule = generate_rule(rebalance_date.year, db_path=db_path)
         llm_s_signals = screen(rule, rebalance_date, db_path=db_path)
 
     llm_f_signals = None
@@ -111,8 +117,35 @@ def run_pipeline_against(
         llm_f_signals = screen_month(rebalance_date.year, rebalance_date.month, db_path=db_path)
 
     scan_detail = scan_with_detail(llm_s_signals, llm_f_signals)
+    return {
+        "rule": rule,
+        "llm_s_signals": llm_s_signals,
+        "llm_f_signals": llm_f_signals,
+        "scan_detail": scan_detail,
+    }
+
+
+def run_pipeline_against(
+    rebalance_date: date,
+    objective: str,
+    portfolio_value: float,
+    selection: str,
+    db_path: str,
+    mode: str,
+    rule: ScreeningRule | None = None,
+) -> dict:
+    """The shared sequence behind both modes: `run_scan` (LLM-S/LLM-F/the
+    scanner) followed by the optimizer (`compute_weights_and_allocation`)
+    - all reading `db_path`, whichever database that is. Exposed (not
+    module-private) so a CLI session opened with `open_pipeline_session`
+    can call this once for the initial run and then call
+    `compute_weights_and_allocation` directly on its own for every
+    subsequent edit, without repeating LLM-S/LLM-F/the scanner. `rule` is
+    passed straight through to `run_scan` - see its docstring.
+    """
+    scan = run_scan(rebalance_date, selection, db_path, rule=rule)
     weights, allocation = compute_weights_and_allocation(
-        scan_detail["candidates"], objective, portfolio_value, rebalance_date, db_path
+        scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date, db_path
     )
 
     return {
@@ -120,10 +153,7 @@ def run_pipeline_against(
         "rebalance_date": rebalance_date,
         "objective": objective,
         "selection": selection,
-        "rule": rule,
-        "llm_s_signals": llm_s_signals,
-        "llm_f_signals": llm_f_signals,
-        "scan_detail": scan_detail,
+        **scan,
         "weights": weights,
         "allocation": allocation,
     }
