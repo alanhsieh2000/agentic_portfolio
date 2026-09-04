@@ -1,16 +1,15 @@
-"""CLI entry point for `plans/06_interactive_flow.md`'s backtest mode:
-`uv run python -m src.flow.cli --date YYYY-MM-DD --objective GMV|MV|MSR
---value 100000 [--selection llm_s_only|llm_f_only|llm_s_and_f]`.
+"""CLI entry point for `plans/06_interactive_flow.md`'s backtest and live
+modes: `uv run python -m src.flow.cli --date YYYY-MM-DD|today --objective
+GMV|MV|MSR --value 100000 [--selection llm_s_only|llm_f_only|llm_s_and_f]`.
 
-Prints `run_pipeline`'s bundled result - LLM-S's rule (if run), the
-scanner's branch and candidate list, the weights, and the share allocation
-- so a person can see why each ticker is or is not a candidate, not just
-the final number of shares.
+Prints `run_pipeline`'s bundled result - which mode ran, LLM-S's rule (if
+run), the scanner's branch and candidate list, the weights, and the share
+allocation - so a person can see why each ticker is or is not a candidate,
+not just the final number of shares.
 
-Live mode (`--date today`) and the interactive add/remove/finish editing
-loop are `plans/06_interactive_flow.md`'s Progress items 19 and 20,
-not yet implemented; this entry point only drives backtest mode's
-one-shot, non-interactive display for now.
+The interactive add/remove/finish editing loop is this plan's Progress
+item 20, not yet implemented; this entry point only drives a one-shot,
+non-interactive display for now.
 """
 
 from __future__ import annotations
@@ -22,10 +21,14 @@ from src.flow.interactive import VALID_SELECTIONS, run_pipeline
 from src.optimizer.portfolio import VALID_OBJECTIVES
 
 
+def _parse_date(value: str) -> date:
+    return date.today() if value == "today" else date.fromisoformat(value)
+
+
 def print_pipeline_result(result: dict) -> None:
     """Human-readable rendering of one `run_pipeline` result dict."""
-    print(f"Rebalance date: {result['rebalance_date']}  Objective: {result['objective']}  "
-          f"Selection: {result['selection']}")
+    print(f"Mode: {result['mode']}  Rebalance date: {result['rebalance_date']}  "
+          f"Objective: {result['objective']}  Selection: {result['selection']}")
 
     rule = result["rule"]
     if rule is not None:
@@ -55,14 +58,14 @@ def print_pipeline_result(result: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run plans/06_interactive_flow.md's backtest-mode pipeline.")
-    parser.add_argument("--date", required=True, help="Rebalance date, YYYY-MM-DD (backtest mode only for now).")
+    parser.add_argument("--date", required=True, help="Rebalance date, YYYY-MM-DD, or 'today' for live mode.")
     parser.add_argument("--objective", required=True, choices=VALID_OBJECTIVES)
     parser.add_argument("--value", required=True, type=float, help="Total portfolio value to allocate.")
     parser.add_argument("--selection", default="llm_s_only", choices=VALID_SELECTIONS)
     parser.add_argument("--db-path", default="data/portfolio.duckdb")
     args = parser.parse_args()
 
-    rebalance_date = date.fromisoformat(args.date)
+    rebalance_date = _parse_date(args.date)
     result = run_pipeline(
         rebalance_date=rebalance_date,
         objective=args.objective,
