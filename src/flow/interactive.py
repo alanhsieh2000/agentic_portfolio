@@ -7,13 +7,21 @@ Backtest mode (a `rebalance_date` within the stored 2020-01-01..2024-04-30
 window) reads directly from `data/portfolio.duckdb`'s cached historical
 tables. Live mode (any other date, e.g. "today") builds a fresh,
 throwaway snapshot instead - see `src/flow/live.py`'s `build_live_snapshot`
-- and runs the exact same downstream sequence against it. The interactive
-candidate-editing loop (`edit_candidates`) is this plan's Progress item
-20, not yet implemented.
+- and runs the exact same downstream sequence against it.
+
+`open_pipeline_session` is what makes the interactive candidate-editing
+loop possible: it keeps live mode's throwaway snapshot alive for an
+entire CLI session (one initial `run_pipeline_against` call plus any
+number of `compute_weights_and_allocation` recomputes against edited
+candidate lists), tearing it down only when the `with` block exits -
+`run_pipeline` itself is a single-call convenience wrapper around exactly
+one such session, for callers (a future backtest runner, tests) that only
+need one shot and never edit anything.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date
 
 from src.agents.llm_f_signals import screen_month
@@ -37,7 +45,45 @@ def _is_backtest_date(rebalance_date: date) -> bool:
     return start <= rebalance_date <= end
 
 
-def _run_pipeline_against(
+@contextmanager
+def open_pipeline_session(rebalance_date: date, selection: str, db_path: str = "data/portfolio.duckdb"):
+    """Yield `(effective_db_path, mode)` for `rebalance_date`: `(db_path,
+    "backtest")` unchanged for a date within the stored window, or a
+    freshly-built live snapshot's temp path and `"live"` for any other
+    date - kept alive for the whole `with` block (not torn down after a
+    single pipeline call), so a caller can run the initial pipeline and
+    then recompute weights/allocation against edited candidate lists any
+    number of times before the snapshot is deleted on exit.
+    """
+    if _is_backtest_date(rebalance_date):
+        yield db_path, "backtest"
+    else:
+        with build_live_snapshot(rebalance_date, selection, source_db_path=db_path) as live_db_path:
+            yield live_db_path, "live"
+
+
+def compute_weights_and_allocation(
+    candidates: list[str],
+    objective: str,
+    portfolio_value: float,
+    rebalance_date: date,
+    db_path: str,
+) -> tuple[dict[str, float], tuple[dict[str, int], float]]:
+    """`compute_weights` + `allocate_shares` for `candidates` as of
+    `rebalance_date`, reading `db_path` - the part of the pipeline an
+    interactive edit re-runs, deliberately never the two LLM agents, since
+    editing the candidate list is the user overriding the agents' already-
+    given recommendation, not asking them to reconsider it.
+    """
+    returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
+    weights = compute_weights(returns_matrix, objective)
+
+    latest_prices = load_latest_prices(list(weights.keys()), as_of=rebalance_date, db_path=db_path)
+    allocation = allocate_shares(weights, latest_prices, portfolio_value)
+    return weights, allocation
+
+
+def run_pipeline_against(
     rebalance_date: date,
     objective: str,
     portfolio_value: float,
@@ -47,8 +93,12 @@ def _run_pipeline_against(
 ) -> dict:
     """The shared sequence behind both modes: LLM-S (`generate_rule` +
     `screen`) and/or LLM-F (`screen_month`) per `selection`, the scanner
-    (`scan_with_detail`), and the optimizer (`compute_weights` +
-    `allocate_shares`) - all reading `db_path`, whichever database that is.
+    (`scan_with_detail`), and the optimizer
+    (`compute_weights_and_allocation`) - all reading `db_path`, whichever
+    database that is. Exposed (not module-private) so a CLI session opened
+    with `open_pipeline_session` can call this once for the initial run
+    and then call `compute_weights_and_allocation` directly on its own for
+    every subsequent edit, without repeating LLM-S/LLM-F/the scanner.
     """
     rule = None
     llm_s_signals = None
@@ -61,13 +111,9 @@ def _run_pipeline_against(
         llm_f_signals = screen_month(rebalance_date.year, rebalance_date.month, db_path=db_path)
 
     scan_detail = scan_with_detail(llm_s_signals, llm_f_signals)
-    candidates = scan_detail["candidates"]
-
-    returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
-    weights = compute_weights(returns_matrix, objective)
-
-    latest_prices = load_latest_prices(list(weights.keys()), as_of=rebalance_date, db_path=db_path)
-    allocation = allocate_shares(weights, latest_prices, portfolio_value)
+    weights, allocation = compute_weights_and_allocation(
+        scan_detail["candidates"], objective, portfolio_value, rebalance_date, db_path
+    )
 
     return {
         "mode": mode,
@@ -83,6 +129,24 @@ def _run_pipeline_against(
     }
 
 
+def edit_candidates(scan_result: dict, add: list[str], remove: list[str]) -> list[str]:
+    """`scan_result["candidates"]` (as produced by `scan_with_detail`) with
+    every ticker in `add` not already present added, and every ticker in
+    `remove` that is present removed - returns the resulting sorted list.
+
+    Deliberately simple set manipulation: by this point in the pipeline
+    both agents have already spoken, and the user is directly overriding
+    their combined recommendation, the same way
+    `plans/04_candidate_scanner.md`'s `scan` function already accepts an
+    arbitrary user-supplied ticker list rather than only the scanner's own
+    output.
+    """
+    candidates = set(scan_result["candidates"])
+    candidates |= set(add)
+    candidates -= set(remove)
+    return sorted(candidates)
+
+
 def run_pipeline(
     rebalance_date: date,
     objective: str,
@@ -90,7 +154,10 @@ def run_pipeline(
     selection: str = "llm_s_only",
     db_path: str = "data/portfolio.duckdb",
 ) -> dict:
-    """Run the full pipeline for one `rebalance_date`.
+    """Run the full pipeline for one `rebalance_date`, as a single,
+    self-contained call - see `open_pipeline_session` for a CLI-style
+    session that keeps live mode's snapshot alive across multiple calls
+    for interactive editing.
 
     `selection` (one of `"llm_s_only"` (the default), `"llm_f_only"`,
     `"llm_s_and_f"`) controls which agent(s) actually run, per README's
@@ -102,11 +169,11 @@ def run_pipeline(
 
     Backtest mode (`rebalance_date` within the stored 2020-2024 window)
     reads `db_path`'s cached historical tables directly. Live mode (any
-    other date) first builds a fresh, throwaway snapshot via
-    `build_live_snapshot` (a real Wikipedia/yfinance/SEC EDGAR fetch, not a
-    read from `db_path`) and runs the identical downstream sequence
-    against that instead - `db_path` is used there only as the source of
-    the static `news_articles_hf` archive `screen_month` needs.
+    other date) first builds a fresh, throwaway snapshot (a real
+    Wikipedia/yfinance/SEC EDGAR fetch, not a read from `db_path`) and runs
+    the identical downstream sequence against that instead - `db_path` is
+    used there only as the source of the static `news_articles_hf` archive
+    `screen_month` needs.
 
     Returns a dict bundling every intermediate result: `mode`
     (`"backtest"` or `"live"`), `rule` (LLM-S's `ScreeningRule`, `None` if
@@ -120,8 +187,5 @@ def run_pipeline(
     if selection not in VALID_SELECTIONS:
         raise ValueError(f"selection must be one of {VALID_SELECTIONS}, got {selection!r}")
 
-    if _is_backtest_date(rebalance_date):
-        return _run_pipeline_against(rebalance_date, objective, portfolio_value, selection, db_path, mode="backtest")
-
-    with build_live_snapshot(rebalance_date, selection, source_db_path=db_path) as live_db_path:
-        return _run_pipeline_against(rebalance_date, objective, portfolio_value, selection, live_db_path, mode="live")
+    with open_pipeline_session(rebalance_date, selection, db_path) as (effective_db_path, mode):
+        return run_pipeline_against(rebalance_date, objective, portfolio_value, selection, effective_db_path, mode)
