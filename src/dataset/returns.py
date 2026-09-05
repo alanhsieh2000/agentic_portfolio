@@ -213,6 +213,13 @@ def build_returns_for_tickers(tickers: list[str], db_path: str, start: str, end:
     return returns
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (`portfolio-build-returns`), also used by
+    `python -m src.dataset.returns`.
+    """
     logging.basicConfig(level=logging.INFO)
     build_returns()
+
+
+if __name__ == "__main__":
+    main()

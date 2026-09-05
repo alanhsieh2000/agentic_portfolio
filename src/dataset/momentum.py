@@ -154,6 +154,13 @@ def build_momentum_factors(db_path: str = settings.db_path) -> pd.DataFrame:
     return updated
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (`portfolio-build-momentum`), also used by
+    `python -m src.dataset.momentum`.
+    """
     logging.basicConfig(level=logging.INFO)
     build_momentum_factors()
+
+
+if __name__ == "__main__":
+    main()

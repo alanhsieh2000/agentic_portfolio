@@ -13,7 +13,7 @@ After this change, a person can run the pipeline with `--selection user_provided
 
 Concretely, this is the observable outcome, from a real run (the `$` lines are what a person types):
 
-    $ uv run python -m src.flow.cli --date today --objective GMV --value 100000 --selection user_provided
+    $ uv run portfolio --date today --objective GMV --value 100000 --selection user_provided
 
     Current candidate pool (0): (empty)
 
@@ -53,6 +53,7 @@ Two things in that transcript are worth naming explicitly, because they are the 
 - [x] (2026-09-05) Wired the user-facing loop into `src/flow/cli.py`: added `_run_user_provided_confirm_loop` (the show-pool, add/remove, confirm-when-done loop), a `--memory-path` argument, and made the existing post-run `_run_edit_loop` validate added tickers and re-save the pool when — and only when — the selection is `user_provided`. Covered by 13 tests in the new `tests/test_cli.py`, the first automated coverage this CLI module has had.
 - [x] (2026-09-05) Added `memory/` to `.gitignore`, since a saved candidate pool is exactly the "local watchlist data" `AGENTS.md` says must not land in tracked files.
 - [x] (2026-09-05) Verified the full suite: `uv run pytest tests/test_*.py` reports 188 passed, up from 141 before this work (47 new tests). Verified end to end with three real network runs, transcripts in Artifacts and Notes below.
+- [x] (2026-09-05) Restated this plan's commands using the `portfolio` console script added to `pyproject.toml`'s `[project.scripts]` that same day, so the selection is invoked as `uv run portfolio --selection user_provided ...` rather than `uv run python -m src.flow.cli --selection user_provided ...`. No code in this plan's own feature changed; `python -m src.flow.cli` remains exactly equivalent. See the Revision Note at the bottom of this plan.
 
 
 ## Surprises & Discoveries
@@ -153,7 +154,7 @@ Run everything from the repository root, `/app/agentic_portfolio`.
 
 To see the feature work, with a scratch memory file so nothing is left behind:
 
-    uv run python -m src.flow.cli --date today --objective GMV --value 100000 \
+    uv run portfolio --date today --objective GMV --value 100000 \
         --selection user_provided --memory-path /tmp/candidates.json
 
 Type `a`, then `AAPL SPY ZZZZQQQ`, then `d`. Expect the transcript shown in Purpose above: `Added: AAPL, SPY.` followed by `Ignored (not found): ZZZZQQQ.`, then a saved-pool line, then the weights and share allocation. Yahoo Finance also prints its own `HTTP Error 404` and `1 Failed download: ['ZZZZQQQ']` noise to stderr for the bogus symbol; that is `yfinance` reporting the same fact the loop reports, not an error in this code.
@@ -365,3 +366,15 @@ In `src/flow/cli.py`, add:
     ) -> list[str]
 
 and `_run_edit_loop` gains `selection: str = "llm_s_only"` and `memory_path: str = DEFAULT_CANDIDATES_PATH`.
+
+This selection is reached through the `portfolio` console script (`pyproject.toml`'s `[project.scripts]`, pointing at `src.flow.cli:main`), so `--selection user_provided` is passed to `uv run portfolio`. That script is not specific to this plan — it is the whole CLI's entry point, declared when `[project.scripts]` was first added — and `uv run python -m src.flow.cli` remains an exactly equivalent way in.
+
+
+## Revision Note (2026-09-05)
+
+
+Changed: the two runnable command lines in this plan (the worked example under Purpose / Big Picture, and Concrete Steps' "to see the feature work" invocation) now read `uv run portfolio ...` instead of `uv run python -m src.flow.cli ...`, and the Interfaces and Dependencies section above notes the console script this selection is reached through.
+
+Why: the repository owner asked for a friendlier command line immediately after this plan was implemented, and `pyproject.toml` gained a `[project.scripts]` section the same day. Both spellings invoke the identical `main()`, so no behavior, interface, decision, or acceptance criterion in this plan changed.
+
+One honesty note about the transcripts: the real runs recorded under Purpose / Big Picture and Artifacts and Notes were executed with the `uv run python -m src.flow.cli` form, since the console script did not exist yet when they were captured. The command line shown in the Purpose example has been updated to the form a reader should now type; its output is reproduced exactly as captured, and is unaffected by which of the two equivalent spellings is used. The abridged transcripts in Artifacts and Notes show output only, with no command line to restate.

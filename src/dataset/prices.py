@@ -344,6 +344,13 @@ def build_price_history(
     return long_prices
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (`portfolio-build-prices`), also used by
+    `python -m src.dataset.prices`.
+    """
     logging.basicConfig(level=logging.INFO)
     build_price_history()
+
+
+if __name__ == "__main__":
+    main()

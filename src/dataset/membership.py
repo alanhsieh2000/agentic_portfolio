@@ -279,6 +279,13 @@ def build_membership_table(db_path: str = settings.db_path, url: str = WIKIPEDIA
     return membership
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (`portfolio-build-membership`), also used by
+    `python -m src.dataset.membership`.
+    """
     logging.basicConfig(level=logging.INFO)
     build_membership_table()
+
+
+if __name__ == "__main__":
+    main()

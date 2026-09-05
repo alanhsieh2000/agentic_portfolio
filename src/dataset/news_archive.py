@@ -94,7 +94,14 @@ def build_news_archive(
         con.close()
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (`portfolio-build-news-archive`), also used
+    by `python -m src.dataset.news_archive`.
+    """
     logging.basicConfig(level=logging.INFO)
     download_news_archive()
     build_news_archive()
+
+
+if __name__ == "__main__":
+    main()

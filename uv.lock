@@ -16,7 +16,7 @@ resolution-markers = [
 [[package]]
 name = "agentic-portfolio"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "aisuite" },
     { name = "crewai", extra = ["anthropic", "azure-ai-inference", "google-genai", "tools"] },

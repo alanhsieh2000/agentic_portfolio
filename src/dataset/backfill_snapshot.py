@@ -136,10 +136,19 @@ def insert_snapshot_rows(df: pd.DataFrame, db_path: str = settings.db_path) -> N
     logger.info("inserted %d row(s) into %s::factors", len(df), db_path)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (`portfolio-backfill-snapshot`), also used by
+    `python -m src.dataset.backfill_snapshot`. Takes an optional ISO date as
+    the sole positional argument, defaulting to this module's own 2019-12-31
+    target.
+    """
     import sys
 
     logging.basicConfig(level=logging.INFO)
     target = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date(2019, 12, 31)
     snapshot = build_snapshot_for_date(target)
     insert_snapshot_rows(snapshot)
+
+
+if __name__ == "__main__":
+    main()

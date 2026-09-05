@@ -190,9 +190,16 @@ def run_full_backtest(
     return pd.DataFrame(rows).set_index("rebalance_date")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (`portfolio-backtest`), also used by
+    `python -m src.flow.backtest`.
+    """
     logging.basicConfig(level=logging.INFO)
     result = run_full_backtest("MSR")
     sharpe = compute_sharpe_ratio(result["net_return"])
     print(f"Realized annualized Sharpe (MSR, net of transaction cost and risk-free rate, this project): {sharpe:.4f}")
     print("Paper-reported S&P 500 baseline Sharpe, 2020-2024: 0.6324")
+
+
+if __name__ == "__main__":
+    main()
