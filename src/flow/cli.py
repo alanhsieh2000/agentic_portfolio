@@ -22,7 +22,9 @@ candidate pool persisted at `--memory-path` (`memory/candidates.json` by
 default) and prompts add/remove until the user confirms it, validating each
 added ticker against Yahoo Finance so a typo is named rather than silently
 carried into the optimizer - then feeds the confirmed pool through the same
-optimizer and post-run edit loop every other selection uses.
+optimizer and post-run edit loop every other selection uses. That file
+holds one pool per currency, since a portfolio can only hold one; when
+several are saved, the user is asked which to resume.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from datetime import date
 from src.config.settings import settings
 from src.dataset.ticker_currency import DEFAULT_CURRENCY, group_by_currency
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
-from src.flow.candidate_memory import DEFAULT_CANDIDATES_PATH, load_candidate_pool, save_candidate_pool
+from src.flow.candidate_memory import DEFAULT_CANDIDATES_PATH, load_all_pools, save_candidate_pool
 from src.flow.interactive import (
     VALID_SELECTIONS,
     compute_weights_and_allocation,
@@ -191,8 +193,53 @@ def _resolve_mixed_persisted_pool(pool: list[str], currencies: dict[str, str]) -
         print(f"Unrecognized currency {chosen!r}.")
 
 
+def _choose_pool_to_resume(pools: dict[str, list[str]]) -> tuple[list[str], str | None]:
+    """Pick which saved pool this session works on, returning
+    `(tickers, currency)`.
+
+    `memory/candidates.json` holds one pool per currency, since a portfolio
+    can only hold one, so with anything saved there is nothing but the
+    person's intent to go on and this asks. A `None` currency means "start a
+    new pool": the same not-yet-established state as a first-ever run, where
+    the first ticker typed decides its currency. Choosing a currency that
+    already has a pool and emptying it is simply editing that pool, which
+    overwrites it on save - `save_candidate_pool` has always replaced rather
+    than merged.
+
+    The `[n]ew` option is offered even when only one pool is saved, which
+    costs a keystroke in the common case but is what makes a second currency
+    reachable at all: resuming the sole saved pool unconditionally would
+    leave a person with a USD pool no way to start a JPY one, since every
+    Tokyo ticker they typed would be refused against the pool they were
+    forced into.
+    """
+    if not pools:
+        return [], None
+
+    print("\nSaved candidate pools:")
+    for currency, tickers in sorted(pools.items()):
+        print(f"  {currency} ({len(tickers)}): {', '.join(tickers)}")
+
+    if len(pools) == 1:
+        only_currency, only_tickers = next(iter(pools.items()))
+        prompt = f"Resume the {only_currency} pool? [Enter] resume / [n]ew pool in another currency: "
+    else:
+        only_currency, only_tickers = None, None
+        prompt = f"Resume which pool? ({'/'.join(sorted(pools))}) or [n]ew: "
+
+    while True:
+        chosen = input(prompt).strip().upper()
+        if chosen in ("N", "NEW"):
+            return [], None
+        if not chosen and only_currency is not None:
+            return only_tickers, only_currency
+        if chosen in pools:
+            return pools[chosen], chosen
+        print(f"Unrecognized choice {chosen!r}.")
+
+
 def _run_user_provided_confirm_loop(
-    initial_pool: list[str],
+    initial_pools: dict[str, list[str]],
     rebalance_date: date,
     db_path: str,
     memory_path: str = DEFAULT_CANDIDATES_PATH,
@@ -203,8 +250,11 @@ def _run_user_provided_confirm_loop(
     `user_provided` selection's replacement for the agents that choose
     candidates in every other selection.
 
-    The pool is persisted exactly once, when the user confirms: an
-    in-progress edit is never written to `memory_path`. `initial_pool` is
+    `initial_pools` is every pool saved at `memory_path`, keyed by currency;
+    `_choose_pool_to_resume` settles which one this session works on. The
+    chosen pool is persisted exactly once, when the user confirms, and only
+    into its own currency's slot - an in-progress edit is never written, and
+    the other currencies' pools are left exactly as they were. It is
     re-validated (and re-ingested into this session's `db_path`, which is a
     fresh scratch database every run) before anything is shown, so a
     previously-saved ticker that no longer resolves is dropped with a
@@ -215,11 +265,13 @@ def _run_user_provided_confirm_loop(
     ticker added to an empty pool establishes that currency and later adds
     are measured against it.
     """
+    initial_pool, resumed_currency = _choose_pool_to_resume(initial_pools)
+
     pool, invalid, currencies = validate_and_ingest_tickers(initial_pool, rebalance_date, db_path)
     if invalid:
         print(f"Warning: dropping previously-saved ticker(s) that no longer resolve: {', '.join(sorted(invalid))}.")
 
-    pool_currency: str | None = None
+    pool_currency: str | None = resumed_currency
     if pool:
         groups = group_by_currency(pool, currencies)
         if len(groups) > 1:
@@ -238,9 +290,10 @@ def _run_user_provided_confirm_loop(
             if not pool:
                 print("Candidate pool is empty; add at least one ticker before finishing.")
                 continue
-            save_candidate_pool(pool, path=memory_path)
-            print(f"Saved {len(pool)} ticker(s) to {memory_path}.")
-            return pool, pool_currency or DEFAULT_CURRENCY
+            confirmed_currency = pool_currency or DEFAULT_CURRENCY
+            save_candidate_pool(pool, path=memory_path, currency=confirmed_currency)
+            print(f"Saved {len(pool)} {confirmed_currency} ticker(s) to {memory_path}.")
+            return pool, confirmed_currency
 
         previous_pool = pool
         if choice in ("a", "add"):
@@ -397,7 +450,7 @@ def _run_edit_loop(
             continue
 
         if selection == "user_provided" and choice in ("a", "add", "r", "remove"):
-            save_candidate_pool(candidates, path=memory_path)
+            save_candidate_pool(candidates, path=memory_path, currency=currency)
 
         print_weights_and_allocation(stats, allocation, objective, currency)
 
@@ -433,7 +486,8 @@ def main() -> None:
     parser.add_argument(
         "--memory-path",
         default=DEFAULT_CANDIDATES_PATH,
-        help="Where the user_provided selection's candidate pool is persisted.",
+        help="Where the user_provided selection's candidate pools are persisted. One file holds "
+             "one pool per currency; when several are saved you are asked which to resume.",
     )
     args = parser.parse_args()
 
@@ -444,7 +498,7 @@ def main() -> None:
         currency = DEFAULT_CURRENCY
         if args.selection == "user_provided":
             candidates, currency = _run_user_provided_confirm_loop(
-                load_candidate_pool(args.memory_path),
+                load_all_pools(args.memory_path),
                 rebalance_date,
                 session_db_path,
                 memory_path=args.memory_path,

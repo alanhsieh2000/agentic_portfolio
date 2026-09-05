@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.flow.cli import (
+    _choose_pool_to_resume,
     _run_edit_loop,
     _run_user_provided_confirm_loop,
     main,
@@ -74,7 +75,7 @@ def test_confirm_loop_add_then_done_persists_pool_once(monkeypatch):
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "a", "AAPL MSFT", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop([], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     assert pool == ["AAPL", "MSFT"]
     assert save_spy.call_count == 1
@@ -86,7 +87,7 @@ def test_confirm_loop_reports_bad_ticker_and_still_adds_the_good_ones(monkeypatc
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL ZZZZ", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop([], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     out = capsys.readouterr().out
     assert pool == ["AAPL"]
@@ -100,7 +101,7 @@ def test_confirm_loop_rejects_finishing_with_an_empty_pool(monkeypatch, capsys):
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "d", "a", "AAPL", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop([], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     assert "add at least one ticker" in capsys.readouterr().out
     assert pool == ["AAPL"]
@@ -110,9 +111,10 @@ def test_confirm_loop_rejects_finishing_with_an_empty_pool(monkeypatch, capsys):
 def test_confirm_loop_shows_the_persisted_pool_and_can_remove_from_it(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    _script(monkeypatch, "r", "MSFT", "d")
+    _script(monkeypatch, "", "r", "MSFT", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop(["AAPL", "MSFT"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL", "MSFT"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     out = capsys.readouterr().out
     assert "Current candidate pool (2): AAPL, MSFT" in out
@@ -122,9 +124,10 @@ def test_confirm_loop_shows_the_persisted_pool_and_can_remove_from_it(monkeypatc
 def test_confirm_loop_names_a_removal_that_was_not_in_the_pool(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    _script(monkeypatch, "r", "GHOST", "d")
+    _script(monkeypatch, "", "r", "GHOST", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop(["AAPL"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     assert "Not in pool (ignored): GHOST." in capsys.readouterr().out
     assert pool == ["AAPL"]
@@ -133,9 +136,10 @@ def test_confirm_loop_names_a_removal_that_was_not_in_the_pool(monkeypatch, caps
 def test_confirm_loop_refuses_an_edit_that_would_empty_the_pool(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    _script(monkeypatch, "r", "AAPL", "d")
+    _script(monkeypatch, "", "r", "AAPL", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop(["AAPL"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     assert "would be empty" in capsys.readouterr().out
     assert pool == ["AAPL"]
@@ -144,9 +148,10 @@ def test_confirm_loop_refuses_an_edit_that_would_empty_the_pool(monkeypatch, cap
 def test_confirm_loop_drops_a_saved_ticker_that_no_longer_resolves(monkeypatch, capsys):
     _fake_ingestion(monkeypatch, invalid={"DEAD"})
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    _script(monkeypatch, "d")
+    _script(monkeypatch, "", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop(["AAPL", "DEAD"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL", "DEAD"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     out = capsys.readouterr().out
     assert "no longer resolve: DEAD" in out
@@ -156,9 +161,10 @@ def test_confirm_loop_drops_a_saved_ticker_that_no_longer_resolves(monkeypatch, 
 def test_confirm_loop_reprompts_on_an_unrecognized_choice(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    _script(monkeypatch, "x", "d")
+    _script(monkeypatch, "", "x", "d")
 
-    pool, _currency = _run_user_provided_confirm_loop(["AAPL"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     assert "Unrecognized choice 'x'." in capsys.readouterr().out
     assert pool == ["AAPL"]
@@ -168,9 +174,10 @@ def test_confirm_loop_blank_input_confirms_the_pool(monkeypatch):
     _fake_ingestion(monkeypatch)
     save_spy = MagicMock()
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
-    _script(monkeypatch, "")
+    _script(monkeypatch, "", "")
 
-    pool, _currency = _run_user_provided_confirm_loop(["AAPL"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, _currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     assert pool == ["AAPL"]
     assert save_spy.call_count == 1
@@ -186,7 +193,7 @@ def test_confirm_loop_first_ticker_establishes_the_pool_currency_and_refuses_oth
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "7203.T", "a", "AAPL", "d")
 
-    pool, currency = _run_user_provided_confirm_loop([], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     out = capsys.readouterr().out
     assert pool == ["7203.T"]
@@ -205,7 +212,7 @@ def test_confirm_loop_currency_is_established_by_what_was_typed_first(monkeypatc
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL 7203.T", "d")
 
-    pool, currency = _run_user_provided_confirm_loop([], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     assert pool == ["AAPL"]
     assert currency == "USD"
@@ -218,7 +225,7 @@ def test_confirm_loop_same_line_partial_accept_across_currencies(monkeypatch, ca
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "7203.T", "a", "AAPL 6758.T", "d")
 
-    pool, currency = _run_user_provided_confirm_loop([], REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+    pool, currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
 
     out = capsys.readouterr().out
     assert pool == ["6758.T", "7203.T"]
@@ -234,10 +241,10 @@ def test_confirm_loop_reports_a_mixed_persisted_pool_and_asks_which_to_keep(monk
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
     save_spy = MagicMock()
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
-    _script(monkeypatch, "JPY", "d")
+    _script(monkeypatch, "", "JPY", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
-        ["AAPL", "7203.T"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
+        {"USD": ["AAPL", "7203.T"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
     )
 
     out = capsys.readouterr().out
@@ -255,15 +262,100 @@ def test_confirm_loop_reports_a_mixed_persisted_pool_and_asks_which_to_keep(monk
 def test_confirm_loop_reprompts_on_an_unrecognized_currency_choice(monkeypatch, capsys):
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    _script(monkeypatch, "EUR", "USD", "d")
+    _script(monkeypatch, "", "EUR", "USD", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
-        ["AAPL", "7203.T"], REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
+        {"USD": ["AAPL", "7203.T"]}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
     )
 
     assert "Unrecognized currency 'EUR'." in capsys.readouterr().out
     assert pool == ["AAPL"]
     assert currency == "USD"
+
+
+# ---------------------------------------------------------------------------
+# _choose_pool_to_resume
+# ---------------------------------------------------------------------------
+
+
+def test_choose_pool_to_resume_with_nothing_saved_starts_empty(monkeypatch):
+    """No prompt at all on a first-ever run, and no currency yet - the first
+    ticker typed will establish it.
+    """
+    _script(monkeypatch)  # any input() call would raise StopIteration
+
+    assert _choose_pool_to_resume({}) == ([], None)
+
+
+def test_choose_pool_to_resume_with_one_saved_pool_resumes_on_a_bare_enter(monkeypatch, capsys):
+    _script(monkeypatch, "")
+
+    tickers, currency = _choose_pool_to_resume({"JPY": ["6758.T", "7203.T"]})
+
+    assert "  JPY (2): 6758.T, 7203.T" in capsys.readouterr().out
+    assert (tickers, currency) == (["6758.T", "7203.T"], "JPY")
+
+
+def test_choose_pool_to_resume_offers_a_new_pool_even_when_only_one_is_saved(monkeypatch):
+    """Without this, someone whose only saved pool is USD could never start a
+    JPY one: every Tokyo ticker would be refused against the pool they had
+    been placed in with no way out.
+    """
+    _script(monkeypatch, "n")
+
+    assert _choose_pool_to_resume({"USD": ["AAPL"]}) == ([], None)
+
+
+def test_choose_pool_to_resume_lists_several_pools_and_resumes_the_chosen_one(monkeypatch, capsys):
+    _script(monkeypatch, "JPY")
+
+    tickers, currency = _choose_pool_to_resume({"USD": ["AAPL", "SPY"], "JPY": ["7203.T"]})
+
+    out = capsys.readouterr().out
+    assert "Saved candidate pools:" in out
+    assert "  USD (2): AAPL, SPY" in out
+    assert "  JPY (1): 7203.T" in out
+    assert (tickers, currency) == (["7203.T"], "JPY")
+
+
+def test_choose_pool_to_resume_can_start_a_new_pool_instead(monkeypatch):
+    _script(monkeypatch, "n")
+
+    assert _choose_pool_to_resume({"USD": ["AAPL"], "JPY": ["7203.T"]}) == ([], None)
+
+
+def test_choose_pool_to_resume_reprompts_on_an_unrecognized_currency(monkeypatch, capsys):
+    _script(monkeypatch, "EUR", "USD")
+
+    tickers, currency = _choose_pool_to_resume({"USD": ["AAPL"], "JPY": ["7203.T"]})
+
+    assert "Unrecognized choice 'EUR'." in capsys.readouterr().out
+    assert (tickers, currency) == (["AAPL"], "USD")
+
+
+def test_confirm_loop_resumes_a_chosen_pool_and_saves_it_under_its_own_currency(
+    monkeypatch, capsys
+):
+    """End to end for the shared file: two pools saved, the JPY one resumed,
+    and the save lands in the JPY slot rather than clobbering USD.
+    """
+    _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY", "6758.T": "JPY"})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    _script(monkeypatch, "JPY", "a", "6758.T", "d")
+
+    pool, currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL", "SPY"], "JPY": ["7203.T"]},
+        REBALANCE_DATE,
+        "session.duckdb",
+        memory_path="mem.json",
+    )
+
+    assert pool == ["6758.T", "7203.T"]
+    assert currency == "JPY"
+    assert save_spy.call_args.kwargs["currency"] == "JPY"
+    assert save_spy.call_args.args[0] == ["6758.T", "7203.T"]
+    assert "Saved 2 JPY ticker(s) to mem.json." in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
