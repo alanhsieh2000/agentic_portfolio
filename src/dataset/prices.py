@@ -53,17 +53,62 @@ class PriceFetchFailedError(RuntimeError):
     """
 
 
-def to_yfinance_symbol(ticker: str) -> str:
-    """Translate a Wikipedia-style ticker to the symbol yfinance expects.
+KNOWN_EXCHANGE_SUFFIXES = frozenset({
+    "T", "L", "HK", "TO", "PA", "DE", "MI", "AS", "SW", "SI", "AX",
+    "KS", "SS", "SZ", "BO", "NS", "MC", "BR", "ST", "OL", "CO", "HE", "SA",
+})
+"""Yahoo Finance's own suffix codes for non-US exchanges, which it writes
+after a literal dot ('7203.T' for Tokyo, 'BARC.L' for London).
 
-    Wikipedia's share-class tickers use a literal dot ('BRK.B', 'BF.B');
-    Yahoo Finance / yfinance expect a dash ('BRK-B', 'BF-B'). Any ticker
-    with no dot passes through unchanged. This is a fetch-boundary concern
-    only — the `prices` table is keyed by the original ticker string (see
-    _build_symbol_map / reshape_prices_long), so later modules that join
-    against sp500_membership never need to know this translation happened.
+`to_yfinance_symbol` uses this to tell such a suffix apart from Wikipedia's
+US share-class notation ('BRK.B'), which needs a dash instead. Only
+single-letter codes could ever be ambiguous, since every other code is two
+or more letters and cannot collide with a share class. So the invariant that
+makes this safe is: the only single letters here are 'T' and 'L', and 'A',
+'B', 'C' and 'K' are deliberately absent, because those are the letters US
+listings actually use as share classes ('BRK.B' and 'BF.B' are the only
+dotted tickers this project's membership scrape has ever produced; 'HEI.A'
+and 'MOG.A' are other real examples). Extend this set one exchange at a
+time, and never add a single letter beyond these two.
+
+'V' (TSX Venture) and 'F' (Frankfurt) are consciously excluded for that
+reason: they carry the same collision risk with no offsetting need, and
+their markets stay reachable by other suffixes ('SAP.DE' resolves, 'SAP.F'
+does not).
+"""
+
+
+def to_yfinance_symbol(ticker: str) -> str:
+    """Translate a ticker to the symbol yfinance expects.
+
+    Two conventions both use a dot and mean different things. Wikipedia's
+    share-class tickers ('BRK.B', 'BF.B') correspond to a dash on Yahoo
+    Finance ('BRK-B', 'BF-B'). Yahoo Finance's own exchange suffixes
+    ('7203.T', 'BARC.L') keep the dot exactly as written. So a ticker whose
+    text after the LAST dot is in `KNOWN_EXCHANGE_SUFFIXES` (compared
+    case-insensitively, though the string itself is returned untouched)
+    passes through unchanged, and any other dotted ticker is dash-converted
+    as before - which is also the right default for a typo, since the
+    mangled symbol then fails loudly through `detect_unresolved_tickers`
+    instead of being fetched as something unintended. A ticker with no dot
+    passes through unchanged.
+
+    This is a fetch-boundary concern only — the `prices` table is keyed by
+    the original ticker string (see _build_symbol_map / reshape_prices_long),
+    so later modules that join against sp500_membership never need to know
+    this translation happened.
+
+    Note this decides only which symbol to FETCH, not what currency the
+    result is in. A non-US listing is priced in its local currency, which
+    `src/dataset/ticker_currency.py` records and normalizes at ingestion so
+    one portfolio can never mix units.
     """
-    return ticker.strip().replace(".", "-")
+    stripped = ticker.strip()
+    if "." not in stripped:
+        return stripped
+    if stripped.rsplit(".", 1)[-1].upper() in KNOWN_EXCHANGE_SUFFIXES:
+        return stripped
+    return stripped.replace(".", "-")
 
 
 def _build_symbol_map(tickers: list[str]) -> dict[str, str]:

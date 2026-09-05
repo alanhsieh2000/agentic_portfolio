@@ -23,12 +23,20 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import date
+from typing import NamedTuple
 
 from src.agents.llm_f_signals import screen_month
 from src.agents.llm_s import generate_rule
 from src.agents.llm_s_schema import ScreeningRule
 from src.agents.llm_s_signals import screen
 from src.config.settings import settings
+from src.dataset.ticker_currency import (
+    DEFAULT_CURRENCY,
+    MixedCurrencyPoolError,
+    group_by_currency,
+    load_ticker_currencies,
+    partition_by_currency,
+)
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.live import build_live_snapshot
 from src.optimizer.portfolio import (
@@ -79,6 +87,27 @@ def open_pipeline_session(rebalance_date: date, selection: str, db_path: str = "
         yield db_path, mode
 
 
+def _require_single_currency(candidates: list[str], db_path: str) -> None:
+    """Raise `MixedCurrencyPoolError` unless every ticker in `candidates`
+    trades in the same currency.
+
+    Checked against `candidates` rather than the optimizer's surviving
+    holdings so the refusal happens before any work and describes the pool
+    the person actually assembled, even if the minimum-history rule would
+    later have dropped one currency's tickers entirely.
+    """
+    if not candidates:
+        return
+
+    groups = group_by_currency(candidates, load_ticker_currencies(candidates, db_path))
+    if len(groups) > 1:
+        detail = "; ".join(f"{currency}: {', '.join(tickers)}" for currency, tickers in groups.items())
+        raise MixedCurrencyPoolError(
+            f"refusing to build a portfolio that mixes currencies ({detail}). "
+            "A portfolio cannot mix currencies; run them as separate portfolios."
+        )
+
+
 def compute_weights_and_allocation(
     candidates: list[str],
     objective: str,
@@ -98,7 +127,17 @@ def compute_weights_and_allocation(
     can report the expected returns, volatilities, and Sharpe ratio behind an
     allocation. `target_annual_return` applies only to `objective="MV"`, the
     one objective defined by a target.
+
+    Raises `MixedCurrencyPoolError` if `candidates` do not all trade in one
+    currency. The interactive loops already refuse a cross-currency ticker as
+    it is typed, so this is a last line of defense - but a reachable one, via
+    a hand-edited `memory/candidates.json` or a direct `run_pipeline` call
+    that has no confirmation loop, and the failure it prevents is silently
+    misallocated money rather than a crash. In every other selection and in
+    backtest mode there is no `ticker_currency` table, so the check is one
+    cheap query that finds a single implicit US-dollar group.
     """
+    _require_single_currency(candidates, db_path)
     returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
     stats = compute_weights_and_stats(returns_matrix, objective, target_annual_return, risk_free_rate)
 
@@ -181,6 +220,7 @@ def run_pipeline_against(
     candidates: list[str] | None = None,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
+    currency: str = DEFAULT_CURRENCY,
 ) -> dict:
     """The shared sequence behind both modes: `run_scan` (LLM-S/LLM-F/the
     scanner) followed by the optimizer (`compute_weights_and_allocation`)
@@ -211,6 +251,7 @@ def run_pipeline_against(
         "weights": stats.weights,
         "allocation": allocation,
         "stats": stats,
+        "currency": currency,
     }
 
 
@@ -232,28 +273,82 @@ def edit_candidates(scan_result: dict, add: list[str], remove: list[str]) -> lis
     return sorted(candidates)
 
 
+class CandidateEditResult(NamedTuple):
+    """One `validate_and_edit_candidates` outcome.
+
+    `invalid` and `refused` are different rejections and are reported
+    differently: `invalid` maps a ticker to why it could not be used at all
+    (it did not resolve, or its currency could not be determined), while
+    `refused` maps a ticker to its own currency, meaning it is perfectly
+    valid but cannot share a portfolio with this pool. `pool_currency` is
+    the currency the pool holds after the edit, or `None` when the pool is
+    empty and the next add will establish it.
+    """
+
+    pool: list[str]
+    added: list[str]
+    invalid: dict[str, str]
+    refused: dict[str, str]
+    pool_currency: str | None
+
+
+def _in_typed_order(valid_added: list[str], add: list[str]) -> list[str]:
+    """`valid_added` (which `validate_and_ingest_tickers` returns sorted) put
+    back into the order the person typed in `add`.
+
+    This matters only for an empty pool, where the first ticker establishes
+    the pool's currency: typing `AAPL 7203.T` must give a dollar pool, but
+    sorted order puts `'7203.T'` first (digits sort before letters) and
+    would silently make it a yen pool instead.
+    """
+    first_seen: dict[str, int] = {}
+    for i, ticker in enumerate(add):
+        first_seen.setdefault(ticker.strip().upper(), i)
+    return sorted(valid_added, key=lambda t: first_seen.get(t, len(add)))
+
+
 def validate_and_edit_candidates(
     pool: list[str],
     add: list[str],
     remove: list[str],
     as_of: date,
     db_path: str,
-) -> tuple[list[str], list[str], dict[str, str]]:
+    pool_currency: str | None = None,
+) -> CandidateEditResult:
     """`edit_candidates` for the `user_provided` selection: every ticker in
-    `add` must first resolve on Yahoo Finance (and have its prices/returns
-    ingested into `db_path`) before it joins the pool, so a typo'd or
-    delisted symbol is reported rather than silently surviving until the
-    optimizer drops or chokes on it.
+    `add` must first resolve on Yahoo Finance (and have its prices, returns
+    and trading currency ingested into `db_path`) before it joins the pool,
+    so a typo'd or delisted symbol is reported rather than silently
+    surviving until the optimizer drops or chokes on it.
 
-    Returns `(new_pool, valid_added, invalid)` - the tickers in `add` that
-    did not resolve are named in `invalid` and simply left out of
-    `new_pool`, so one bad ticker never blocks the good ones typed
-    alongside it. `remove` needs no validation: removing a ticker that
-    isn't in the pool is already a harmless no-op in set arithmetic.
+    A ticker that resolves but trades in a different currency from
+    `pool_currency` is `refused` rather than added, because a portfolio
+    whose prices carry two different units cannot be allocated correctly -
+    see `src/dataset/ticker_currency.py`. One refused or unresolvable ticker
+    never blocks the good ones typed alongside it, and `remove` needs no
+    validation, since removing a ticker that isn't in the pool is already a
+    harmless no-op in set arithmetic.
     """
-    valid_added, invalid = validate_and_ingest_tickers(add, as_of, db_path) if add else ([], {})
-    new_pool = edit_candidates({"candidates": pool}, add=valid_added, remove=remove)
-    return new_pool, valid_added, invalid
+    if add:
+        valid_added, invalid, currencies = validate_and_ingest_tickers(add, as_of, db_path)
+    else:
+        valid_added, invalid, currencies = [], {}, {}
+
+    accepted, refused, pool_currency = partition_by_currency(
+        _in_typed_order(valid_added, add), pool_currency, currencies
+    )
+    new_pool = edit_candidates({"candidates": pool}, add=accepted, remove=remove)
+
+    if not new_pool:
+        pool_currency = None
+    elif remove:
+        # A removal can retire the last ticker of the pool's currency, so
+        # re-derive it from whatever survived rather than trusting the
+        # incoming value.
+        surviving = group_by_currency(new_pool, load_ticker_currencies(new_pool, db_path))
+        pool_currency = next(iter(surviving)) if len(surviving) == 1 else pool_currency
+
+    return CandidateEditResult(new_pool, accepted, invalid, refused, pool_currency)
 
 
 def run_pipeline(
@@ -265,6 +360,7 @@ def run_pipeline(
     candidates: list[str] | None = None,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
+    currency: str = DEFAULT_CURRENCY,
 ) -> dict:
     """Run the full pipeline for one `rebalance_date`, as a single,
     self-contained call - see `open_pipeline_session` for a CLI-style
@@ -294,7 +390,10 @@ def run_pipeline(
     `target_annual_return` is the annual return `objective="MV"` optimizes
     toward and is ignored by the other two objectives; `risk_free_rate` is
     the rate MSR maximizes its Sharpe ratio against and that every objective's
-    reported Sharpe ratio is measured against.
+    reported Sharpe ratio is measured against. `currency` names the unit
+    `portfolio_value` is expressed in and is echoed back for display; it does
+    not convert anything, since every ticker in one portfolio must already
+    share a currency (enforced by `compute_weights_and_allocation`).
 
     Returns a dict bundling every intermediate result: `mode`
     (`"backtest"` or `"live"`), `rule` (LLM-S's `ScreeningRule`, `None` if
@@ -313,4 +412,5 @@ def run_pipeline(
         return run_pipeline_against(
             rebalance_date, objective, portfolio_value, selection, effective_db_path, mode,
             candidates=candidates, target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
+            currency=currency,
         )

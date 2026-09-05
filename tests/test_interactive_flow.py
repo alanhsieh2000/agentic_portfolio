@@ -34,11 +34,13 @@ import pytest
 
 from src.agents.llm_s_schema import ScreeningRule
 from src.flow.backtest import _gross_return, _turnover_cost, compute_sharpe_ratio
+from src.dataset.ticker_currency import MixedCurrencyPoolError
 from src.flow.interactive import (
     compute_weights_and_allocation,
     edit_candidates,
     open_pipeline_session,
     run_pipeline,
+    run_pipeline_against,
     run_scan,
     validate_and_edit_candidates,
 )
@@ -200,6 +202,59 @@ def test_compute_weights_and_allocation_returns_portfolio_stats(tmp_path):
     assert allocation[0] == {"AAA": 10}
 
 
+def _add_currency_table(db_path: str, rows: list[tuple[str, str]]) -> None:
+    con = duckdb.connect(db_path)
+    try:
+        con.execute(
+            "CREATE TABLE ticker_currency "
+            "(ticker VARCHAR, currency VARCHAR, quoted_currency VARCHAR, price_multiplier DOUBLE)"
+        )
+        con.executemany(
+            "INSERT INTO ticker_currency VALUES (?, ?, ?, 1.0)", [(t, c, c) for t, c in rows]
+        )
+    finally:
+        con.close()
+
+
+def test_compute_weights_and_allocation_refuses_a_mixed_currency_pool(tmp_path):
+    """The last line of defense, reachable by a route that skipped the
+    interactive refusal - a hand-edited memory file, or a direct
+    `run_pipeline` call with no confirmation loop.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    _add_currency_table(db_path, [("AAA", "JPY"), ("BBB", "USD")])
+
+    with pytest.raises(MixedCurrencyPoolError, match="mixes currencies"):
+        compute_weights_and_allocation(["AAA", "BBB"], "GMV", 1000.0, date(2024, 3, 1), db_path)
+
+
+def test_compute_weights_and_allocation_is_unaffected_without_a_currency_table(tmp_path):
+    """The regression that matters most: every LLM selection and the whole
+    backtest path run against databases that have no `ticker_currency`
+    table, so the guard must find one implicit US-dollar group and get out
+    of the way.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+
+    stats, _allocation = compute_weights_and_allocation(["AAA"], "GMV", 1000.0, date(2024, 3, 1), db_path)
+
+    assert stats.weights == pytest.approx({"AAA": 1.0}, abs=1e-3)
+
+
+def test_run_pipeline_against_echoes_the_currency(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+
+    result = run_pipeline_against(
+        date(2024, 3, 1), "GMV", 1000.0, "user_provided", db_path, "backtest",
+        candidates=["AAA"], currency="JPY",
+    )
+
+    assert result["currency"] == "JPY"
+
+
 def test_run_pipeline_stats_agree_with_the_flat_weights_key(tmp_path, monkeypatch):
     """`"weights"` stays a plain ticker-to-weight mapping for every existing
     reader; `"stats"` is additive and must describe the same portfolio.
@@ -320,19 +375,30 @@ def test_open_pipeline_session_backtest_date_still_reads_the_cache_for_other_sel
     assert snapshot_spy.called is False
 
 
-def test_validate_and_edit_candidates_adds_only_the_valid_tickers(monkeypatch):
+def _fake_ingest(monkeypatch, valid, invalid, currencies):
     monkeypatch.setattr(
         "src.flow.interactive.validate_and_ingest_tickers",
-        lambda tickers, as_of, db_path: (["NVDA"], {"ZZZZ": "no data"}),
+        lambda tickers, as_of, db_path: (valid, invalid, currencies),
+    )
+    monkeypatch.setattr(
+        "src.flow.interactive.load_ticker_currencies",
+        lambda tickers, db_path: {t: currencies.get(t, "USD") for t in tickers},
     )
 
-    pool, valid_added, invalid = validate_and_edit_candidates(
-        ["AAPL"], add=["NVDA", "ZZZZ"], remove=[], as_of=date(2026, 9, 5), db_path="unused.duckdb"
+
+def test_validate_and_edit_candidates_adds_only_the_valid_tickers(monkeypatch):
+    _fake_ingest(monkeypatch, ["NVDA"], {"ZZZZ": "no data"}, {"NVDA": "USD"})
+
+    edit = validate_and_edit_candidates(
+        ["AAPL"], add=["NVDA", "ZZZZ"], remove=[], as_of=date(2026, 9, 5), db_path="unused.duckdb",
+        pool_currency="USD",
     )
 
-    assert pool == ["AAPL", "NVDA"]
-    assert valid_added == ["NVDA"]
-    assert invalid == {"ZZZZ": "no data"}
+    assert edit.pool == ["AAPL", "NVDA"]
+    assert edit.added == ["NVDA"]
+    assert edit.invalid == {"ZZZZ": "no data"}
+    assert edit.refused == {}
+    assert edit.pool_currency == "USD"
 
 
 def test_validate_and_edit_candidates_removes_without_validating(monkeypatch):
@@ -341,15 +407,57 @@ def test_validate_and_edit_candidates_removes_without_validating(monkeypatch):
     """
     ingest_spy = MagicMock()
     monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
-
-    pool, valid_added, invalid = validate_and_edit_candidates(
-        ["AAPL", "MSFT"], add=[], remove=["MSFT"], as_of=date(2026, 9, 5), db_path="unused.duckdb"
+    monkeypatch.setattr(
+        "src.flow.interactive.load_ticker_currencies", lambda tickers, db_path: {"AAPL": "USD"}
     )
 
-    assert pool == ["AAPL"]
-    assert valid_added == []
-    assert invalid == {}
+    edit = validate_and_edit_candidates(
+        ["AAPL", "MSFT"], add=[], remove=["MSFT"], as_of=date(2026, 9, 5), db_path="unused.duckdb",
+        pool_currency="USD",
+    )
+
+    assert edit.pool == ["AAPL"]
+    assert edit.added == []
+    assert edit.invalid == {}
+    assert edit.refused == {}
     assert ingest_spy.called is False
+
+
+def test_validate_and_edit_candidates_refuses_a_cross_currency_ticker(monkeypatch):
+    """The headline behavior: a dollar ticker cannot join a yen pool, but a
+    yen ticker typed on the same line still lands.
+    """
+    _fake_ingest(
+        monkeypatch, ["6758.T", "AAPL"], {}, {"6758.T": "JPY", "AAPL": "USD"}
+    )
+
+    edit = validate_and_edit_candidates(
+        ["7203.T"], add=["AAPL", "6758.T"], remove=[], as_of=date(2026, 9, 5), db_path="unused.duckdb",
+        pool_currency="JPY",
+    )
+
+    assert edit.pool == ["6758.T", "7203.T"]
+    assert edit.added == ["6758.T"]
+    assert edit.refused == {"AAPL": "USD"}
+    assert edit.pool_currency == "JPY"
+
+
+def test_validate_and_edit_candidates_first_typed_ticker_sets_an_empty_pools_currency(monkeypatch):
+    """`validate_and_ingest_tickers` returns its list sorted, and '7203.T'
+    sorts before 'AAPL', so without re-ordering by what was typed this pool
+    would silently become JPY.
+    """
+    _fake_ingest(
+        monkeypatch, ["7203.T", "AAPL"], {}, {"7203.T": "JPY", "AAPL": "USD"}
+    )
+
+    edit = validate_and_edit_candidates(
+        [], add=["AAPL", "7203.T"], remove=[], as_of=date(2026, 9, 5), db_path="unused.duckdb"
+    )
+
+    assert edit.pool_currency == "USD"
+    assert edit.added == ["AAPL"]
+    assert edit.refused == {"7203.T": "JPY"}
 
 
 def test_run_pipeline_user_provided_optimizes_the_supplied_candidates(tmp_path, monkeypatch):

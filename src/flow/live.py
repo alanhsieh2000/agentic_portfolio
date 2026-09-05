@@ -73,18 +73,22 @@ def _causal_masking_date(as_of: date) -> date:
 
 
 def _init_empty_price_and_returns_tables(db_path: str) -> None:
-    """Create the empty `prices`/`unresolved_tickers`/`returns` tables the
-    `user_provided` selection incrementally fills in via
-    `src/dataset/ticker_ingestion.py`'s upserts, with the same column
-    shapes plans 1's own writers use. No `sp500_membership` table: nothing
-    in that selection's downstream path reads one, since its candidates
-    come from the user rather than from index membership.
+    """Create the empty `prices`/`unresolved_tickers`/`returns`/
+    `ticker_currency` tables the `user_provided` selection incrementally
+    fills in via `src/dataset/ticker_ingestion.py`'s upserts, with the same
+    column shapes plans 1's and 11's own writers use. No `sp500_membership`
+    table: nothing in that selection's downstream path reads one, since its
+    candidates come from the user rather than from index membership.
     """
     con = duckdb.connect(db_path)
     try:
         con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
         con.execute("CREATE TABLE unresolved_tickers (ticker VARCHAR, reason VARCHAR)")
         con.execute("CREATE TABLE returns (rebalance_date DATE, ticker VARCHAR, monthly_return DOUBLE)")
+        con.execute(
+            "CREATE TABLE ticker_currency "
+            "(ticker VARCHAR, currency VARCHAR, quoted_currency VARCHAR, price_multiplier DOUBLE)"
+        )
     finally:
         con.close()
 

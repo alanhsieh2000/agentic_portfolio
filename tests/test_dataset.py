@@ -148,6 +148,37 @@ def test_to_yfinance_symbol_translates_dot_to_dash_for_share_classes():
     assert to_yfinance_symbol("AAPL") == "AAPL"
 
 
+def test_to_yfinance_symbol_preserves_a_known_exchange_suffix():
+    """Yahoo Finance's own exchange suffixes use a literal dot, so converting
+    them to a dash produces a symbol that does not exist.
+    """
+    assert to_yfinance_symbol("7203.T") == "7203.T"
+    assert to_yfinance_symbol("BARC.L") == "BARC.L"
+    assert to_yfinance_symbol("0700.HK") == "0700.HK"
+    assert to_yfinance_symbol("SHOP.TO") == "SHOP.TO"
+
+
+def test_to_yfinance_symbol_matches_a_suffix_case_insensitively_without_changing_case():
+    assert to_yfinance_symbol("7203.t") == "7203.t"
+
+
+def test_to_yfinance_symbol_dash_converts_an_unrecognized_dotted_suffix():
+    """The safe default for a typo or an unknown share class: the mangled
+    symbol then fails loudly through `detect_unresolved_tickers` rather than
+    being fetched as something unintended.
+    """
+    assert to_yfinance_symbol("AAPL.X") == "AAPL-X"
+    assert to_yfinance_symbol("HEI.A") == "HEI-A"
+
+
+def test_to_yfinance_symbol_considers_only_the_text_after_the_last_dot():
+    assert to_yfinance_symbol("A.B.L") == "A.B.L"
+
+
+def test_to_yfinance_symbol_leaves_an_fx_pair_alone():
+    assert to_yfinance_symbol("JPYUSD=X") == "JPYUSD=X"
+
+
 def _raw_prices_fixture() -> pd.DataFrame:
     """Shaped like yfinance's real multi-ticker download() output with
     auto_adjust=False: 2-level MultiIndex columns (field, symbol), field in

@@ -21,6 +21,7 @@ from src.dataset.prices import (
     write_prices_tables,
 )
 from src.dataset.returns import build_returns_for_tickers, upsert_returns_table
+from src.dataset.ticker_currency import load_ticker_currencies, upsert_ticker_currency_table
 
 # ---------------------------------------------------------------------------
 # upsert_prices_tables
@@ -109,6 +110,95 @@ def test_upsert_prices_tables_is_idempotent_for_an_unchanged_ticker(tmp_path):
     upsert_prices_tables(prices, _unresolved(), ["AAPL"], db_path)
 
     assert _read(db_path, "SELECT count(*) FROM prices") == [(1,)]
+
+
+# ---------------------------------------------------------------------------
+# upsert_ticker_currency_table / load_ticker_currencies
+# ---------------------------------------------------------------------------
+
+
+def _currencies(*rows: tuple[str, str, str, float]) -> pd.DataFrame:
+    """(ticker, currency, quoted_currency, price_multiplier) tuples."""
+    return pd.DataFrame(
+        {
+            "ticker": [r[0] for r in rows],
+            "currency": [r[1] for r in rows],
+            "quoted_currency": [r[2] for r in rows],
+            "price_multiplier": [r[3] for r in rows],
+        }
+    )
+
+
+def test_upsert_ticker_currency_table_creates_the_table_when_absent(tmp_path):
+    db_path = str(tmp_path / "fresh.duckdb")
+
+    upsert_ticker_currency_table(_currencies(("BARC.L", "GBP", "GBp", 0.01)), ["BARC.L"], db_path)
+
+    assert _read(db_path, "SELECT ticker, currency, quoted_currency, price_multiplier FROM ticker_currency") == [
+        ("BARC.L", "GBP", "GBp", 0.01)
+    ]
+
+
+def test_upsert_ticker_currency_table_replaces_only_named_tickers(tmp_path):
+    db_path = str(tmp_path / "fresh.duckdb")
+    upsert_ticker_currency_table(
+        _currencies(("AAPL", "USD", "USD", 1.0), ("7203.T", "JPY", "JPY", 1.0)),
+        ["AAPL", "7203.T"],
+        db_path,
+    )
+
+    upsert_ticker_currency_table(_currencies(("AAPL", "USD", "USD", 1.0)), ["AAPL"], db_path)
+
+    assert sorted(_read(db_path, "SELECT ticker, currency FROM ticker_currency")) == [
+        ("7203.T", "JPY"),
+        ("AAPL", "USD"),
+    ]
+
+
+def test_upsert_ticker_currency_table_is_idempotent_for_an_unchanged_ticker(tmp_path):
+    db_path = str(tmp_path / "fresh.duckdb")
+    row = _currencies(("7203.T", "JPY", "JPY", 1.0))
+
+    upsert_ticker_currency_table(row, ["7203.T"], db_path)
+    upsert_ticker_currency_table(row, ["7203.T"], db_path)
+
+    assert _read(db_path, "SELECT count(*) FROM ticker_currency") == [(1,)]
+
+
+def test_load_ticker_currencies_returns_the_normalized_currency(tmp_path):
+    db_path = str(tmp_path / "fresh.duckdb")
+    upsert_ticker_currency_table(
+        _currencies(("BARC.L", "GBP", "GBp", 0.01), ("7203.T", "JPY", "JPY", 1.0)),
+        ["BARC.L", "7203.T"],
+        db_path,
+    )
+
+    assert load_ticker_currencies(["BARC.L", "7203.T"], db_path) == {"BARC.L": "GBP", "7203.T": "JPY"}
+
+
+def test_load_ticker_currencies_without_the_table_returns_empty_not_an_error(tmp_path):
+    """The normal case for the shared historical cache and every
+    non-user_provided path: no table, so callers fall back to USD. This is
+    what keeps the backtest path working with no changes at all.
+    """
+    db_path = str(tmp_path / "no-currency-table.duckdb")
+    write_prices_tables(_prices(("2026-09-01", "AAPL", 100.0)), _unresolved(), db_path)
+
+    assert load_ticker_currencies(["AAPL"], db_path) == {}
+
+
+def test_load_ticker_currencies_with_no_tickers_makes_no_query(tmp_path):
+    assert load_ticker_currencies([], str(tmp_path / "does-not-exist.duckdb")) == {}
+
+
+def test_load_ticker_currencies_does_not_create_a_database(tmp_path):
+    """A read must not have the side effect of creating what it reads from -
+    otherwise merely asking about an absent database litters a stray file.
+    """
+    missing = tmp_path / "does-not-exist.duckdb"
+
+    assert load_ticker_currencies(["AAPL"], str(missing)) == {}
+    assert not missing.exists()
 
 
 # ---------------------------------------------------------------------------

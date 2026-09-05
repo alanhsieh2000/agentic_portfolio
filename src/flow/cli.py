@@ -31,6 +31,7 @@ import argparse
 from datetime import date
 
 from src.config.settings import settings
+from src.dataset.ticker_currency import DEFAULT_CURRENCY, group_by_currency
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.candidate_memory import DEFAULT_CANDIDATES_PATH, load_candidate_pool, save_candidate_pool
 from src.flow.interactive import (
@@ -44,14 +45,31 @@ from src.flow.interactive import (
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
 
 
+CURRENCY_SYMBOLS = {"USD": "$", "JPY": "¥", "GBP": "£", "EUR": "€"}
+"""Symbols for the currencies most likely to come up, used alongside - never
+instead of - the ISO code. A bare '$' is shared by the US, Canadian,
+Australian, Hong Kong and Singapore dollars, and removing exactly that
+ambiguity is the point of tracking currency at all, so the code is always
+printed too. A currency absent from this table simply prints its code.
+"""
+
+
 def _parse_date(value: str) -> date:
     return date.today() if value == "today" else date.fromisoformat(value)
+
+
+def format_money(amount: float, currency: str) -> str:
+    """A money amount with both its symbol (when known) and its ISO code, so
+    the unit is never ambiguous: `'$12.34 USD'`, `'¥12.34 JPY'`, `'12.34 SGD'`.
+    """
+    return f"{CURRENCY_SYMBOLS.get(currency, '')}{amount:,.2f} {currency}"
 
 
 def print_weights_and_allocation(
     stats: PortfolioStats,
     allocation: tuple[dict[str, int], float],
     objective: str,
+    currency: str = DEFAULT_CURRENCY,
 ) -> None:
     """Human-readable rendering of one `compute_weights_and_allocation`
     result, including the figures the optimizer decided from.
@@ -63,7 +81,15 @@ def print_weights_and_allocation(
     target-return line is printed for every objective, saying so explicitly
     when it does not apply, so its presence and position never depend on
     which objective ran.
+
+    `currency` names the unit every money figure here is in, including the
+    `--value` that was allocated. It is printed first, because it qualifies
+    everything below it, and it is printed here rather than in
+    `print_pipeline_result`'s header because the interactive edit loop calls
+    this function directly and would otherwise never show it.
     """
+    print(f"\nPortfolio currency: {currency} - --value is interpreted as {currency}")
+
     held = [ticker for ticker, weight in sorted(stats.weights.items(), key=lambda kv: -kv[1]) if weight > 0]
 
     print("\nWeights:")
@@ -87,7 +113,7 @@ def print_weights_and_allocation(
     print("\nShare allocation:")
     for ticker, count in sorted(shares.items()):
         print(f"  {ticker}: {count}")
-    print(f"Leftover cash: ${leftover_cash:.2f}")
+    print(f"Leftover cash: {format_money(leftover_cash, currency)}")
 
 
 def print_pipeline_result(result: dict) -> None:
@@ -108,18 +134,61 @@ def print_pipeline_result(result: dict) -> None:
           f"intersection={scan_detail['intersection_size']} union={scan_detail['union_size']})")
     print(f"Candidates ({len(scan_detail['candidates'])}): {', '.join(scan_detail['candidates'])}")
 
-    print_weights_and_allocation(result["stats"], result["allocation"], result["objective"])
+    print_weights_and_allocation(
+        result["stats"], result["allocation"], result["objective"], result["currency"]
+    )
 
 
-def _print_add_outcome(valid_added: list[str], invalid: dict[str, str]) -> None:
-    """Report which of the tickers just typed resolved and which did not -
-    the whole point of validating an add is that the good tickers in a
-    batch still land while the bad ones are named.
+def _print_add_outcome(
+    valid_added: list[str],
+    invalid: dict[str, str],
+    refused: dict[str, str] | None = None,
+    pool_currency: str | None = None,
+) -> None:
+    """Report which of the tickers just typed resolved, which did not, and
+    which were valid but could not join this pool - the whole point of
+    validating an add is that the good tickers in a batch still land while
+    the bad ones are named.
+
+    A `refused` ticker is a different thing from an `invalid` one and gets a
+    different sentence: it exists and is priceable, it simply trades in
+    another currency, and a portfolio whose prices carry two units cannot be
+    allocated correctly.
     """
     if valid_added:
-        print(f"Added: {', '.join(valid_added)}.")
+        print(f"Added: {', '.join(sorted(valid_added))}.")
     if invalid:
         print(f"Ignored (not found): {', '.join(sorted(invalid))}.")
+    for ticker in sorted(refused or {}):
+        print(
+            f"Refused: {ticker} is priced in {refused[ticker]} but this pool is {pool_currency}. "
+            "A portfolio cannot mix currencies; run them separately."
+        )
+
+
+def _resolve_mixed_persisted_pool(pool: list[str], currencies: dict[str, str]) -> tuple[list[str], str]:
+    """Report a saved pool that spans several currencies and ask which one to
+    keep, returning `(kept_tickers, currency)`.
+
+    A pool saved before currencies were recorded can legitimately be mixed,
+    and so can one whose ticker changed listing. The machine genuinely
+    cannot decide which currency was intended - keeping the largest group
+    would just be guessing quietly - so this asks, which is safe because
+    this loop is already interactive and the pool is the person's own.
+    Nothing reaches disk until they confirm at the `[d]one` prompt.
+    """
+    groups = group_by_currency(pool, currencies)
+    print("\nWarning: the saved candidate pool mixes currencies, which one portfolio cannot do:")
+    for currency, tickers in groups.items():
+        print(f"  {currency}: {', '.join(tickers)}")
+
+    while True:
+        chosen = input(f"Keep which currency? ({'/'.join(groups)}): ").strip().upper()
+        if chosen in groups:
+            dropped = sorted(t for c, ts in groups.items() if c != chosen for t in ts)
+            print(f"Keeping {chosen}; dropping {', '.join(dropped)}.")
+            return groups[chosen], chosen
+        print(f"Unrecognized currency {chosen!r}.")
 
 
 def _run_user_provided_confirm_loop(
@@ -127,11 +196,12 @@ def _run_user_provided_confirm_loop(
     rebalance_date: date,
     db_path: str,
     memory_path: str = DEFAULT_CANDIDATES_PATH,
-) -> list[str]:
+) -> tuple[list[str], str]:
     """Show the persisted candidate pool, then prompt in a loop for
     add/remove until the user confirms they are done, and return the
-    confirmed pool - the `user_provided` selection's replacement for the
-    agents that choose candidates in every other selection.
+    confirmed pool together with the currency it is priced in - the
+    `user_provided` selection's replacement for the agents that choose
+    candidates in every other selection.
 
     The pool is persisted exactly once, when the user confirms: an
     in-progress edit is never written to `memory_path`. `initial_pool` is
@@ -139,10 +209,23 @@ def _run_user_provided_confirm_loop(
     fresh scratch database every run) before anything is shown, so a
     previously-saved ticker that no longer resolves is dropped with a
     warning rather than breaking the optimizer later.
+
+    Every ticker in the pool must trade in one currency, since prices in two
+    different units cannot be allocated against a single budget. The first
+    ticker added to an empty pool establishes that currency and later adds
+    are measured against it.
     """
-    pool, invalid = validate_and_ingest_tickers(initial_pool, rebalance_date, db_path)
+    pool, invalid, currencies = validate_and_ingest_tickers(initial_pool, rebalance_date, db_path)
     if invalid:
         print(f"Warning: dropping previously-saved ticker(s) that no longer resolve: {', '.join(sorted(invalid))}.")
+
+    pool_currency: str | None = None
+    if pool:
+        groups = group_by_currency(pool, currencies)
+        if len(groups) > 1:
+            pool, pool_currency = _resolve_mixed_persisted_pool(pool, currencies)
+        else:
+            pool_currency = next(iter(groups))
 
     print(f"\nCurrent candidate pool ({len(pool)}): {', '.join(pool) if pool else '(empty)'}")
 
@@ -157,15 +240,17 @@ def _run_user_provided_confirm_loop(
                 continue
             save_candidate_pool(pool, path=memory_path)
             print(f"Saved {len(pool)} ticker(s) to {memory_path}.")
-            return pool
+            return pool, pool_currency or DEFAULT_CURRENCY
 
         previous_pool = pool
         if choice in ("a", "add"):
             raw = input("Ticker(s) to add (space-separated): ").strip().upper()
-            pool, valid_added, invalid = validate_and_edit_candidates(
-                pool, add=raw.split(), remove=[], as_of=rebalance_date, db_path=db_path
+            edit = validate_and_edit_candidates(
+                pool, add=raw.split(), remove=[], as_of=rebalance_date, db_path=db_path,
+                pool_currency=pool_currency,
             )
-            _print_add_outcome(valid_added, invalid)
+            pool, pool_currency = edit.pool, edit.pool_currency
+            _print_add_outcome(edit.added, edit.invalid, edit.refused, pool_currency)
         elif choice in ("r", "remove"):
             raw = input("Ticker(s) to remove (space-separated): ").strip().upper()
             requested = raw.split()
@@ -211,6 +296,7 @@ def _run_edit_loop(
     memory_path: str = DEFAULT_CANDIDATES_PATH,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
+    currency: str = DEFAULT_CURRENCY,
 ) -> None:
     """Prompt in a loop for add/remove/objective/target-return/finish; each
     edit recomputes weights and allocation against the current `candidates`
@@ -250,10 +336,12 @@ def _run_edit_loop(
         if choice in ("a", "add"):
             raw = input("Ticker(s) to add (space-separated): ").strip().upper()
             if selection == "user_provided":
-                candidates, valid_added, invalid = validate_and_edit_candidates(
-                    candidates, add=raw.split(), remove=[], as_of=rebalance_date, db_path=db_path
+                edit = validate_and_edit_candidates(
+                    candidates, add=raw.split(), remove=[], as_of=rebalance_date, db_path=db_path,
+                    pool_currency=currency,
                 )
-                _print_add_outcome(valid_added, invalid)
+                candidates = edit.pool
+                _print_add_outcome(edit.added, edit.invalid, edit.refused, currency)
             else:
                 candidates = edit_candidates({"candidates": candidates}, add=raw.split(), remove=[])
         elif choice in ("r", "remove"):
@@ -297,10 +385,12 @@ def _run_edit_loop(
         except ValueError as e:
             # An edit can be individually valid and still leave the optimizer
             # with nothing to solve - most easily by asking MV for a target
-            # return no combination of these candidates can reach. That is a
-            # rejected edit, not a failed session: this loop holds live mode's
-            # only snapshot open, so letting it escape would throw away the
-            # fetched data and the user's confirmed pool along with it.
+            # return no combination of these candidates can reach, or by
+            # assembling a pool that mixes currencies (MixedCurrencyPoolError
+            # is a ValueError for exactly this reason). That is a rejected
+            # edit, not a failed session: this loop holds live mode's only
+            # snapshot open, so letting it escape would throw away the fetched
+            # data and the user's confirmed pool along with it.
             print(f"Cannot optimize that edit: {e}")
             print("Keeping the previous candidates, objective, and target return.")
             candidates, objective, target_annual_return = previous_candidates, previous_objective, previous_target
@@ -309,14 +399,21 @@ def _run_edit_loop(
         if selection == "user_provided" and choice in ("a", "add", "r", "remove"):
             save_candidate_pool(candidates, path=memory_path)
 
-        print_weights_and_allocation(stats, allocation, objective)
+        print_weights_and_allocation(stats, allocation, objective, currency)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run plans/06_interactive_flow.md's interactive pipeline.")
     parser.add_argument("--date", required=True, help="Rebalance date, YYYY-MM-DD, or 'today' for live mode.")
     parser.add_argument("--objective", required=True, choices=VALID_OBJECTIVES)
-    parser.add_argument("--value", required=True, type=float, help="Total portfolio value to allocate.")
+    parser.add_argument(
+        "--value",
+        required=True,
+        type=float,
+        help="Total portfolio value to allocate, in the portfolio's own currency (shown as the "
+             "'Portfolio currency' line in the output). For --selection user_provided that is the "
+             "currency the pool's tickers are priced in; for every other selection it is USD.",
+    )
     parser.add_argument("--selection", default="llm_s_only", choices=VALID_SELECTIONS)
     parser.add_argument(
         "--target-return",
@@ -344,8 +441,9 @@ def main() -> None:
 
     with open_pipeline_session(rebalance_date, args.selection, args.db_path) as (session_db_path, mode):
         candidates = None
+        currency = DEFAULT_CURRENCY
         if args.selection == "user_provided":
-            candidates = _run_user_provided_confirm_loop(
+            candidates, currency = _run_user_provided_confirm_loop(
                 load_candidate_pool(args.memory_path),
                 rebalance_date,
                 session_db_path,
@@ -355,7 +453,7 @@ def main() -> None:
         result = run_pipeline_against(
             rebalance_date, args.objective, args.value, args.selection, session_db_path, mode,
             candidates=candidates, target_annual_return=args.target_return,
-            risk_free_rate=args.risk_free_rate,
+            risk_free_rate=args.risk_free_rate, currency=currency,
         )
         print_pipeline_result(result)
 
@@ -363,6 +461,7 @@ def main() -> None:
             result["scan_detail"]["candidates"], args.objective, args.value, rebalance_date, session_db_path,
             selection=args.selection, memory_path=args.memory_path,
             target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
+            currency=currency,
         )
 
 
