@@ -36,6 +36,7 @@ portfolio-build-momentum = "src.dataset.momentum:main"
 portfolio-build-returns = "src.dataset.returns:main"
 portfolio-build-news-archive = "src.dataset.news_archive:main"
 portfolio-backfill-snapshot = "src.dataset.backfill_snapshot:main"
+portfolio-migrate-candidates = "src.flow.candidate_memory:main"
 
 [build-system]
 requires = ["hatchling"]

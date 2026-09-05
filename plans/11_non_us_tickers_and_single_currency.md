@@ -15,10 +15,10 @@ The good news, and the reason this plan is smaller than it might have been, is t
 
 So this plan does not convert currencies. It makes the currency *known*, *visible*, and *uniform*: each ticker's trading currency is looked up and recorded when the ticker is added, London's pence quotes are normalized to pounds, a ticker whose currency differs from the pool's is refused by name at the moment it is typed, and the portfolio's currency is printed alongside the money it describes. Then, and only then, the symbol translation is fixed so foreign tickers can be added at all.
 
-Concretely, this is the observable outcome. Building a yen portfolio:
+Every pool lives in the one `memory/candidates.json`, keyed by currency, so a standing yen pool and a standing dollar pool coexist there and the person is asked which to work on. Concretely, this is the observable outcome. Building a yen portfolio, on a machine with nothing saved yet:
 
     $ uv run portfolio --date today --objective GMV --value 15000000 \
-        --selection user_provided --memory-path /tmp/jpy.json --risk-free-rate 0.005
+        --selection user_provided --risk-free-rate 0.005
 
     Current candidate pool (0): (empty)
 
@@ -33,7 +33,7 @@ Concretely, this is the observable outcome. Building a yen portfolio:
     Candidate pool (2): 6758.T, 7203.T
 
     Edit candidate pool? [a]dd tickers / [r]emove tickers / [d]one: d
-    Saved 2 ticker(s) to /tmp/jpy.json.
+    Saved 2 JPY ticker(s) to memory/candidates.json.
 
     Portfolio currency: JPY - --value is interpreted as JPY
 
@@ -46,9 +46,22 @@ Concretely, this is the observable outcome. Building a yen portfolio:
       7203.T: 2429
     Leftover cash: ¥2,661.00 JPY
 
+There is no pool-selection prompt there because nothing was saved yet; the next section shows what a returning session looks like. Every figure above is from the real runs recorded in Artifacts and Notes.
+
 `AAPL` is refused by name, in the same breath as it is typed, with the reason stated — and the two yen tickers that were already accepted are untouched. That refusal is the point of the plan; the yen portfolio itself was already computable.
 
 The share counts are what show the yen arithmetic is genuinely right rather than merely labelled: 2,429 shares of Toyota at roughly ¥3,081 is about ¥7.5 million, half of the ¥15 million allocated, which is what a near-even split should buy.
+
+Come back with both a dollar and a yen pool saved and the session opens by asking which one this run is about:
+
+    Saved candidate pools:
+      JPY (2): 6758.T, 7203.T
+      USD (12): AMLP, BIL, BOXX, GOOGL, NVDA, PFF, PFFA, QQQI, T, TLT, TSM, VZ
+    Resume which pool? (JPY/USD) or [n]ew: USD
+
+    Current candidate pool (12): AMLP, BIL, BOXX, GOOGL, NVDA, PFF, PFFA, QQQI, T, TLT, TSM, VZ
+
+Saving one of those pools never disturbs the other's tickers or its `updated_at`, so the two are genuinely independent stores that happen to share a file.
 
 The second observable outcome is the pence normalization, which is invisible unless you know to look for it:
 
@@ -72,8 +85,9 @@ Barclays quotes on the London Stock Exchange in pence, so Yahoo Finance reports 
 - [x] (2026-09-05) M2: wired the currency lookup, the pence normalization, and the currency upsert into `validate_and_ingest_tickers`, widening its return to `(valid, invalid, currencies)`. Covered by 5 new tests in `tests/test_ticker_ingestion.py` plus the 8 existing ones widened.
 - [x] (2026-09-05) M3: added `CandidateEditResult` and `_in_typed_order` to `src/flow/interactive.py`, threaded the currency through both `src/flow/cli.py` loops, added `_resolve_mixed_persisted_pool`'s report-and-prompt, and added the `_require_single_currency` guard to `compute_weights_and_allocation`.
 - [x] (2026-09-05) M4: added `KNOWN_EXCHANGE_SUFFIXES` and rewrote `to_yfinance_symbol` around it — the change that finally lets a foreign ticker resolve, landed last by design. Added `CURRENCY_SYMBOLS`, `format_money`, the `Portfolio currency:` line, and the clarified `--value` help text.
-- [x] (2026-09-05) M6: made `memory/candidates.json` hold one pool PER CURRENCY instead of one flat list, so a standing JPY pool and a standing USD pool live in the same default file rather than requiring different `--memory-path` values. Rewrote `src/flow/candidate_memory.py` around `load_all_pools`/`_load_raw_pools`, gave `load_candidate_pool`/`save_candidate_pool` a `currency` parameter, made saving one currency preserve every other's tickers *and* `updated_at`, and auto-migrated the old flat shape as the USD pool. Added `_choose_pool_to_resume` to `src/flow/cli.py`. Suite 268 to 283 passed. See Revision Note 1.
 - [x] (2026-09-05) M5: verified the full suite (268 passed, up from 217) and verified end to end with four real runs — a JPY pool refusing `AAPL`, a GBP pool proving the pence normalization, an unchanged USD pool, and a backtest-date run leaving `data/portfolio.duckdb` byte-identical. Added the `README.md` Live Mode note. Transcripts in Artifacts and Notes.
+- [x] (2026-09-05) M6: made `memory/candidates.json` hold one pool PER CURRENCY instead of one flat list, so a standing JPY pool and a standing USD pool live in the same default file rather than requiring different `--memory-path` values. Rewrote `src/flow/candidate_memory.py` around `load_all_pools`/`_load_raw_pools`, gave `load_candidate_pool`/`save_candidate_pool` a `currency` parameter, made saving one currency preserve every other's tickers *and* `updated_at`, and auto-migrated the old flat shape as the USD pool. Added `_choose_pool_to_resume` to `src/flow/cli.py`. Suite 268 to 283 passed. See Revision Note 1.
+- [x] (2026-09-05) M7: added `migrate_candidate_pools` and a `portfolio-migrate-candidates` console script for converting a pre-M6 `candidates.json` deliberately and offline, preserving each pool's tickers and its original `updated_at` rather than letting the next save stamp over them. Narrowed `--memory-path`'s documented purpose to "an alternate or scratch store" now that it is no longer how currencies are kept apart, and corrected every section of this plan that still described the superseded one-file-per-currency workflow. Suite 283 to 288 passed. See Revision Note 2.
 
 
 ## Surprises & Discoveries
@@ -165,7 +179,7 @@ Barclays quotes on the London Stock Exchange in pence, so Yahoo Finance reports 
 ## Outcomes & Retrospective
 
 
-The stated purpose is met. A Tokyo or London ticker can now be added to a candidate pool; each portfolio carries exactly one currency, established by the first ticker added and enforced by refusing any ticker that disagrees, by name and with the reason; London's pence quotes are normalized to pounds; every money figure is printed with both its symbol and its ISO code; and (per M6) every currency's pool lives in the one `memory/candidates.json`, listed and chosen at session start, with saving one pool never disturbing another. Verified with four real runs against live market data, not only in tests: a yen pool of `7203.T` and `6758.T` that refused `AAPL`, a pound pool of `BARC.L` and `VOD.L` whose stored prices were confirmed to be exactly one hundredth of what Yahoo Finance reported, an unchanged dollar pool, and a backtest-date run that left `data/portfolio.duckdb` byte-identical. The suite grew from 217 to 268 tests, all passing.
+The stated purpose is met. A Tokyo or London ticker can now be added to a candidate pool; each portfolio carries exactly one currency, established by the first ticker added and enforced by refusing any ticker that disagrees, by name and with the reason; London's pence quotes are normalized to pounds; every money figure is printed with both its symbol and its ISO code; and (per M6) every currency's pool lives in the one `memory/candidates.json`, listed and chosen at session start, with saving one pool never disturbing another. Verified with four real runs against live market data, not only in tests: a yen pool of `7203.T` and `6758.T` that refused `AAPL`, a pound pool of `BARC.L` and `VOD.L` whose stored prices were confirmed to be exactly one hundredth of what Yahoo Finance reported, an unchanged dollar pool, and a backtest-date run that left `data/portfolio.duckdb` byte-identical. The suite grew from 217 to 288 tests, all passing.
 
 The milestone ordering earned its keep, and is the part of this plan most worth reusing. Fixing `to_yfinance_symbol` is a three-line change and the obvious place to start; landing it last instead meant that at no point did the repository contain a state where foreign tickers could be ingested but nothing stopped them mixing with dollar tickers. Every guard was written and tested against a tree in which the dangerous input was still unreachable. The cost was some discipline about ordering; the benefit is that no intermediate commit here is unsafe to check out and run.
 
@@ -192,6 +206,18 @@ The file shape became `{"pools": {"USD": {"tickers": [...], "updated_at": ...}, 
 One design flaw in the approved plan was found by real testing and fixed before finishing; it is the most useful thing in this revision and is written up under Surprises & Discoveries. The plan said to auto-resume without prompting when exactly one pool is saved, to keep the common case frictionless. That silently made a second currency unreachable: resuming the sole USD pool unconditionally meant every Tokyo ticker typed afterwards was refused against a pool the person had been placed in with no way out. The `[n]ew` option is now offered whenever anything is saved, with a bare Enter accepting the single-pool case.
 
 
+## Revision Note 2 (2026-09-05)
+
+
+Changed, at the repository owner's request after M6, in two parts.
+
+First, a deliberate migration path for a `candidates.json` written before M6. Nothing was broken without it — such a file is already read as the USD pool, and the next save rewrites it in the keyed shape — but relying on that had two costs. The save stamps a fresh `updated_at`, discarding the only record of when the pool was curated, which is the field `README.md`'s Live Mode staleness rules are defined against. And it happens only after a live re-validation of every ticker, so a transient Yahoo Finance failure on any one of them marks it invalid and drops it from the pool once the person confirms. `migrate_candidate_pools` and the `portfolio-migrate-candidates` console script convert the file offline instead, preserving tickers and timestamps verbatim, and are idempotent. Verified against a copy of this repository's real legacy file; the transcript is in Artifacts and Notes.
+
+Second, the owner noticed this plan still used `--memory-path` throughout, and asked whether the flag should go. It stays, with its purpose narrowed rather than removed. Before M6 it did double duty: "which file" *and* "how currencies are kept apart". M6 killed the second job, but the first is genuinely useful and not hypothetical — pointing at a scratch file is how every live verification in M5 and M6 avoided writing to the real curated pool, and removing the flag would make future live checks either destructive or awkward. Its argparse help now describes an alternate or scratch store and explicitly says it is not the currency separator.
+
+That prompted a full re-read of this document, which turned out to be teaching the superseded workflow in several places. Corrected: the Purpose / Big Picture transcript used `--memory-path /tmp/jpy.json` and the pre-M6 `Saved 2 ticker(s)` message, so it has been rewritten around the default shared file, the currency-naming save line, and a second transcript showing the resume prompt; Concrete Steps did the same with `/tmp/jpy.json` and `/tmp/gbp.json` and now uses the shared file, adds the migration command, and mentions `--memory-path` once as the scratch escape hatch; Plan of Work said "five milestones" and had no M6 paragraph at all, so it now covers seven with M6 and M7 described and the "lands last" safety claim scoped to the first five; Progress listed M6 ahead of M5; Validation and Acceptance grew from seven parts to twelve with the shared-file and migration items; Idempotence and Recovery now records that the migration is offline and repeatable and that deleting `memory/candidates.json` has a wider blast radius than before, since it now discards every currency's pool rather than one; and the Outcomes test count was stale at 268.
+
+
 ## Context and Orientation
 
 
@@ -215,7 +241,7 @@ And the `user_provided` selection is unusually well isolated, which keeps this p
 ## Plan of Work
 
 
-The work divides into five milestones. Their order is deliberate and is itself a safety property, explained in the Decision Log: the change that lets a foreign ticker resolve lands last, so the repository never passes through a state where foreign tickers work but the guards do not.
+The work divides into seven milestones. The order of the first five is deliberate and is itself a safety property, explained in the Decision Log: the change that lets a foreign ticker resolve lands last of those, so the repository never passes through a state where foreign tickers work but the guards do not. M6 and M7 were added afterwards at the repository owner's request and are safe in any order, since by then every guard is already in place — see the two Revision Notes.
 
 **M1** adds one new module, `src/dataset/ticker_currency.py`, and one line elsewhere. The module holds `MINOR_UNIT_CURRENCIES`, mapping each of Yahoo Finance's minor-unit codes to its major unit and multiplier (`GBp`→`GBP` at 0.01, `ZAc`→`ZAR`, `ILA`→`ILS`); `DEFAULT_CURRENCY = "USD"`; a `CURRENCY_LOOKUP_FAILED_REASON` string; and `MixedCurrencyPoolError`, a `ValueError` subclass. Its pure functions are `normalize_currency(raw)`, returning a `(currency, multiplier)` pair and deliberately case-sensitive so that `GBP` is not mistaken for `GBp`; `apply_price_multipliers(long_prices, multipliers)`, which scales *both* the `close` and `adj_close` columns, since both are quoted in the minor unit and `load_latest_prices` reads `adj_close`; `group_by_currency(tickers, currencies)`, which buckets tickers and treats an unrecorded one as `DEFAULT_CURRENCY`; and `partition_by_currency(candidates, pool_currency, currencies)`, which splits a batch into accepted and refused and, when the pool is empty, lets the first candidate establish the currency. Storage mirrors the existing upsert discipline exactly: `upsert_ticker_currency_table` creates the table if absent, deletes the rows for the requested tickers, then inserts; `load_ticker_currencies` returns a mapping and, crucially, an empty one when the table does not exist, which is the normal case for the shared cache. The single network function is `fetch_ticker_currencies`, the only place in the module that touches yfinance, which makes it the one seam tests need to monkeypatch. Finally, add the `ticker_currency` table to `src/flow/live.py`'s `_init_empty_price_and_returns_tables`, matching that function's stated purpose of pre-creating the shapes the upserts fill.
 
@@ -227,6 +253,10 @@ The work divides into five milestones. Their order is deliberate and is itself a
 
 **M5** verifies: the full suite, then real runs against live market data for a yen pool and a pence pool, a check that a dollar run is unchanged, a check that the shared cache is byte-identical after a backtest-date run, and a `README.md` note.
 
+**M6** moves persistence from one pool per file to one pool per currency inside the single `memory/candidates.json`. Before it, keeping a yen pool and a dollar pool apart meant remembering a different `--memory-path` for each, which is how this plan's own verification had to run. `src/flow/candidate_memory.py` gains `load_all_pools` as its primitive, built on a `_load_raw_pools` that normalizes the old flat shape to `{"USD": {...}}` and validates each entry; `load_candidate_pool` and `save_candidate_pool` gain a `currency` parameter; and the save becomes read-modify-write so that storing one currency's pool carries every other's tickers *and* its own `updated_at` across untouched. In `src/flow/cli.py`, `_choose_pool_to_resume` lists what is saved and asks which pool this session is about, offering `[n]ew` — offered even when only one pool exists, which is what keeps a second currency reachable at all. `_run_user_provided_confirm_loop` takes `initial_pools: dict[str, list[str]]` rather than one pre-loaded list, and every save inside both loops names its currency.
+
+**M7** finishes two loose ends M6 left. `migrate_candidate_pools` converts a pre-M6 file deliberately and offline, reading through `_load_raw_pools` and writing straight back, so tickers and each pool's original `updated_at` survive verbatim — the point being that letting the next `save_candidate_pool` do the conversion instead would stamp the current time over the only record of when a pool was curated, and would do it only after a live re-validation that can drop a ticker which momentarily fails to resolve. It is exposed as `portfolio-migrate-candidates`, is idempotent, and reports a missing file rather than creating one. Separately, `--memory-path` is re-documented: before M6 it meant both "which file" and "how currencies are kept apart", and only the first of those survives, so its help text and every reference in this plan now describe an alternate or scratch store and never a currency separator.
+
 
 ## Concrete Steps
 
@@ -237,29 +267,43 @@ To run the tests:
 
     uv run pytest tests/test_*.py
 
+If `memory/candidates.json` was written before M6 — a single flat `{"tickers": [...]}` object rather than `{"pools": {...}}` — convert it first. This is optional, since it is read correctly either way, but doing it deliberately preserves the pool's original timestamp that a save would otherwise overwrite:
+
+    uv run portfolio-migrate-candidates
+
+Expect it to name what it converted, for instance `USD (12): AMLP, BIL, BOXX, ...`. Running it again is a no-op, and running it with nothing saved prints `Nothing to migrate`.
+
 To build a yen portfolio and see a dollar ticker refused:
 
     uv run portfolio --date today --objective GMV --value 15000000 \
-        --selection user_provided --memory-path /tmp/jpy.json --risk-free-rate 0.005
+        --selection user_provided --risk-free-rate 0.005
 
-Type `a`, then `7203.T 6758.T`, then `a` again and `AAPL`. Expect the two Tokyo tickers accepted, then `Refused: AAPL is priced in USD but this pool is JPY. A portfolio cannot mix currencies; run them separately.` with the pool still holding exactly the two Tokyo tickers. Type `d` to confirm and expect `Portfolio currency: JPY` above the weights and a `JPY`-labelled leftover cash line.
+If anything is already saved, the session opens with `Saved candidate pools:` and asks which to resume; press `n` for a new pool in another currency. Then type `a`, then `7203.T 6758.T`, then `a` again and `AAPL`. Expect the two Tokyo tickers accepted, then `Refused: AAPL is priced in USD but this pool is JPY. A portfolio cannot mix currencies; run them separately.` with the pool still holding exactly the two Tokyo tickers. Type `d` to confirm and expect `Saved 2 JPY ticker(s)`, then `Portfolio currency: JPY` above the weights and a `JPY`-labelled leftover cash line. Note `--risk-free-rate 0.005` is passed because the 2% default is a dollar rate.
 
-To prove the pence normalization:
+Run the same command again and expect the yen pool listed beside whatever else is saved, each with its ticker count — which is the check that they coexist rather than overwrite one another.
+
+To prove the pence normalization, start another new pool:
+
+    uv run portfolio --date today --objective GMV --value 100000 --selection user_provided
+
+Choose `n`, type `a`, then `BARC.L`, then `d`. Expect `Portfolio currency: GBP` — the major unit, not the `GBp` Yahoo Finance reports. The share count should reflect a price near four pounds ninety rather than four hundred ninety; the direct check is that `adj_close` for `BARC.L` in the session database is near 4.9.
+
+To confirm nothing changed for dollars, resume or create a dollar pool with `AAPL SPY` and expect `Portfolio currency: USD` and a `$`-prefixed leftover cash line.
+
+Every command above writes to `memory/candidates.json`. To try things without touching a curated pool, point `--memory-path` at a scratch file — that flag selects which file to use and nothing more; currencies are kept apart inside whichever file it names:
 
     uv run portfolio --date today --objective GMV --value 100000 \
-        --selection user_provided --memory-path /tmp/gbp.json
-
-Type `a`, then `BARC.L`, then `d`. Expect `Portfolio currency: GBP` — the major unit, not `GBp`. The share count should reflect a price near one pound ninety rather than one hundred ninety; the direct check is that `adj_close` for `BARC.L` in the session database is near 1.9.
-
-To confirm nothing changed for dollars, run the same command with `AAPL SPY` and expect `Portfolio currency: USD` and a `$`-prefixed leftover cash line.
+        --selection user_provided --memory-path /tmp/scratch.json
 
 
 ## Validation and Acceptance
 
 
-Acceptance is behavioral, in seven parts, each verified for real and recorded in Artifacts and Notes.
+Acceptance is behavioral, in twelve parts, each verified for real and recorded in Artifacts and Notes.
 
 A Tokyo ticker (`7203.T`) and a London ticker (`BARC.L`) are accepted rather than reported as not found — the capability that did not exist before. `BRK.B` still resolves, which is the regression that would matter most, since it is the reason the dot-to-dash translation exists. A pool of Tokyo tickers reports `Portfolio currency: JPY` and interprets `--value` as yen. Adding `AAPL` to that pool prints the refusal naming both `AAPL` and both currencies, and leaves the pool exactly as it was, while a valid same-currency ticker typed on the same line as a refused one is still added. A London ticker's stored `adj_close` is one hundredth of what Yahoo Finance reports, so its share count reflects a price of about £1.9. A dollar portfolio behaves exactly as it did before this plan, including its `$`-prefixed output. And a backtest-window date still reports `Mode: backtest` and leaves `data/portfolio.duckdb` byte-identical, checked with `md5sum` before and after.
+
+Five further acceptance points cover the shared candidate file. A yen pool and a dollar pool coexist in one `memory/candidates.json`, and saving either leaves the other's tickers and its own `updated_at` untouched — checked by reading the file back after each save. A returning session lists every saved pool with its ticker count and resumes the one chosen. `[n]ew` is offered even when only one pool is saved, without which a second currency could never be created. A pre-M6 flat-shape file is read as the USD pool with no error. And `portfolio-migrate-candidates` converts such a file in place, preserving its tickers and its original timestamp, is byte-identical when re-run, and reports rather than creates a missing file.
 
 For the automated suite, every one of the 217 tests passing before this plan must still pass, and the new tests must cover: the suffix allowlist in both directions; the case-sensitivity of `normalize_currency`, including that `GBP` is *not* divided by 100; the multiplier applied to both price columns while a dollar ticker in the same batch is untouched; the currency lookup receiving only the tickers that resolved; a lookup failure landing in `invalid` rather than defaulting to dollars; the first-typed-ticker rule establishing the pool currency; a refusal not being persisted; and — the most important regression — `compute_weights_and_allocation` being entirely unaffected when no `ticker_currency` table exists, which is what proves the backtest path and the shared cache are untouched. Per `AGENTS.md`, no test calls Yahoo Finance or an LLM; `fetch_ticker_currencies` is the seam, monkeypatched at its point of use exactly as `fetch_and_reshape_for_tickers` already is.
 
@@ -269,7 +313,9 @@ For the automated suite, every one of the 217 tests passing before this plan mus
 
 Every step is safe to repeat. `upsert_ticker_currency_table` deletes the rows for the tickers it is given before inserting, so ingesting the same ticker twice leaves exactly one row. The pence multiplier cannot compound, because it is applied to a freshly fetched frame before the price upsert replaces the stored rows wholesale — it never multiplies a value already in the database. A `user_provided` session always gets a throwaway database that `src/flow/live.py`'s existing `finally` clause deletes on exit, so nothing this plan writes can damage the shared historical cache.
 
-Two recoverable situations are worth naming. A persisted `memory/candidates.json` that mixes currencies is reported at session start with its tickers grouped by currency, and the person chooses which group to keep; deleting the file is always a complete reset, since a missing file reads back as an empty pool. And a ticker whose currency cannot be determined is reported as invalid rather than guessed at, so the recovery is simply to omit it or try again later.
+The candidate file is safe to repeat against too. `save_candidate_pool` is read-modify-write, so storing one currency's pool cannot damage a sibling pool's tickers or timestamp. `migrate_candidate_pools` performs no network calls and rewrites only the file's shape, so running it twice leaves a byte-identical file and running it against a file already in the new shape does nothing; it also reports a missing file rather than creating one.
+
+Three recoverable situations are worth naming. A persisted pool that mixes currencies — possible for one saved before this plan — is reported at session start with its tickers grouped by currency, and the person chooses which group to keep. A ticker whose currency cannot be determined is reported as invalid rather than guessed at, so the recovery is to omit it or try again later. And deleting `memory/candidates.json` is still a complete reset, since a missing file reads back as no pools at all — but note the blast radius grew with M6: that file now holds *every* currency's pool, so deleting it discards all of them rather than one. Copying it aside first, or pointing `--memory-path` at a scratch file when experimenting, is the cheap precaution.
 
 
 ## Artifacts and Notes
@@ -403,10 +449,54 @@ Reading the file back after that USD save confirms the JPY pool survived it unto
     USD: 12 tickers, updated_at=2026-09-05T05:31:53.885356+00:00
     JPY: 2 tickers, updated_at=2026-09-05T05:31:33.115047+00:00
 
+M7, the offline migration, run against a copy of this repository's real legacy file:
+
+    $ cp memory/candidates.json /tmp/legacy.json
+    $ uv run portfolio-migrate-candidates --path /tmp/legacy.json
+    Migrated /tmp/legacy.json to the per-currency shape:
+      USD (12): AMLP, BIL, BOXX, GOOGL, NVDA, PFF, PFFA, QQQI, T, TLT, TSM, VZ
+
+    $ cat /tmp/legacy.json
+    {
+      "pools": {
+        "USD": {
+          "tickers": ["AMLP", "BIL", "BOXX", "GOOGL", "NVDA", "PFF",
+                      "PFFA", "QQQI", "T", "TLT", "TSM", "VZ"],
+          "updated_at": "2026-09-05T01:49:26.829379+00:00"
+        }
+      }
+    }
+
+The timestamp is the thing to look at: `01:49:26` is when that pool was originally curated, hours before this feature existed, and the migration kept it. Letting the next save do the conversion instead would have replaced it with the moment of the run. Idempotence and the missing-file case, checked directly:
+
+    $ md5sum /tmp/legacy.json
+    4ee449507bf3628e5d6a75d40b552e50  /tmp/legacy.json
+    $ uv run portfolio-migrate-candidates --path /tmp/legacy.json >/dev/null
+    $ md5sum /tmp/legacy.json
+    4ee449507bf3628e5d6a75d40b552e50  /tmp/legacy.json
+
+    $ uv run portfolio-migrate-candidates --path /tmp/nope/candidates.json
+    Nothing to migrate: /tmp/nope/candidates.json does not exist.
+    $ ls /tmp/nope
+    ls: cannot access '/tmp/nope': No such file or directory
+
+And the migrated file driving a normal session, which is what proves the conversion produced something the CLI actually reads:
+
+    Saved candidate pools:
+      USD (12): AMLP, BIL, BOXX, GOOGL, NVDA, PFF, PFFA, QQQI, T, TLT, TSM, VZ
+    Resume the USD pool? [Enter] resume / [n]ew pool in another currency:
+
+    Current candidate pool (12): AMLP, BIL, BOXX, GOOGL, NVDA, PFF, PFFA, QQQI, T, TLT, TSM, VZ
+    Saved 12 USD ticker(s) to /tmp/legacy.json.
+    Portfolio currency: USD - --value is interpreted as USD
+    Leftover cash: $10.70 USD
+
+All twelve survived that live re-validation, so every ticker in the legacy pool still resolves. Note the save then refreshed the timestamp to `05:55:46`, which is correct — the pool really was re-confirmed at that moment — and is exactly the overwrite the offline migration exists to avoid doing prematurely.
+
 The suite:
 
     $ uv run pytest tests/test_*.py -q
-    283 passed in 50.63s
+    288 passed in 51.09s
 
 And the intermediate state worth recording, from immediately after M2, before the callers were updated:
 
@@ -477,13 +567,19 @@ In `src/flow/candidate_memory.py`, the stored shape becomes one pool per currenc
     def save_candidate_pool(
         tickers: list[str], path: str = DEFAULT_CANDIDATES_PATH, currency: str = DEFAULT_CURRENCY
     ) -> None
+    def migrate_candidate_pools(path: str = DEFAULT_CANDIDATES_PATH) -> dict[str, list[str]]
+    def main() -> None   # the `portfolio-migrate-candidates` console script
 
 with the file holding:
 
     {"pools": {"USD": {"tickers": [...], "updated_at": "..."},
                "JPY": {"tickers": [...], "updated_at": "..."}}}
 
-A file in the old `{"tickers": [...], "updated_at": ...}` shape is read as the USD pool and rewritten in the new shape on the next save.
+A file in the old `{"tickers": [...], "updated_at": ...}` shape is read as the USD pool and rewritten in the new shape on the next save, or converted deliberately and offline by `migrate_candidate_pools`, which preserves each pool's original `updated_at` where a save would replace it.
+
+`pyproject.toml`'s `[project.scripts]` gains `portfolio-migrate-candidates = "src.flow.candidate_memory:main"`.
+
+`--memory-path` keeps its existing meaning of *which file* to use, and nothing more: it is an alternate or scratch store, useful for trying something without touching a curated pool. It is no longer how currencies are kept apart — that is done by the keys inside whichever file it names.
 
 In `src/flow/cli.py`, add:
 

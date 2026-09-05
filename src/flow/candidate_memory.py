@@ -25,6 +25,7 @@ unimplemented scope gap tracked separately (see
 
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -105,7 +106,63 @@ def save_candidate_pool(
         "tickers": sorted(set(tickers)),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    _write_pools(path, pools)
 
+
+def _write_pools(path: str, pools: dict[str, dict]) -> None:
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(json.dumps({"pools": pools}, indent=2))
+
+
+def migrate_candidate_pools(path: str = DEFAULT_CANDIDATES_PATH) -> dict[str, list[str]]:
+    """Rewrite `path` in the per-currency shape without touching its contents,
+    returning `{currency: tickers}` for whatever it holds afterwards.
+
+    Only the file's *shape* changes. Every pool keeps its tickers and its own
+    `updated_at` verbatim, which is the reason this exists rather than just
+    letting the next `save_candidate_pool` do the conversion: that would
+    stamp the current time over the only record of when the pool was last
+    curated, and it happens only after a live re-validation of every ticker,
+    which can drop one that momentarily fails to resolve.
+
+    Performs no network calls. Safe to repeat: a file already in the new
+    shape is rewritten identically. A missing file is reported as `{}` rather
+    than created, so asking about a file that is not there does not
+    materialize one.
+
+    A legacy file with no `updated_at` migrates with that field left null.
+    Back-filling it with the migration time would invent a curation date we
+    do not know.
+    """
+    if not Path(path).exists():
+        return {}
+
+    pools = _load_raw_pools(path)
+    _write_pools(path, pools)
+    return {currency: entry["tickers"] for currency, entry in pools.items()}
+
+
+def main() -> None:
+    """Console-script entry point (`portfolio-migrate-candidates`), for
+    converting a `candidates.json` written before pools were kept per
+    currency. Running it on an already-converted file is a harmless no-op.
+    """
+    parser = argparse.ArgumentParser(
+        description="Rewrite a candidates.json in the per-currency shape, preserving tickers and timestamps."
+    )
+    parser.add_argument("--path", default=DEFAULT_CANDIDATES_PATH, help="The candidates file to convert.")
+    args = parser.parse_args()
+
+    pools = migrate_candidate_pools(args.path)
+    if not pools:
+        print(f"Nothing to migrate: {args.path} does not exist.")
+        return
+
+    print(f"Migrated {args.path} to the per-currency shape:")
+    for currency, tickers in sorted(pools.items()):
+        print(f"  {currency} ({len(tickers)}): {', '.join(tickers)}")
+
+
+if __name__ == "__main__":
+    main()

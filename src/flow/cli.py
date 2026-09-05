@@ -486,8 +486,10 @@ def main() -> None:
     parser.add_argument(
         "--memory-path",
         default=DEFAULT_CANDIDATES_PATH,
-        help="Where the user_provided selection's candidate pools are persisted. One file holds "
-             "one pool per currency; when several are saved you are asked which to resume.",
+        help="Which file the user_provided selection's candidate pools are persisted in - an "
+             "alternate or scratch store, for trying something without touching a curated pool. "
+             "One file holds one pool per currency, so this is not how currencies are kept apart; "
+             "when several pools are saved you are asked which to resume.",
     )
     args = parser.parse_args()
 

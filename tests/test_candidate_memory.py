@@ -11,7 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from src.flow.candidate_memory import load_all_pools, load_candidate_pool, save_candidate_pool
+from src.flow.candidate_memory import (
+    load_all_pools,
+    load_candidate_pool,
+    migrate_candidate_pools,
+    save_candidate_pool,
+)
 
 
 def test_load_candidate_pool_returns_empty_list_when_file_missing(tmp_path):
@@ -153,3 +158,68 @@ def test_saving_a_new_currency_migrates_a_legacy_file_without_losing_it(tmp_path
 
     assert load_all_pools(str(path)) == {"USD": ["AAPL"], "JPY": ["7203.T"]}
     assert "pools" in json.loads(path.read_text())
+
+
+# ---------------------------------------------------------------------------
+# migrate_candidate_pools
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_converts_a_legacy_file_and_preserves_its_timestamp(tmp_path):
+    """The reason this exists rather than letting the next save convert the
+    file: a save would stamp the current time over the only record of when
+    the pool was curated.
+    """
+    path = tmp_path / "candidates.json"
+    path.write_text(json.dumps({"tickers": ["SPY", "AAPL"], "updated_at": "2026-09-05T01:49:26.829379+00:00"}))
+
+    assert migrate_candidate_pools(str(path)) == {"USD": ["AAPL", "SPY"]}
+
+    payload = json.loads(path.read_text())
+    assert payload == {
+        "pools": {"USD": {"tickers": ["AAPL", "SPY"], "updated_at": "2026-09-05T01:49:26.829379+00:00"}}
+    }
+
+
+def test_migrate_is_idempotent(tmp_path):
+    path = tmp_path / "candidates.json"
+    path.write_text(json.dumps({"tickers": ["AAPL"], "updated_at": "2026-09-05T01:49:26+00:00"}))
+
+    migrate_candidate_pools(str(path))
+    once = path.read_text()
+    migrate_candidate_pools(str(path))
+
+    assert path.read_text() == once
+
+
+def test_migrate_leaves_an_already_converted_multi_pool_file_intact(tmp_path):
+    path = str(tmp_path / "candidates.json")
+    save_candidate_pool(["AAPL", "SPY"], path, currency="USD")
+    save_candidate_pool(["7203.T"], path, currency="JPY")
+    before = json.loads(Path(path).read_text())
+
+    assert migrate_candidate_pools(path) == {"USD": ["AAPL", "SPY"], "JPY": ["7203.T"]}
+
+    assert json.loads(Path(path).read_text()) == before
+
+
+def test_migrate_reports_a_missing_file_without_creating_one(tmp_path):
+    """A read-shaped operation must not materialize the thing it was asked
+    about - the same rule `load_ticker_currencies` follows.
+    """
+    missing = tmp_path / "memory" / "candidates.json"
+
+    assert migrate_candidate_pools(str(missing)) == {}
+    assert not missing.exists()
+
+
+def test_migrate_leaves_a_legacy_file_without_a_timestamp_null(tmp_path):
+    """Back-filling `updated_at` with the migration time would invent a
+    curation date that is not known.
+    """
+    path = tmp_path / "candidates.json"
+    path.write_text(json.dumps({"tickers": ["AAPL"]}))
+
+    migrate_candidate_pools(str(path))
+
+    assert json.loads(path.read_text())["pools"]["USD"]["updated_at"] is None
