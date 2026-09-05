@@ -224,6 +224,16 @@ def test_detect_unresolved_tickers_returns_empty_typed_frame_when_all_resolved()
     assert list(unresolved.columns) == ["ticker", "reason"]
 
 
+def test_detect_unresolved_tickers_reason_names_the_window_actually_fetched():
+    long_prices = pd.DataFrame(columns=["date", "ticker", "close", "adj_close"])
+
+    unresolved = detect_unresolved_tickers(["GHOST"], long_prices, start="2021-04-05", end="2026-09-10")
+
+    reason = unresolved.loc[0, "reason"]
+    assert "2021-04-05" in reason
+    assert "2026-09-10" in reason
+
+
 def test_cumulative_split_ratio_after_multiplies_only_splits_strictly_after_as_of():
     splits = pd.Series(
         [2.0, 4.0, 10.0],

@@ -133,15 +133,23 @@ def reshape_prices_long(raw: pd.DataFrame, symbol_to_ticker: dict[str, str]) -> 
     )
 
 
-def detect_unresolved_tickers(all_tickers: list[str], long_prices: pd.DataFrame) -> pd.DataFrame:
+def detect_unresolved_tickers(
+    all_tickers: list[str],
+    long_prices: pd.DataFrame,
+    start: str = settings.fetch_start,
+    end: str = settings.fetch_end,
+) -> pd.DataFrame:
     """Return columns ['ticker', 'reason'] for every ticker in `all_tickers`
     absent from `long_prices['ticker']` — i.e. yfinance never produced a
     single non-null close/adj_close row for it. Pure, no I/O; always
-    returns a correctly-typed DataFrame, even when empty.
+    returns a correctly-typed DataFrame, even when empty. `start`/`end`
+    default to the module-wide fetch window but should be passed explicitly
+    by a caller fetching a different window (e.g. for a single arbitrary
+    ticker), so the reason string names the window that was actually used.
     """
     present = set(long_prices["ticker"]) if not long_prices.empty else set()
     missing = sorted(set(all_tickers) - present)
-    reason = UNRESOLVED_REASON.format(start=settings.fetch_start, end=settings.fetch_end)
+    reason = UNRESOLVED_REASON.format(start=start, end=end)
     return pd.DataFrame({"ticker": missing, "reason": [reason] * len(missing)})
 
 
@@ -238,6 +246,75 @@ def write_prices_tables(prices_df: pd.DataFrame, unresolved_df: pd.DataFrame, db
         con.close()
 
 
+def upsert_prices_tables(
+    prices_df: pd.DataFrame,
+    unresolved_df: pd.DataFrame,
+    tickers: list[str],
+    db_path: str = settings.db_path,
+) -> None:
+    """Merge `prices_df`/`unresolved_df` into the `prices`/`unresolved_tickers`
+    tables at `db_path`, replacing only the rows for `tickers` — every other
+    ticker's existing rows are left untouched, unlike `write_prices_tables`'s
+    full drop-and-recreate. `tickers` (not the dataframes' own content) drives
+    which rows get deleted first, so this is correct even when a ticker flips
+    from resolved to unresolved (or back) between calls: it may be present in
+    one dataframe and absent from the other, but its stale row in *both*
+    tables is cleared before the new rows are inserted.
+    """
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(db_path)
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS prices "
+            "(date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)"
+        )
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS unresolved_tickers (ticker VARCHAR, reason VARCHAR)"
+        )
+
+        placeholders = ", ".join(["?"] * len(tickers))
+        if tickers:
+            con.execute(f"DELETE FROM prices WHERE ticker IN ({placeholders})", tickers)
+            con.execute(f"DELETE FROM unresolved_tickers WHERE ticker IN ({placeholders})", tickers)
+
+        con.register("prices_df", prices_df)
+        con.execute(
+            "INSERT INTO prices SELECT date::DATE, ticker::VARCHAR, "
+            "close::DOUBLE, adj_close::DOUBLE FROM prices_df"
+        )
+        con.unregister("prices_df")
+
+        con.register("unresolved_df", unresolved_df)
+        con.execute(
+            "INSERT INTO unresolved_tickers SELECT ticker::VARCHAR, reason::VARCHAR FROM unresolved_df"
+        )
+        con.unregister("unresolved_df")
+    finally:
+        con.close()
+
+
+def fetch_and_reshape_for_tickers(
+    tickers: list[str],
+    start: str,
+    end: str,
+    batch_size: int = settings.price_batch_size,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch, reshape, and detect unresolved tickers for an arbitrary
+    `tickers` list (not necessarily S&P 500 members) over `[start, end]`.
+    Pure orchestration, no writes — the same fetch/reshape/detect sequence
+    `build_price_history` runs for the full membership universe, factored
+    out here so it's reusable against any ticker list. Returns
+    `(long_prices, unresolved)`.
+    """
+    ticker_to_symbol = _build_symbol_map(tickers)
+    symbol_to_ticker = {v: k for k, v in ticker_to_symbol.items()}
+
+    raw = fetch_price_history(list(symbol_to_ticker.keys()), start, end, batch_size)
+    long_prices = reshape_prices_long(raw, symbol_to_ticker)
+    unresolved = detect_unresolved_tickers(tickers, long_prices, start=start, end=end)
+    return long_prices, unresolved
+
+
 def build_price_history(
     db_path: str = settings.db_path,
     start: str = settings.fetch_start,
@@ -248,11 +325,7 @@ def build_price_history(
     return the resulting long-format prices DataFrame.
     """
     tickers = load_ticker_universe(db_path)
-    ticker_to_symbol = _build_symbol_map(tickers)
-    symbol_to_ticker = {v: k for k, v in ticker_to_symbol.items()}
-
-    raw = fetch_price_history(list(symbol_to_ticker.keys()), start, end, batch_size)
-    long_prices = reshape_prices_long(raw, symbol_to_ticker)
+    long_prices, unresolved = fetch_and_reshape_for_tickers(tickers, start, end, batch_size)
 
     if long_prices.empty and tickers:
         raise PriceFetchFailedError(
@@ -261,7 +334,6 @@ def build_price_history(
             "genuine total delisting. Check connectivity before proceeding."
         )
 
-    unresolved = detect_unresolved_tickers(tickers, long_prices)
     write_prices_tables(long_prices, unresolved, db_path)
     logger.info(
         "wrote %d rows to %s::prices, %d unresolved tickers",

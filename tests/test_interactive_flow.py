@@ -1,6 +1,12 @@
-"""Tests for src/flow/interactive.py's `edit_candidates` and `run_pipeline`
-selection-mode branching, and src/flow/backtest.py's turnover-cost/gross-
-return/Sharpe-ratio arithmetic.
+"""Tests for src/flow/interactive.py's `edit_candidates`,
+`validate_and_edit_candidates`, `open_pipeline_session` routing, and
+`run_pipeline`/`run_scan` selection-mode branching, plus
+src/flow/backtest.py's turnover-cost/gross-return/Sharpe-ratio arithmetic.
+
+The `user_provided` selection's tests monkeypatch `build_live_snapshot`
+(that selection always routes through it, even for a backtest date, so it
+never writes to the shared cache) and `validate_and_ingest_tickers` (the
+one call that would otherwise reach yfinance).
 
 Per AGENTS.md, no test here calls yfinance's live API, any LLM, or hits
 `data/portfolio.duckdb`. `run_pipeline`'s selection-mode tests exercise
@@ -18,6 +24,7 @@ calls by design (see `src/flow/live.py`), verified instead by the real,
 manual runs recorded in `plans/06_interactive_flow.md`.
 """
 
+from contextlib import contextmanager
 from datetime import date
 from unittest.mock import MagicMock
 
@@ -27,7 +34,13 @@ import pytest
 
 from src.agents.llm_s_schema import ScreeningRule
 from src.flow.backtest import _gross_return, _turnover_cost, compute_sharpe_ratio
-from src.flow.interactive import edit_candidates, run_pipeline
+from src.flow.interactive import (
+    edit_candidates,
+    open_pipeline_session,
+    run_pipeline,
+    run_scan,
+    validate_and_edit_candidates,
+)
 
 # ---------------------------------------------------------------------------
 # edit_candidates
@@ -164,6 +177,143 @@ def test_run_pipeline_llm_s_and_f_calls_both_agents(tmp_path, monkeypatch):
 def test_run_pipeline_invalid_selection_raises_value_error():
     with pytest.raises(ValueError, match="selection"):
         run_pipeline(date(2024, 3, 1), "GMV", 1000.0, selection="bogus")
+
+
+# ---------------------------------------------------------------------------
+# user_provided selection
+# ---------------------------------------------------------------------------
+
+
+def test_run_scan_user_provided_never_calls_either_agent_or_the_scanner(monkeypatch):
+    """The user chose these candidates, so there are no signals to generate
+    or combine - LLM-S, LLM-F and the scanner must all be skipped outright,
+    not merely have their results discarded.
+    """
+    generate_rule_spy = MagicMock()
+    screen_spy = MagicMock()
+    screen_month_spy = MagicMock()
+    scan_with_detail_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.generate_rule", generate_rule_spy)
+    monkeypatch.setattr("src.flow.interactive.screen", screen_spy)
+    monkeypatch.setattr("src.flow.interactive.screen_month", screen_month_spy)
+    monkeypatch.setattr("src.flow.interactive.scan_with_detail", scan_with_detail_spy)
+
+    scan = run_scan(date(2026, 9, 5), "user_provided", "unused.duckdb", candidates=["MSFT", "AAPL", "AAPL"])
+
+    assert generate_rule_spy.called is False
+    assert screen_spy.called is False
+    assert screen_month_spy.called is False
+    assert scan_with_detail_spy.called is False
+    assert scan == {
+        "rule": None,
+        "llm_s_signals": None,
+        "llm_f_signals": None,
+        "scan_detail": {
+            "candidates": ["AAPL", "MSFT"],
+            "branch": "user_provided",
+            "buy_s_size": None,
+            "buy_f_size": None,
+            "intersection_size": None,
+            "union_size": None,
+        },
+    }
+
+
+def test_run_scan_user_provided_with_no_candidates_yields_an_empty_list():
+    scan = run_scan(date(2026, 9, 5), "user_provided", "unused.duckdb")
+    assert scan["scan_detail"]["candidates"] == []
+
+
+def test_open_pipeline_session_user_provided_uses_a_snapshot_even_for_a_backtest_date(monkeypatch):
+    """`user_provided` writes its tickers' prices/returns into whichever
+    database it is handed, so it must never be handed the shared historical
+    cache - even for a date that cache covers.
+    """
+
+    @contextmanager
+    def fake_snapshot(as_of, selection, source_db_path):
+        yield "/tmp/fake-snapshot.duckdb"
+
+    snapshot_spy = MagicMock(side_effect=fake_snapshot)
+    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", snapshot_spy)
+
+    with open_pipeline_session(date(2024, 3, 1), "user_provided", "data/portfolio.duckdb") as (db_path, mode):
+        assert db_path == "/tmp/fake-snapshot.duckdb"
+        assert mode == "backtest"
+
+    assert snapshot_spy.called is True
+
+
+def test_open_pipeline_session_backtest_date_still_reads_the_cache_for_other_selections(monkeypatch):
+    snapshot_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", snapshot_spy)
+
+    with open_pipeline_session(date(2024, 3, 1), "llm_s_only", "data/portfolio.duckdb") as (db_path, mode):
+        assert db_path == "data/portfolio.duckdb"
+        assert mode == "backtest"
+
+    assert snapshot_spy.called is False
+
+
+def test_validate_and_edit_candidates_adds_only_the_valid_tickers(monkeypatch):
+    monkeypatch.setattr(
+        "src.flow.interactive.validate_and_ingest_tickers",
+        lambda tickers, as_of, db_path: (["NVDA"], {"ZZZZ": "no data"}),
+    )
+
+    pool, valid_added, invalid = validate_and_edit_candidates(
+        ["AAPL"], add=["NVDA", "ZZZZ"], remove=[], as_of=date(2026, 9, 5), db_path="unused.duckdb"
+    )
+
+    assert pool == ["AAPL", "NVDA"]
+    assert valid_added == ["NVDA"]
+    assert invalid == {"ZZZZ": "no data"}
+
+
+def test_validate_and_edit_candidates_removes_without_validating(monkeypatch):
+    """A removal needs no network round trip - and an empty `add` must not
+    trigger one either.
+    """
+    ingest_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+
+    pool, valid_added, invalid = validate_and_edit_candidates(
+        ["AAPL", "MSFT"], add=[], remove=["MSFT"], as_of=date(2026, 9, 5), db_path="unused.duckdb"
+    )
+
+    assert pool == ["AAPL"]
+    assert valid_added == []
+    assert invalid == {}
+    assert ingest_spy.called is False
+
+
+def test_run_pipeline_user_provided_optimizes_the_supplied_candidates(tmp_path, monkeypatch):
+    """End to end for the new selection: no agent runs, and the user's own
+    candidate list flows through the real optimizer chain.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+
+    @contextmanager
+    def fake_snapshot(as_of, selection, source_db_path):
+        yield db_path
+
+    generate_rule_spy = MagicMock()
+    screen_month_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
+    monkeypatch.setattr("src.flow.interactive.generate_rule", generate_rule_spy)
+    monkeypatch.setattr("src.flow.interactive.screen_month", screen_month_spy)
+
+    result = run_pipeline(
+        date(2024, 3, 1), "GMV", 1000.0, selection="user_provided", db_path=db_path, candidates=["AAA"]
+    )
+
+    assert generate_rule_spy.called is False
+    assert screen_month_spy.called is False
+    assert result["rule"] is None
+    assert result["scan_detail"]["branch"] == "user_provided"
+    assert result["scan_detail"]["candidates"] == ["AAA"]
+    assert result["weights"] == pytest.approx({"AAA": 1.0}, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------

@@ -161,6 +161,58 @@ def build_returns(db_path: str = settings.db_path, start: str = settings.fetch_s
     return returns
 
 
+def upsert_returns_table(df: pd.DataFrame, tickers: list[str], db_path: str = settings.db_path) -> None:
+    """Merge `df` into the `returns` table at `db_path`, replacing only the
+    rows for `tickers` — every other ticker's existing rows are left
+    untouched, unlike `write_returns_table`'s full drop-and-recreate.
+    """
+    con = duckdb.connect(db_path)
+    try:
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS returns "
+            "(rebalance_date DATE, ticker VARCHAR, monthly_return DOUBLE)"
+        )
+        if tickers:
+            placeholders = ", ".join(["?"] * len(tickers))
+            con.execute(f"DELETE FROM returns WHERE ticker IN ({placeholders})", tickers)
+
+        con.register("returns_df", df)
+        con.execute(
+            "INSERT INTO returns SELECT rebalance_date::DATE, "
+            "ticker::VARCHAR, monthly_return::DOUBLE FROM returns_df"
+        )
+        con.unregister("returns_df")
+    finally:
+        con.close()
+
+
+def build_returns_for_tickers(tickers: list[str], db_path: str, start: str, end: str) -> pd.DataFrame:
+    """Same computation as `build_returns`, but scoped to an explicit
+    `tickers` list instead of `load_ticker_universe(db_path)`, and merged
+    into the `returns` table via `upsert_returns_table` instead of fully
+    overwriting it. Must run after `db_path`'s `prices` table already has
+    rows for `tickers` (e.g. via `upsert_prices_tables`), since this reads
+    `load_prices_for_join(db_path)` to compute the join.
+    """
+    months = compute_rebalance_dates(start, end)
+    prices = load_prices_for_join(db_path)
+
+    grid = build_month_ticker_grid(tickers, months)
+    grid["monthly_return"] = compute_monthly_return_column(grid, prices)
+
+    returns = grid[["rebalance_date", "ticker", "monthly_return"]]
+    upsert_returns_table(returns, tickers, db_path)
+    logger.info(
+        "upserted %d rows to %s::returns (%d non-null) across %d months for %d ticker(s)",
+        len(returns),
+        db_path,
+        returns["monthly_return"].notna().sum(),
+        len(months),
+        len(tickers),
+    )
+    return returns
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     build_returns()

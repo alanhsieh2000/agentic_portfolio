@@ -29,11 +29,12 @@ from src.agents.llm_s import generate_rule
 from src.agents.llm_s_schema import ScreeningRule
 from src.agents.llm_s_signals import screen
 from src.config.settings import settings
+from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.live import build_live_snapshot
 from src.optimizer.portfolio import allocate_shares, compute_weights, load_latest_prices, load_returns_matrix
 from src.scanner.candidate_scanner import scan_with_detail
 
-VALID_SELECTIONS = ("llm_s_only", "llm_f_only", "llm_s_and_f")
+VALID_SELECTIONS = ("llm_s_only", "llm_f_only", "llm_s_and_f", "user_provided")
 
 
 def _is_backtest_date(rebalance_date: date) -> bool:
@@ -55,12 +56,20 @@ def open_pipeline_session(rebalance_date: date, selection: str, db_path: str = "
     single pipeline call), so a caller can run the initial pipeline and
     then recompute weights/allocation against edited candidate lists any
     number of times before the snapshot is deleted on exit.
+
+    `selection="user_provided"` always gets a snapshot, even for a
+    backtest-window date: that mode writes its user-supplied tickers' prices
+    and returns into whichever database it is given, and `db_path` (the
+    shared historical cache) must never be mutated. Its snapshot is cheap -
+    see `build_live_snapshot`, which builds empty tables for it rather than
+    fetching anything.
     """
-    if _is_backtest_date(rebalance_date):
-        yield db_path, "backtest"
+    mode = "backtest" if _is_backtest_date(rebalance_date) else "live"
+    if selection == "user_provided" or mode == "live":
+        with build_live_snapshot(rebalance_date, selection, source_db_path=db_path) as session_db_path:
+            yield session_db_path, mode
     else:
-        with build_live_snapshot(rebalance_date, selection, source_db_path=db_path) as live_db_path:
-            yield live_db_path, "live"
+        yield db_path, mode
 
 
 def compute_weights_and_allocation(
@@ -89,6 +98,7 @@ def run_scan(
     selection: str,
     db_path: str,
     rule: ScreeningRule | None = None,
+    candidates: list[str] | None = None,
 ) -> dict:
     """LLM-S (`generate_rule` + `screen`) and/or LLM-F (`screen_month`) per
     `selection`, then the scanner (`scan_with_detail`) - the part of the
@@ -104,7 +114,28 @@ def run_scan(
     per call to this function. Left `None` (the default), `generate_rule`
     is still called exactly when `selection` needs LLM-S, matching every
     other caller's existing behavior.
+
+    `candidates` is the user's own already-confirmed ticker list, used only
+    by `selection="user_provided"`, which returns it directly in a
+    `scan_with_detail`-shaped dict without calling either agent or the
+    scanner at all - there are no signals to combine when the user, not an
+    agent, chose the candidates.
     """
+    if selection == "user_provided":
+        return {
+            "rule": None,
+            "llm_s_signals": None,
+            "llm_f_signals": None,
+            "scan_detail": {
+                "candidates": sorted(set(candidates or [])),
+                "branch": "user_provided",
+                "buy_s_size": None,
+                "buy_f_size": None,
+                "intersection_size": None,
+                "union_size": None,
+            },
+        }
+
     if rule is None and selection in ("llm_s_only", "llm_s_and_f"):
         rule = generate_rule(rebalance_date.year, db_path=db_path)
 
@@ -133,6 +164,7 @@ def run_pipeline_against(
     db_path: str,
     mode: str,
     rule: ScreeningRule | None = None,
+    candidates: list[str] | None = None,
 ) -> dict:
     """The shared sequence behind both modes: `run_scan` (LLM-S/LLM-F/the
     scanner) followed by the optimizer (`compute_weights_and_allocation`)
@@ -140,10 +172,11 @@ def run_pipeline_against(
     module-private) so a CLI session opened with `open_pipeline_session`
     can call this once for the initial run and then call
     `compute_weights_and_allocation` directly on its own for every
-    subsequent edit, without repeating LLM-S/LLM-F/the scanner. `rule` is
-    passed straight through to `run_scan` - see its docstring.
+    subsequent edit, without repeating LLM-S/LLM-F/the scanner. `rule` and
+    `candidates` are passed straight through to `run_scan` - see its
+    docstring.
     """
-    scan = run_scan(rebalance_date, selection, db_path, rule=rule)
+    scan = run_scan(rebalance_date, selection, db_path, rule=rule, candidates=candidates)
     weights, allocation = compute_weights_and_allocation(
         scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date, db_path
     )
@@ -177,12 +210,37 @@ def edit_candidates(scan_result: dict, add: list[str], remove: list[str]) -> lis
     return sorted(candidates)
 
 
+def validate_and_edit_candidates(
+    pool: list[str],
+    add: list[str],
+    remove: list[str],
+    as_of: date,
+    db_path: str,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """`edit_candidates` for the `user_provided` selection: every ticker in
+    `add` must first resolve on Yahoo Finance (and have its prices/returns
+    ingested into `db_path`) before it joins the pool, so a typo'd or
+    delisted symbol is reported rather than silently surviving until the
+    optimizer drops or chokes on it.
+
+    Returns `(new_pool, valid_added, invalid)` - the tickers in `add` that
+    did not resolve are named in `invalid` and simply left out of
+    `new_pool`, so one bad ticker never blocks the good ones typed
+    alongside it. `remove` needs no validation: removing a ticker that
+    isn't in the pool is already a harmless no-op in set arithmetic.
+    """
+    valid_added, invalid = validate_and_ingest_tickers(add, as_of, db_path) if add else ([], {})
+    new_pool = edit_candidates({"candidates": pool}, add=valid_added, remove=remove)
+    return new_pool, valid_added, invalid
+
+
 def run_pipeline(
     rebalance_date: date,
     objective: str,
     portfolio_value: float,
     selection: str = "llm_s_only",
     db_path: str = "data/portfolio.duckdb",
+    candidates: list[str] | None = None,
 ) -> dict:
     """Run the full pipeline for one `rebalance_date`, as a single,
     self-contained call - see `open_pipeline_session` for a CLI-style
@@ -190,12 +248,16 @@ def run_pipeline(
     for interactive editing.
 
     `selection` (one of `"llm_s_only"` (the default), `"llm_f_only"`,
-    `"llm_s_and_f"`) controls which agent(s) actually run, per README's
-    Backtest Mode Stage 1 default-selection sentence and
+    `"llm_s_and_f"`, `"user_provided"`) controls which agent(s) actually
+    run, per README's Backtest Mode Stage 1 default-selection sentence and
     `plans/08_consistency_review.md` finding 9: the skipped agent's call is
     never made (not merely its result discarded), since README frames
     LLM-F evaluation as "expensive". Raises `ValueError` for any other
     `selection` value.
+
+    `"user_provided"` runs neither agent, taking its candidate list from
+    `candidates` instead (already validated and ingested by the caller, or
+    by `validate_and_edit_candidates`).
 
     Backtest mode (`rebalance_date` within the stored 2020-2024 window)
     reads `db_path`'s cached historical tables directly. Live mode (any
@@ -218,4 +280,6 @@ def run_pipeline(
         raise ValueError(f"selection must be one of {VALID_SELECTIONS}, got {selection!r}")
 
     with open_pipeline_session(rebalance_date, selection, db_path) as (effective_db_path, mode):
-        return run_pipeline_against(rebalance_date, objective, portfolio_value, selection, effective_db_path, mode)
+        return run_pipeline_against(
+            rebalance_date, objective, portfolio_value, selection, effective_db_path, mode, candidates=candidates
+        )

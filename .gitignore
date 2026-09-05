@@ -6,6 +6,7 @@ lib/
 .devcontainer
 skills-lock.json
 output/
+memory/
 .codex
 pre-claude.sh
 pre-codex.sh
