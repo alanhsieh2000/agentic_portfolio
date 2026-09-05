@@ -13,14 +13,18 @@ deterministic regardless of whether the real dataset has been built.
 from datetime import date
 
 import duckdb
+import numpy as np
 import pandas as pd
 import pytest
+from pypfopt import EfficientFrontier, expected_returns, risk_models
 
+from src.config.settings import settings
 from src.optimizer.portfolio import (
     _covariance_input,
     allocate_shares,
     apply_min_history_rule,
     compute_weights,
+    compute_weights_and_stats,
     load_latest_prices,
     pivot_returns_matrix,
 )
@@ -179,6 +183,143 @@ def test_compute_weights_mv_unreachable_target_raises_value_error():
 
     with pytest.raises(ValueError):
         compute_weights(df, "MV", target_annual_return=1.0)
+
+
+# ---------------------------------------------------------------------------
+# compute_weights_and_stats
+# ---------------------------------------------------------------------------
+
+
+def _spy_on_max_sharpe(monkeypatch) -> dict:
+    """Record the `risk_free_rate` PyPortfolioOpt's `max_sharpe` is actually
+    called with, while still running the real optimization.
+    """
+    seen: dict[str, float] = {}
+    real_max_sharpe = EfficientFrontier.max_sharpe
+
+    def spy(self, risk_free_rate=0.0):
+        seen["risk_free_rate"] = risk_free_rate
+        return real_max_sharpe(self, risk_free_rate=risk_free_rate)
+
+    monkeypatch.setattr("src.optimizer.portfolio.EfficientFrontier.max_sharpe", spy)
+    return seen
+
+
+def test_compute_weights_and_stats_msr_fits_at_the_configured_risk_free_rate(monkeypatch):
+    """MSR maximizes a Sharpe ratio, which is only defined relative to a
+    risk-free rate - so this project's configured rate must be the one
+    PyPortfolioOpt optimizes against, not its library default of 0.0.
+    """
+    seen = _spy_on_max_sharpe(monkeypatch)
+
+    stats = compute_weights_and_stats(_three_ticker_fixture(), "MSR")
+
+    assert seen["risk_free_rate"] == settings.risk_free_rate
+    assert stats.risk_free_rate == settings.risk_free_rate
+
+
+def test_compute_weights_msr_still_fits_at_zero_risk_free_rate(monkeypatch):
+    """The regression guard for src/flow/backtest.py: its 52-month run calls
+    `compute_weights`, whose MSR results must not move just because the
+    interactive path started fitting at a nonzero rate.
+    """
+    seen = _spy_on_max_sharpe(monkeypatch)
+
+    compute_weights(_three_ticker_fixture(), "MSR")
+
+    assert seen["risk_free_rate"] == 0.0
+
+
+def test_compute_weights_and_stats_honors_an_explicit_risk_free_rate_override(monkeypatch):
+    seen = _spy_on_max_sharpe(monkeypatch)
+
+    stats = compute_weights_and_stats(_three_ticker_fixture(), "MSR", risk_free_rate=0.05)
+
+    assert seen["risk_free_rate"] == 0.05
+    assert stats.risk_free_rate == 0.05
+
+
+def test_compute_weights_and_stats_sharpe_is_measured_against_the_risk_free_rate():
+    """The reported Sharpe ratio must be the reported return and volatility
+    combined with the reported rate - otherwise the four numbers printed
+    together would not describe one another.
+    """
+    stats = compute_weights_and_stats(_three_ticker_fixture(), "GMV", risk_free_rate=0.05)
+
+    expected = (stats.portfolio_expected_return - 0.05) / stats.portfolio_volatility
+    assert stats.portfolio_sharpe == pytest.approx(expected)
+
+
+def test_compute_weights_and_stats_per_ticker_figures_match_pypfopt_estimates():
+    """Verify the reported per-ticker figures against their definition -
+    annualized mean historical return, and the square root of the
+    shrunk covariance matrix's diagonal - computed independently here.
+    """
+    df = _three_ticker_fixture()
+    mu = expected_returns.mean_historical_return(df, returns_data=True, frequency=12)
+    cov_matrix = risk_models.CovarianceShrinkage(
+        _covariance_input(df), returns_data=True, frequency=12
+    ).ledoit_wolf()
+    expected_volatility = np.sqrt(np.diag(cov_matrix.to_numpy()))
+
+    stats = compute_weights_and_stats(df, "GMV")
+
+    assert stats.expected_returns == pytest.approx(mu.to_dict())
+    assert stats.volatility == pytest.approx(dict(zip(cov_matrix.columns, expected_volatility)))
+    # Every considered ticker is reported, including ones GMV gave no weight.
+    assert set(stats.expected_returns) == {"STABLE", "RISKY_A", "RISKY_B"}
+
+
+def test_compute_weights_and_stats_portfolio_figures_match_a_directly_fitted_frontier():
+    df = _three_ticker_fixture()
+    mu = expected_returns.mean_historical_return(df, returns_data=True, frequency=12)
+    cov_matrix = risk_models.CovarianceShrinkage(
+        _covariance_input(df), returns_data=True, frequency=12
+    ).ledoit_wolf()
+    ef = EfficientFrontier(mu, cov_matrix)
+    ef.min_volatility()
+    expected_return, expected_vol, expected_sharpe = ef.portfolio_performance(
+        risk_free_rate=settings.risk_free_rate
+    )
+
+    stats = compute_weights_and_stats(df, "GMV")
+
+    assert stats.portfolio_expected_return == pytest.approx(expected_return)
+    assert stats.portfolio_volatility == pytest.approx(expected_vol)
+    assert stats.portfolio_sharpe == pytest.approx(expected_sharpe)
+
+
+def test_compute_weights_and_stats_gmv_weights_match_compute_weights():
+    """GMV ignores expected returns and the risk-free rate entirely, so the
+    two entry points must agree exactly - the check that extracting the
+    shared `_fit_efficient_frontier` helper changed no arithmetic.
+    """
+    df = _three_ticker_fixture()
+
+    assert compute_weights_and_stats(df, "GMV").weights == pytest.approx(compute_weights(df, "GMV"))
+
+
+def test_compute_weights_and_stats_mv_reaches_its_target_return():
+    df = _three_ticker_fixture()
+
+    stats = compute_weights_and_stats(df, "MV", target_annual_return=0.10)
+
+    assert stats.target_annual_return == 0.10
+    assert stats.portfolio_expected_return == pytest.approx(0.10, abs=1e-4)
+
+
+def test_compute_weights_and_stats_echoes_target_return_even_when_unused():
+    """The field is always populated so a caller can report it beside the
+    objective; it is meaningful only for MV.
+    """
+    stats = compute_weights_and_stats(_three_ticker_fixture(), "GMV", target_annual_return=0.07)
+
+    assert stats.target_annual_return == 0.07
+
+
+def test_compute_weights_and_stats_invalid_objective_raises_value_error():
+    with pytest.raises(ValueError):
+        compute_weights_and_stats(_three_ticker_fixture(), "BOGUS")
 
 
 def test_load_latest_prices_returns_nearest_on_or_before(tmp_path):

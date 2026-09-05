@@ -35,12 +35,14 @@ import pytest
 from src.agents.llm_s_schema import ScreeningRule
 from src.flow.backtest import _gross_return, _turnover_cost, compute_sharpe_ratio
 from src.flow.interactive import (
+    compute_weights_and_allocation,
     edit_candidates,
     open_pipeline_session,
     run_pipeline,
     run_scan,
     validate_and_edit_candidates,
 )
+from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
 # ---------------------------------------------------------------------------
 # edit_candidates
@@ -177,6 +179,69 @@ def test_run_pipeline_llm_s_and_f_calls_both_agents(tmp_path, monkeypatch):
 def test_run_pipeline_invalid_selection_raises_value_error():
     with pytest.raises(ValueError, match="selection"):
         run_pipeline(date(2024, 3, 1), "GMV", 1000.0, selection="bogus")
+
+
+# ---------------------------------------------------------------------------
+# PortfolioStats and target-return threading
+# ---------------------------------------------------------------------------
+
+
+def test_compute_weights_and_allocation_returns_portfolio_stats(tmp_path):
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+
+    stats, allocation = compute_weights_and_allocation(["AAA"], "GMV", 1000.0, date(2024, 3, 1), db_path)
+
+    assert isinstance(stats, PortfolioStats)
+    assert stats.weights == pytest.approx({"AAA": 1.0}, abs=1e-3)
+    # A single asset's portfolio figures are that asset's own figures.
+    assert stats.portfolio_expected_return == pytest.approx(stats.expected_returns["AAA"])
+    assert stats.portfolio_volatility == pytest.approx(stats.volatility["AAA"])
+    assert allocation[0] == {"AAA": 10}
+
+
+def test_run_pipeline_stats_agree_with_the_flat_weights_key(tmp_path, monkeypatch):
+    """`"weights"` stays a plain ticker-to-weight mapping for every existing
+    reader; `"stats"` is additive and must describe the same portfolio.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+
+    @contextmanager
+    def fake_snapshot(as_of, selection, source_db_path):
+        yield db_path
+
+    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
+
+    result = run_pipeline(
+        date(2024, 3, 1), "GMV", 1000.0, selection="user_provided", db_path=db_path, candidates=["AAA"]
+    )
+
+    assert isinstance(result["weights"], dict)
+    assert result["stats"].weights == result["weights"]
+    assert result["stats"].risk_free_rate == pytest.approx(0.02)
+
+
+def test_run_pipeline_target_return_defaults_and_can_be_overridden(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+
+    @contextmanager
+    def fake_snapshot(as_of, selection, source_db_path):
+        yield db_path
+
+    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
+
+    defaulted = run_pipeline(
+        date(2024, 3, 1), "MV", 1000.0, selection="user_provided", db_path=db_path, candidates=["AAA"]
+    )
+    overridden = run_pipeline(
+        date(2024, 3, 1), "MV", 1000.0, selection="user_provided", db_path=db_path, candidates=["AAA"],
+        target_annual_return=0.05,
+    )
+
+    assert defaulted["stats"].target_annual_return == DEFAULT_TARGET_ANNUAL_RETURN
+    assert overridden["stats"].target_annual_return == 0.05
 
 
 # ---------------------------------------------------------------------------

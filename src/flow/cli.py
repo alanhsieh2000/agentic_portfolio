@@ -1,19 +1,21 @@
 """CLI entry point for `plans/06_interactive_flow.md`'s backtest and live
 modes: `uv run python -m src.flow.cli --date YYYY-MM-DD|today --objective
-GMV|MV|MSR --value 100000
+GMV|MV|MSR --value 100000 [--target-return 0.12] [--risk-free-rate 0.02]
 [--selection llm_s_only|llm_f_only|llm_s_and_f|user_provided]`.
 
 Prints the initial pipeline result - which mode ran, LLM-S's rule (if
-run), the scanner's branch and candidate list, the weights, and the share
-allocation - so a person can see why each ticker is or is not a candidate,
-not just the final number of shares. Then enters an interactive loop
-letting the user add/remove candidate tickers or change the objective;
-each edit re-runs only `compute_weights_and_allocation` (never LLM-S or
-LLM-F again - the user is overriding the agents' already-given
-recommendation, not asking them to reconsider it) and reprints the
-updated candidates, weights, and allocation. `open_pipeline_session` keeps
-live mode's throwaway snapshot alive for this entire loop, not just the
-initial run.
+run), the scanner's branch and candidate list, the weights, the expected
+return/volatility behind them, the portfolio's own expected return,
+volatility and Sharpe ratio, and the share allocation - so a person can
+see why each ticker is or is not a candidate and what the optimizer
+expected of the ones it kept, not just the final number of shares. Then
+enters an interactive loop letting the user add/remove candidate tickers,
+change the objective, or change MV's target return; each edit re-runs only
+`compute_weights_and_allocation` (never LLM-S or LLM-F again - the user is
+overriding the agents' already-given recommendation, not asking them to
+reconsider it) and reprints the updated candidates, weights, and
+allocation. `open_pipeline_session` keeps live mode's throwaway snapshot
+alive for this entire loop, not just the initial run.
 
 `--selection user_provided` runs neither agent. It instead shows the
 candidate pool persisted at `--memory-path` (`memory/candidates.json` by
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 from datetime import date
 
+from src.config.settings import settings
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.candidate_memory import DEFAULT_CANDIDATES_PATH, load_candidate_pool, save_candidate_pool
 from src.flow.interactive import (
@@ -38,19 +41,47 @@ from src.flow.interactive import (
     run_pipeline_against,
     validate_and_edit_candidates,
 )
-from src.optimizer.portfolio import VALID_OBJECTIVES
+from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
 
 
 def _parse_date(value: str) -> date:
     return date.today() if value == "today" else date.fromisoformat(value)
 
 
-def print_weights_and_allocation(weights: dict[str, float], allocation: tuple[dict[str, int], float]) -> None:
-    """Human-readable rendering of one `compute_weights_and_allocation` result."""
+def print_weights_and_allocation(
+    stats: PortfolioStats,
+    allocation: tuple[dict[str, int], float],
+    objective: str,
+) -> None:
+    """Human-readable rendering of one `compute_weights_and_allocation`
+    result, including the figures the optimizer decided from.
+
+    The per-ticker expected-return/volatility lines cover only the tickers
+    that actually received weight, in the same order as the weights above
+    them, so the two sections read side by side - `stats` itself carries
+    every considered ticker's figures, including the rejected ones. The
+    target-return line is printed for every objective, saying so explicitly
+    when it does not apply, so its presence and position never depend on
+    which objective ran.
+    """
+    held = [ticker for ticker, weight in sorted(stats.weights.items(), key=lambda kv: -kv[1]) if weight > 0]
+
     print("\nWeights:")
-    for ticker, weight in sorted(weights.items(), key=lambda kv: -kv[1]):
-        if weight > 0:
-            print(f"  {ticker}: {weight:.4f}")
+    for ticker in held:
+        print(f"  {ticker}: {stats.weights[ticker]:.4f}")
+
+    print("\nExpected return / volatility (annualized):")
+    for ticker in held:
+        print(f"  {ticker}: return={stats.expected_returns[ticker]:.4f}  volatility={stats.volatility[ticker]:.4f}")
+
+    print(f"\nPortfolio expected return: {stats.portfolio_expected_return:.4f}  "
+          f"Portfolio volatility: {stats.portfolio_volatility:.4f}  "
+          f"Portfolio Sharpe: {stats.portfolio_sharpe:.4f}")
+    print(f"Risk-free rate used: {stats.risk_free_rate:.4f}")
+    if objective == "MV":
+        print(f"Target annual return: {stats.target_annual_return:.4f}")
+    else:
+        print(f"Target annual return: n/a (objective is {objective}, not MV)")
 
     shares, leftover_cash = allocation
     print("\nShare allocation:")
@@ -77,7 +108,7 @@ def print_pipeline_result(result: dict) -> None:
           f"intersection={scan_detail['intersection_size']} union={scan_detail['union_size']})")
     print(f"Candidates ({len(scan_detail['candidates'])}): {', '.join(scan_detail['candidates'])}")
 
-    print_weights_and_allocation(result["weights"], result["allocation"])
+    print_weights_and_allocation(result["stats"], result["allocation"], result["objective"])
 
 
 def _print_add_outcome(valid_added: list[str], invalid: dict[str, str]) -> None:
@@ -154,6 +185,22 @@ def _run_user_provided_confirm_loop(
         print(f"Candidate pool ({len(pool)}): {', '.join(pool)}")
 
 
+def _prompt_target_return(prompt: str, current: float) -> float:
+    """Ask for a new MV target annual return, returning `current` unchanged
+    when the user presses enter or types something unparseable - the same
+    keep-what-you-had treatment the objective prompt gives a rejected edit.
+    An unchanged value is what lets the caller skip a pointless recompute.
+    """
+    raw = input(prompt).strip()
+    if not raw:
+        return current
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"Unrecognized target return {raw!r}; keeping {current!r}.")
+        return current
+
+
 def _run_edit_loop(
     candidates: list[str],
     objective: str,
@@ -162,9 +209,11 @@ def _run_edit_loop(
     db_path: str,
     selection: str = "llm_s_only",
     memory_path: str = DEFAULT_CANDIDATES_PATH,
+    target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+    risk_free_rate: float = settings.risk_free_rate,
 ) -> None:
-    """Prompt in a loop for add/remove/objective/finish; each edit
-    recomputes weights and allocation against the current `candidates`
+    """Prompt in a loop for add/remove/objective/target-return/finish; each
+    edit recomputes weights and allocation against the current `candidates`
     and reprints them. Returns when the user chooses to finish.
 
     For `selection="user_provided"` an added ticker is validated and
@@ -172,17 +221,32 @@ def _run_edit_loop(
     same message it gets in the confirm loop), and every accepted edit is
     persisted to `memory_path` - unlike the other selections, whose
     candidate lists are one agent run's ephemeral output and are
-    deliberately never saved.
+    deliberately never saved. "Accepted" means the recompute succeeded, so
+    the save happens after it: an edit the optimizer rejects is reverted in
+    memory and must not survive on disk.
+
+    `target_annual_return` only means anything while `objective` is `"MV"`,
+    so the `[t]` choice explains itself and changes nothing under the other
+    two objectives, and switching to `"MV"` prompts for a target in the same
+    step - that switch is the moment the value starts to matter, and a user
+    who has never considered it would otherwise silently inherit whatever
+    default the command line supplied.
+
+    `risk_free_rate` is not editable here, but it must still be carried:
+    every recompute has to use the rate the command line supplied, or a
+    `--risk-free-rate` would apply to the initial run and then silently
+    revert to the configured default on the first edit.
     """
     while True:
         choice = input(
-            "\nEdit candidates? [a]dd tickers / [r]emove tickers / [o]bjective / [f]inish: "
+            "\nEdit candidates? [a]dd tickers / [r]emove tickers / [o]bjective / "
+            "[t]arget-return / [f]inish: "
         ).strip().lower()
 
         if choice in ("", "f", "finish"):
             return
 
-        previous_candidates = candidates
+        previous_candidates, previous_objective, previous_target = candidates, objective, target_annual_return
         if choice in ("a", "add"):
             raw = input("Ticker(s) to add (space-separated): ").strip().upper()
             if selection == "user_provided":
@@ -201,6 +265,20 @@ def _run_edit_loop(
                 print(f"Unrecognized objective {raw!r}; keeping {objective!r}.")
                 continue
             objective = raw
+            if objective == "MV":
+                target_annual_return = _prompt_target_return(
+                    f"Target annual return for MV (default {target_annual_return}): ", target_annual_return
+                )
+        elif choice in ("t", "target-return"):
+            if objective != "MV":
+                print(f"Target annual return applies only to objective MV; current objective is {objective!r}.")
+                continue
+            new_target = _prompt_target_return(
+                f"New target annual return (current {target_annual_return}): ", target_annual_return
+            )
+            if new_target == target_annual_return:
+                continue
+            target_annual_return = new_target
         else:
             print(f"Unrecognized choice {choice!r}.")
             continue
@@ -210,12 +288,28 @@ def _run_edit_loop(
             candidates = previous_candidates
             continue
 
+        print(f"\nCandidates ({len(candidates)}): {', '.join(candidates)}")
+        try:
+            stats, allocation = compute_weights_and_allocation(
+                candidates, objective, portfolio_value, rebalance_date, db_path,
+                target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
+            )
+        except ValueError as e:
+            # An edit can be individually valid and still leave the optimizer
+            # with nothing to solve - most easily by asking MV for a target
+            # return no combination of these candidates can reach. That is a
+            # rejected edit, not a failed session: this loop holds live mode's
+            # only snapshot open, so letting it escape would throw away the
+            # fetched data and the user's confirmed pool along with it.
+            print(f"Cannot optimize that edit: {e}")
+            print("Keeping the previous candidates, objective, and target return.")
+            candidates, objective, target_annual_return = previous_candidates, previous_objective, previous_target
+            continue
+
         if selection == "user_provided" and choice in ("a", "add", "r", "remove"):
             save_candidate_pool(candidates, path=memory_path)
 
-        print(f"\nCandidates ({len(candidates)}): {', '.join(candidates)}")
-        weights, allocation = compute_weights_and_allocation(candidates, objective, portfolio_value, rebalance_date, db_path)
-        print_weights_and_allocation(weights, allocation)
+        print_weights_and_allocation(stats, allocation, objective)
 
 
 def main() -> None:
@@ -224,6 +318,20 @@ def main() -> None:
     parser.add_argument("--objective", required=True, choices=VALID_OBJECTIVES)
     parser.add_argument("--value", required=True, type=float, help="Total portfolio value to allocate.")
     parser.add_argument("--selection", default="llm_s_only", choices=VALID_SELECTIONS)
+    parser.add_argument(
+        "--target-return",
+        type=float,
+        default=DEFAULT_TARGET_ANNUAL_RETURN,
+        help="Annual return --objective MV optimizes toward; ignored by GMV and MSR.",
+    )
+    parser.add_argument(
+        "--risk-free-rate",
+        type=float,
+        default=settings.risk_free_rate,
+        help="Rate --objective MSR maximizes its Sharpe ratio against, and that every "
+             "objective's reported Sharpe ratio is measured against. Defaults to the "
+             "configured RISK_FREE_RATE.",
+    )
     parser.add_argument("--db-path", default="data/portfolio.duckdb")
     parser.add_argument(
         "--memory-path",
@@ -246,13 +354,15 @@ def main() -> None:
 
         result = run_pipeline_against(
             rebalance_date, args.objective, args.value, args.selection, session_db_path, mode,
-            candidates=candidates,
+            candidates=candidates, target_annual_return=args.target_return,
+            risk_free_rate=args.risk_free_rate,
         )
         print_pipeline_result(result)
 
         _run_edit_loop(
             result["scan_detail"]["candidates"], args.objective, args.value, rebalance_date, session_db_path,
             selection=args.selection, memory_path=args.memory_path,
+            target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
         )
 
 

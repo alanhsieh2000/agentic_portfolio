@@ -31,7 +31,14 @@ from src.agents.llm_s_signals import screen
 from src.config.settings import settings
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.live import build_live_snapshot
-from src.optimizer.portfolio import allocate_shares, compute_weights, load_latest_prices, load_returns_matrix
+from src.optimizer.portfolio import (
+    DEFAULT_TARGET_ANNUAL_RETURN,
+    PortfolioStats,
+    allocate_shares,
+    compute_weights_and_stats,
+    load_latest_prices,
+    load_returns_matrix,
+)
 from src.scanner.candidate_scanner import scan_with_detail
 
 VALID_SELECTIONS = ("llm_s_only", "llm_f_only", "llm_s_and_f", "user_provided")
@@ -78,19 +85,26 @@ def compute_weights_and_allocation(
     portfolio_value: float,
     rebalance_date: date,
     db_path: str,
-) -> tuple[dict[str, float], tuple[dict[str, int], float]]:
-    """`compute_weights` + `allocate_shares` for `candidates` as of
+    target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+    risk_free_rate: float = settings.risk_free_rate,
+) -> tuple[PortfolioStats, tuple[dict[str, int], float]]:
+    """`compute_weights_and_stats` + `allocate_shares` for `candidates` as of
     `rebalance_date`, reading `db_path` - the part of the pipeline an
     interactive edit re-runs, deliberately never the two LLM agents, since
     editing the candidate list is the user overriding the agents' already-
     given recommendation, not asking them to reconsider it.
+
+    Returns the full `PortfolioStats` rather than only its weights so the CLI
+    can report the expected returns, volatilities, and Sharpe ratio behind an
+    allocation. `target_annual_return` applies only to `objective="MV"`, the
+    one objective defined by a target.
     """
     returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
-    weights = compute_weights(returns_matrix, objective)
+    stats = compute_weights_and_stats(returns_matrix, objective, target_annual_return, risk_free_rate)
 
-    latest_prices = load_latest_prices(list(weights.keys()), as_of=rebalance_date, db_path=db_path)
-    allocation = allocate_shares(weights, latest_prices, portfolio_value)
-    return weights, allocation
+    latest_prices = load_latest_prices(list(stats.weights.keys()), as_of=rebalance_date, db_path=db_path)
+    allocation = allocate_shares(stats.weights, latest_prices, portfolio_value)
+    return stats, allocation
 
 
 def run_scan(
@@ -165,6 +179,8 @@ def run_pipeline_against(
     mode: str,
     rule: ScreeningRule | None = None,
     candidates: list[str] | None = None,
+    target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+    risk_free_rate: float = settings.risk_free_rate,
 ) -> dict:
     """The shared sequence behind both modes: `run_scan` (LLM-S/LLM-F/the
     scanner) followed by the optimizer (`compute_weights_and_allocation`)
@@ -175,10 +191,15 @@ def run_pipeline_against(
     subsequent edit, without repeating LLM-S/LLM-F/the scanner. `rule` and
     `candidates` are passed straight through to `run_scan` - see its
     docstring.
+
+    `"weights"` stays a plain ticker-to-weight mapping, which is what every
+    caller reading that key means by it; the `PortfolioStats` carrying the
+    figures behind those weights is added alongside it under `"stats"`.
     """
     scan = run_scan(rebalance_date, selection, db_path, rule=rule, candidates=candidates)
-    weights, allocation = compute_weights_and_allocation(
-        scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date, db_path
+    stats, allocation = compute_weights_and_allocation(
+        scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date, db_path,
+        target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
     )
 
     return {
@@ -187,8 +208,9 @@ def run_pipeline_against(
         "objective": objective,
         "selection": selection,
         **scan,
-        "weights": weights,
+        "weights": stats.weights,
         "allocation": allocation,
+        "stats": stats,
     }
 
 
@@ -241,6 +263,8 @@ def run_pipeline(
     selection: str = "llm_s_only",
     db_path: str = "data/portfolio.duckdb",
     candidates: list[str] | None = None,
+    target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+    risk_free_rate: float = settings.risk_free_rate,
 ) -> dict:
     """Run the full pipeline for one `rebalance_date`, as a single,
     self-contained call - see `open_pipeline_session` for a CLI-style
@@ -267,19 +291,26 @@ def run_pipeline(
     used there only as the source of the static `news_articles_hf` archive
     `screen_month` needs.
 
+    `target_annual_return` is the annual return `objective="MV"` optimizes
+    toward and is ignored by the other two objectives; `risk_free_rate` is
+    the rate MSR maximizes its Sharpe ratio against and that every objective's
+    reported Sharpe ratio is measured against.
+
     Returns a dict bundling every intermediate result: `mode`
     (`"backtest"` or `"live"`), `rule` (LLM-S's `ScreeningRule`, `None` if
     skipped), `llm_s_signals`/`llm_f_signals` (each a `ticker`/`signal`
     DataFrame, `None` if skipped), `scan_detail` (`scan_with_detail`'s full
-    output, including the branch taken), `weights`, and `allocation` (the
-    `(shares_per_ticker, leftover_cash)` tuple from `allocate_shares`) - so
-    a CLI layer can display why each ticker is or is not a candidate, not
-    just the final share counts.
+    output, including the branch taken), `weights`, `allocation` (the
+    `(shares_per_ticker, leftover_cash)` tuple from `allocate_shares`), and
+    `stats` (the `PortfolioStats` behind those weights) - so a CLI layer can
+    display why each ticker is or is not a candidate, and what the optimizer
+    expected of the ones it kept, not just the final share counts.
     """
     if selection not in VALID_SELECTIONS:
         raise ValueError(f"selection must be one of {VALID_SELECTIONS}, got {selection!r}")
 
     with open_pipeline_session(rebalance_date, selection, db_path) as (effective_db_path, mode):
         return run_pipeline_against(
-            rebalance_date, objective, portfolio_value, selection, effective_db_path, mode, candidates=candidates
+            rebalance_date, objective, portfolio_value, selection, effective_db_path, mode,
+            candidates=candidates, target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
         )

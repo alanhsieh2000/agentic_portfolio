@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from typing import NamedTuple
 
 import duckdb
 import numpy as np
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 VALID_OBJECTIVES = ("GMV", "MV", "MSR")
 MV_RETURN_TOLERANCE = 1e-4
+DEFAULT_TARGET_ANNUAL_RETURN = 0.12
 
 
 def _load_window_dates(as_of: date, lookback_months: int, db_path: str) -> list[pd.Timestamp]:
@@ -217,16 +219,22 @@ def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFr
         )
 
 
-def compute_weights(
+def _fit_efficient_frontier(
     returns_matrix: pd.DataFrame,
     objective: str,
-    target_annual_return: float = 0.12,
-) -> dict[str, float]:
-    """GMV/MV/MSR portfolio weights from `returns_matrix` (as produced by
-    `load_returns_matrix`), per plan 5's Decision Log and Plan of Work, and
-    per README.md's Backtest Mode Stage 2 spec (annualized expected_returns
-    and cov_matrix, 12% annual MV target return) as resolved by
-    `plans/08_consistency_review.md` findings 6 and 7.
+    target_annual_return: float,
+    risk_free_rate: float,
+) -> tuple[EfficientFrontier, pd.Series, pd.DataFrame]:
+    """Estimate `mu`/`cov_matrix` from `returns_matrix` and solve `objective`,
+    returning the fitted `EfficientFrontier` alongside both estimates.
+
+    Shared by `compute_weights` and `compute_weights_and_stats` so the
+    estimation and the GMV/MV/MSR dispatch exist in exactly one place, even
+    though those two callers deliberately pass different `risk_free_rate`
+    values (see each one's docstring). Only the MSR branch consumes
+    `risk_free_rate`: `min_volatility` ignores expected returns entirely and
+    `efficient_return` is defined purely by its target, so neither takes such
+    a parameter.
 
     `mu` and `cov_matrix` are estimated with `frequency=12`, PyPortfolioOpt's
     annualization multiplier, so a monthly `returns_matrix` (as produced by
@@ -234,11 +242,9 @@ def compute_weights(
     comparable to `target_annual_return`. This makes every quantity
     `EfficientFrontier` reports (`mu`, `cov_matrix`, and `efficient_return`'s
     realized return) annual, not monthly - the realized per-month portfolio
-    return used elsewhere in this project (e.g. backtest scoring) is
-    computed separately, directly from the shared `returns` table's monthly
-    figures, and is unaffected by this annualization since `compute_weights`
-    only ever returns weights, never a return figure of its own except
-    through `_validate_efficient_return_result`'s internal check above.
+    return used elsewhere in this project (e.g. backtest scoring) is computed
+    separately, directly from the shared `returns` table's monthly figures,
+    and is unaffected by this annualization.
     """
     if objective not in VALID_OBJECTIVES:
         raise ValueError(f"objective must be one of {VALID_OBJECTIVES}, got {objective!r}")
@@ -252,16 +258,123 @@ def compute_weights(
     if objective == "GMV":
         ef.min_volatility()
     elif objective == "MSR":
-        ef.max_sharpe()
+        ef.max_sharpe(risk_free_rate=risk_free_rate)
     else:
         ef.efficient_return(target_return=float(target_annual_return))
 
+    return ef, mu, cov_matrix
+
+
+def compute_weights(
+    returns_matrix: pd.DataFrame,
+    objective: str,
+    target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+) -> dict[str, float]:
+    """GMV/MV/MSR portfolio weights from `returns_matrix` (as produced by
+    `load_returns_matrix`), per plan 5's Decision Log and Plan of Work, and
+    per README.md's Backtest Mode Stage 2 spec (annualized expected_returns
+    and cov_matrix, 12% annual MV target return) as resolved by
+    `plans/08_consistency_review.md` findings 6 and 7.
+
+    MSR is fitted at `risk_free_rate=0.0`, passed explicitly to state what
+    was previously implicit: this is PyPortfolioOpt's own default for
+    `max_sharpe`, so this function's numerical behavior is unchanged from
+    before `plans/10_performance_reporting_and_target_return.md`. Its caller
+    `src/flow/backtest.py` scores a whole 52-month run by computing its own
+    realized Sharpe ratio from actual monthly net returns against
+    `settings.risk_free_rate` (see that module's `compute_sharpe_ratio`), so
+    changing the rate the weights themselves are fitted at would silently
+    move every published backtest figure. `compute_weights_and_stats` is the
+    entry point that does fit at this project's configured rate, for the
+    interactive CLI path that also reports the resulting Sharpe ratio.
+    """
+    ef, _mu, _cov_matrix = _fit_efficient_frontier(
+        returns_matrix, objective, target_annual_return, risk_free_rate=0.0
+    )
     weights = dict(ef.clean_weights())
 
     if objective == "MV":
         _validate_efficient_return_result(weights, ef, target_annual_return)
 
     return weights
+
+
+class PortfolioStats(NamedTuple):
+    """One optimization's weights plus every figure needed to explain them.
+
+    `expected_returns` and `volatility` are annualized per-ticker estimates
+    covering *every* ticker in the returns matrix the optimizer considered,
+    not only the ones that received weight - narrowing to held tickers is a
+    display decision, made by `src/flow/cli.py`. `risk_free_rate` and
+    `target_annual_return` are echoed back verbatim so a caller can report
+    the inputs beside the outputs without tracking them separately;
+    `target_annual_return` is populated regardless of objective but is
+    meaningful only for MV, the one objective defined by it.
+    """
+
+    weights: dict[str, float]
+    expected_returns: dict[str, float]
+    volatility: dict[str, float]
+    portfolio_expected_return: float
+    portfolio_volatility: float
+    portfolio_sharpe: float
+    risk_free_rate: float
+    target_annual_return: float
+
+
+def compute_weights_and_stats(
+    returns_matrix: pd.DataFrame,
+    objective: str,
+    target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+    risk_free_rate: float = settings.risk_free_rate,
+) -> PortfolioStats:
+    """`compute_weights`'s result plus the estimates behind it, for a caller
+    that reports why a portfolio looks the way it does rather than only what
+    to buy - see `src/flow/cli.py`'s `print_weights_and_allocation`.
+
+    Unlike `compute_weights`, MSR is fitted at `risk_free_rate` (defaulting
+    to this project's configured `settings.risk_free_rate`) rather than at
+    zero, so the Sharpe ratio reported here is maximized against the same
+    rate it is measured against. Two consequences are worth knowing. A pool
+    whose every ticker has an expected annual return at or below
+    `risk_free_rate` makes MSR genuinely undefined, and PyPortfolioOpt
+    raises `ValueError` saying so - a real possibility once the rate is
+    nonzero, and left to propagate rather than masked, since silently
+    returning some other portfolio would misreport what was optimized. And
+    per-ticker volatility is the square root of `cov_matrix`'s diagonal;
+    `cov_matrix` comes from `_covariance_input`'s complete-overlap window,
+    so a partial-history ticker's volatility is estimated only from months
+    every ticker shares.
+
+    The three portfolio-level figures come from PyPortfolioOpt's
+    `portfolio_performance`, which reads the raw solved weights rather than
+    the rounded ones `clean_weights` returns in `weights`. The two differ
+    only below `clean_weights`'s 1e-4 cutoff and 5-decimal rounding, so the
+    reported figures describe the same portfolio to well beyond display
+    precision - but they are not recomputed from the rounded weights, which
+    is why a holding printed as 0.0000 can still be reflected in them.
+    """
+    ef, mu, cov_matrix = _fit_efficient_frontier(
+        returns_matrix, objective, target_annual_return, risk_free_rate
+    )
+    weights = dict(ef.clean_weights())
+
+    if objective == "MV":
+        _validate_efficient_return_result(weights, ef, target_annual_return)
+
+    volatility = pd.Series(np.sqrt(np.diag(cov_matrix.to_numpy())), index=cov_matrix.columns)
+    portfolio_return, portfolio_volatility, sharpe = ef.portfolio_performance(risk_free_rate=risk_free_rate)
+
+    return PortfolioStats(
+        weights=weights,
+        expected_returns={t: float(v) for t, v in mu.items()},
+        volatility={t: float(v) for t, v in volatility.items()},
+        portfolio_expected_return=float(portfolio_return),
+        portfolio_volatility=float(portfolio_volatility),
+        portfolio_sharpe=float(sharpe),
+        risk_free_rate=float(risk_free_rate),
+        target_annual_return=float(target_annual_return),
+    )
 
 
 def _load_prices_up_to(tickers: list[str], as_of: date, db_path: str) -> pd.DataFrame:
