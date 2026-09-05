@@ -310,6 +310,15 @@ class PortfolioStats(NamedTuple):
     the inputs beside the outputs without tracking them separately;
     `target_annual_return` is populated regardless of objective but is
     meaningful only for MV, the one objective defined by it.
+
+    `returns_window_start`, `returns_window_end`, and `returns_window_months`
+    describe the actual trailing window of monthly returns read from the
+    `returns` table for this optimization - derived from the returns
+    matrix's own date index, so they reflect the real months used even when
+    that is fewer than the configured `lookback_months` (a recent listing,
+    or a `returns` table that doesn't yet reach that far back). They are
+    independent of `apply_min_history_rule`'s per-ticker drops, which remove
+    columns, never rows.
     """
 
     weights: dict[str, float]
@@ -320,6 +329,9 @@ class PortfolioStats(NamedTuple):
     portfolio_sharpe: float
     risk_free_rate: float
     target_annual_return: float
+    returns_window_start: date
+    returns_window_end: date
+    returns_window_months: int
 
 
 def compute_weights_and_stats(
@@ -365,6 +377,8 @@ def compute_weights_and_stats(
     volatility = pd.Series(np.sqrt(np.diag(cov_matrix.to_numpy())), index=cov_matrix.columns)
     portfolio_return, portfolio_volatility, sharpe = ef.portfolio_performance(risk_free_rate=risk_free_rate)
 
+    window_index = returns_matrix.index
+
     return PortfolioStats(
         weights=weights,
         expected_returns={t: float(v) for t, v in mu.items()},
@@ -374,6 +388,9 @@ def compute_weights_and_stats(
         portfolio_sharpe=float(sharpe),
         risk_free_rate=float(risk_free_rate),
         target_annual_return=float(target_annual_return),
+        returns_window_start=window_index.min().date(),
+        returns_window_end=window_index.max().date(),
+        returns_window_months=len(window_index),
     )
 
 

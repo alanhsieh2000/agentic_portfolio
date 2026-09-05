@@ -317,6 +317,32 @@ def test_compute_weights_and_stats_echoes_target_return_even_when_unused():
     assert stats.target_annual_return == 0.07
 
 
+def test_compute_weights_and_stats_reports_the_actual_returns_window():
+    """The window is read off the returns matrix's own index rather than the
+    configured lookback, so it stays truthful when the available history is
+    shorter than that - here 24 months, not 60.
+    """
+    stats = compute_weights_and_stats(_three_ticker_fixture(), "GMV")
+
+    assert stats.returns_window_start == date(2020, 1, 1)
+    assert stats.returns_window_end == date(2021, 12, 1)
+    assert stats.returns_window_months == 24
+
+
+def test_compute_weights_and_stats_returns_window_survives_a_min_history_drop():
+    """`apply_min_history_rule` drops columns, never rows, so a dropped
+    ticker must not shrink the reported window.
+    """
+    df = _three_ticker_fixture()
+    df["NEWLY_LISTED"] = [np.nan] * 20 + [0.01, -0.01, 0.02, -0.02]
+
+    stats = compute_weights_and_stats(apply_min_history_rule(df, min_months=24), "GMV")
+
+    assert "NEWLY_LISTED" not in stats.expected_returns
+    assert stats.returns_window_start == date(2020, 1, 1)
+    assert stats.returns_window_months == 24
+
+
 def test_compute_weights_and_stats_invalid_objective_raises_value_error():
     with pytest.raises(ValueError):
         compute_weights_and_stats(_three_ticker_fixture(), "BOGUS")

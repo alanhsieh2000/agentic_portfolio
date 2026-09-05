@@ -88,9 +88,14 @@ def print_weights_and_allocation(
     `--value` that was allocated. It is printed first, because it qualifies
     everything below it, and it is printed here rather than in
     `print_pipeline_result`'s header because the interactive edit loop calls
-    this function directly and would otherwise never show it.
+    this function directly and would otherwise never show it. The returns
+    window line follows immediately for the same reason: it says which
+    months of history actually produced the figures below, and must reappear
+    after every interactive edit's recompute, not only on the initial run.
     """
     print(f"\nPortfolio currency: {currency} - --value is interpreted as {currency}")
+    print(f"Returns window: {stats.returns_window_start} to {stats.returns_window_end} "
+          f"({stats.returns_window_months} month(s) of monthly returns)")
 
     held = [ticker for ticker, weight in sorted(stats.weights.items(), key=lambda kv: -kv[1]) if weight > 0]
 

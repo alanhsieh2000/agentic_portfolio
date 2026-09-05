@@ -376,6 +376,9 @@ def _stats(**overrides) -> PortfolioStats:
         "portfolio_sharpe": 0.0,
         "risk_free_rate": 0.02,
         "target_annual_return": DEFAULT_TARGET_ANNUAL_RETURN,
+        "returns_window_start": date(2020, 5, 1),
+        "returns_window_end": date(2025, 4, 1),
+        "returns_window_months": 60,
     }
     return PortfolioStats(**{**fields, **overrides})
 
@@ -626,6 +629,7 @@ def test_print_weights_and_allocation_reports_the_figures_behind_the_weights(cap
     assert "Portfolio expected return: 0.1250  Portfolio volatility: 0.1600  Portfolio Sharpe: 0.6562" in out
     assert "Risk-free rate used: 0.0200" in out
     assert "Target annual return: 0.1250" in out
+    assert "Returns window: 2020-05-01 to 2025-04-01 (60 month(s) of monthly returns)" in out
     assert "Leftover cash: $12.34" in out
 
 
