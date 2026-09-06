@@ -52,27 +52,64 @@ def _load_window_dates(as_of: date, lookback_months: int, db_path: str) -> list[
     return sorted(pd.Timestamp(r[0]) for r in rows)
 
 
-def _load_returns_long(tickers: list[str], window_dates: list[pd.Timestamp], db_path: str) -> pd.DataFrame:
+RETURNS_LONG_COLUMNS = ["rebalance_date", "ticker", "monthly_return"]
+"""The column shape every `load_returns_long` result has, including an empty
+one - `pivot_returns_matrix` and every other consumer index into these names,
+so an empty frame must still carry them rather than being column-less."""
+
+
+def load_returns_long(
+    tickers: list[str],
+    window_start: pd.Timestamp | date | None,
+    window_end: pd.Timestamp | date | None,
+    db_path: str,
+    read_only: bool = False,
+) -> pd.DataFrame:
     """Long-format rows (['rebalance_date', 'ticker', 'monthly_return']) from
     the `returns` table for `tickers`, restricted to the closed date range
-    [window_dates[0], window_dates[-1]] - equivalent to restricting to
-    exactly `window_dates` because the `returns` table is a full cross
+    [`window_start`, `window_end`] - equivalent to restricting to an explicit
+    list of that range's months because the `returns` table is a full cross
     product of every ticker with every month in its own date sequence (see
     src/dataset/returns.py's build_month_ticker_grid), so every calendar
     month between the window's endpoints is guaranteed present with no
     gaps in the date sequence itself.
+
+    `window_end=None` means "no window at all" and yields the correctly-shaped
+    empty frame - what `load_returns_matrix` needs when the `returns` table
+    holds no month on or before its `as_of`. `window_start=None` means "no
+    lower bound", the whole available history up to `window_end`, which is
+    what `src/optimizer/benchmark.py` reads once per session so that every
+    window it reports afterwards is a pure in-memory slice.
+
+    `read_only=True` opens `db_path` read-only and reports a missing file or a
+    missing `returns` table as an empty frame instead of raising, so asking a
+    question about a database neither creates one nor takes a write lock on
+    it - the same discipline `src/dataset/ticker_currency.py`'s
+    `load_ticker_currencies` already follows, and what lets a benchmark read
+    the shared `data/portfolio.duckdb` cache with no risk of mutating it.
     """
-    if not window_dates:
-        return pd.DataFrame(columns=["rebalance_date", "ticker", "monthly_return"])
+    if window_end is None or not tickers:
+        return pd.DataFrame(columns=RETURNS_LONG_COLUMNS)
 
     placeholders = ", ".join(["?"] * len(tickers))
-    con = duckdb.connect(db_path)
+    clauses = [f"ticker IN ({placeholders})", "rebalance_date <= ?"]
+    params: list[object] = [*tickers, pd.Timestamp(window_end).date()]
+    if window_start is not None:
+        clauses.append("rebalance_date >= ?")
+        params.append(pd.Timestamp(window_start).date())
+
+    try:
+        con = duckdb.connect(db_path, read_only=True) if read_only else duckdb.connect(db_path)
+    except duckdb.IOException:
+        return pd.DataFrame(columns=RETURNS_LONG_COLUMNS)
     try:
         df = con.execute(
-            f"SELECT rebalance_date, ticker, monthly_return FROM returns "
-            f"WHERE ticker IN ({placeholders}) AND rebalance_date BETWEEN ? AND ?",
-            [*tickers, window_dates[0].date(), window_dates[-1].date()],
+            "SELECT rebalance_date, ticker, monthly_return FROM returns "
+            f"WHERE {' AND '.join(clauses)}",
+            params,
         ).fetchdf()
+    except duckdb.CatalogException:
+        return pd.DataFrame(columns=RETURNS_LONG_COLUMNS)
     finally:
         con.close()
     df["rebalance_date"] = pd.to_datetime(df["rebalance_date"])
@@ -153,7 +190,12 @@ def load_returns_matrix(
     and covariance-matrix estimation.
     """
     window_dates = _load_window_dates(as_of, lookback_months, db_path)
-    long_df = _load_returns_long(tickers, window_dates, db_path)
+    long_df = load_returns_long(
+        tickers,
+        window_dates[0] if window_dates else None,
+        window_dates[-1] if window_dates else None,
+        db_path,
+    )
     wide = pivot_returns_matrix(long_df, tickers, window_dates)
     return apply_min_history_rule(wide, min_months)
 

@@ -6,9 +6,11 @@ GMV|MV|MSR --value 100000 [--target-return 0.12] [--risk-free-rate 0.02]
 Prints the initial pipeline result - which mode ran, LLM-S's rule (if
 run), the scanner's branch and candidate list, the weights, the expected
 return/volatility behind them, the portfolio's own expected return,
-volatility and Sharpe ratio, and the share allocation - so a person can
-see why each ticker is or is not a candidate and what the optimizer
-expected of the ones it kept, not just the final number of shares. Then
+volatility and Sharpe ratio, the same three figures for the benchmark the
+pool is measured against, and the share allocation - so a person can see
+why each ticker is or is not a candidate, what the optimizer expected of
+the ones it kept, and whether all of it beat simply holding the market,
+not just the final number of shares. Then
 enters an interactive loop letting the user add/remove candidate tickers,
 change the objective, or change MV's target return; each edit re-runs only
 `compute_weights_and_allocation` (never LLM-S or LLM-F again - the user is
@@ -16,6 +18,12 @@ overriding the agents' already-given recommendation, not asking them to
 reconsider it) and reprints the updated candidates, weights, and
 allocation. `open_pipeline_session` keeps live mode's throwaway snapshot
 alive for this entire loop, not just the initial run.
+
+The benchmark defaults to whatever the pool recorded, else the currency's
+own default (`SPY` for USD), else - for a currency this project makes no
+assumption about - whatever the person is asked for once and thereafter
+remembered. `--benchmark` overrides it for a run, `[b]` changes it
+mid-session, and `--benchmark none` leaves the comparison out.
 
 `--selection user_provided` runs neither agent. It instead shows the
 candidate pool persisted at `--memory-path` (`memory/candidates.json` by
@@ -35,14 +43,27 @@ from datetime import date
 from src.config.settings import settings
 from src.dataset.ticker_currency import DEFAULT_CURRENCY, group_by_currency
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
-from src.flow.candidate_memory import DEFAULT_CANDIDATES_PATH, load_all_pools, save_candidate_pool
+from src.flow.candidate_memory import (
+    DEFAULT_CANDIDATES_PATH,
+    load_all_pools,
+    load_candidate_benchmark,
+    load_pool_benchmarks,
+    save_candidate_pool,
+)
 from src.flow.interactive import (
     VALID_SELECTIONS,
     compute_weights_and_allocation,
     edit_candidates,
     open_pipeline_session,
+    prepare_benchmark,
     run_pipeline_against,
     validate_and_edit_candidates,
+)
+from src.optimizer.benchmark import (
+    BenchmarkSource,
+    BenchmarkStats,
+    benchmark_stats_for_window,
+    resolve_benchmark_ticker,
 )
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
 
@@ -67,11 +88,44 @@ def format_money(amount: float, currency: str) -> str:
     return f"{CURRENCY_SYMBOLS.get(currency, '')}{amount:,.2f} {currency}"
 
 
+BENCHMARK_DISABLED = "none"
+"""The `--benchmark` value that switches the comparison off entirely, as
+opposed to naming a ticker or leaving the flag out (which takes the pool's
+recorded benchmark, or this currency's default, or asks).
+
+Distinguishing "off" from "none available" matters in the report: switched
+off prints no benchmark line at all, while none available prints a line
+saying so, because in the second case the person may well want to fix it.
+"""
+
+
+def format_benchmark(benchmark: BenchmarkStats, portfolio_window_months: int) -> str:
+    """The one report line that puts the benchmark's figures beside the
+    portfolio's, or explains why there are none.
+
+    The month count is always printed as "N of M" against the portfolio's own
+    window rather than being left implied, because the two can legitimately
+    differ - a benchmark that listed partway through the window is still worth
+    comparing against, but only if the reader can see that it covers fewer
+    months than the portfolio does.
+    """
+    label = f"Benchmark {benchmark.ticker}" if benchmark.ticker else "Benchmark"
+    if benchmark.unavailable_reason is not None:
+        return f"{label}: n/a - {benchmark.unavailable_reason}"
+    return (
+        f"{label}: return={benchmark.annual_return:.4f}  "
+        f"volatility={benchmark.annual_volatility:.4f}  "
+        f"Sharpe={benchmark.sharpe:.4f}  "
+        f"({benchmark.window_months} of {portfolio_window_months} month(s))"
+    )
+
+
 def print_weights_and_allocation(
     stats: PortfolioStats,
     allocation: tuple[dict[str, int], float],
     objective: str,
     currency: str = DEFAULT_CURRENCY,
+    benchmark: BenchmarkStats | None = None,
 ) -> None:
     """Human-readable rendering of one `compute_weights_and_allocation`
     result, including the figures the optimizer decided from.
@@ -92,6 +146,14 @@ def print_weights_and_allocation(
     window line follows immediately for the same reason: it says which
     months of history actually produced the figures below, and must reappear
     after every interactive edit's recompute, not only on the initial run.
+
+    `benchmark`, when given, is printed immediately beneath the portfolio's
+    own return/volatility/Sharpe line so the two triplets read side by side -
+    that adjacency is the whole point, since a portfolio's figures only mean
+    something next to what holding the market over the same months returned.
+    `None` prints nothing at all, which is both the default (so every caller
+    that never asked for a benchmark is unaffected) and what `--benchmark
+    none` produces.
     """
     print(f"\nPortfolio currency: {currency} - --value is interpreted as {currency}")
     print(f"Returns window: {stats.returns_window_start} to {stats.returns_window_end} "
@@ -110,6 +172,8 @@ def print_weights_and_allocation(
     print(f"\nPortfolio expected return: {stats.portfolio_expected_return:.4f}  "
           f"Portfolio volatility: {stats.portfolio_volatility:.4f}  "
           f"Portfolio Sharpe: {stats.portfolio_sharpe:.4f}")
+    if benchmark is not None:
+        print(format_benchmark(benchmark, stats.returns_window_months))
     print(f"Risk-free rate used: {stats.risk_free_rate:.4f}")
     if objective == "MV":
         print(f"Target annual return: {stats.target_annual_return:.4f}")
@@ -142,7 +206,8 @@ def print_pipeline_result(result: dict) -> None:
     print(f"Candidates ({len(scan_detail['candidates'])}): {', '.join(scan_detail['candidates'])}")
 
     print_weights_and_allocation(
-        result["stats"], result["allocation"], result["objective"], result["currency"]
+        result["stats"], result["allocation"], result["objective"], result["currency"],
+        benchmark=result.get("benchmark"),
     )
 
 
@@ -198,7 +263,9 @@ def _resolve_mixed_persisted_pool(pool: list[str], currencies: dict[str, str]) -
         print(f"Unrecognized currency {chosen!r}.")
 
 
-def _choose_pool_to_resume(pools: dict[str, list[str]]) -> tuple[list[str], str | None]:
+def _choose_pool_to_resume(
+    pools: dict[str, list[str]], benchmarks: dict[str, str | None] | None = None
+) -> tuple[list[str], str | None]:
     """Pick which saved pool this session works on, returning
     `(tickers, currency)`.
 
@@ -217,13 +284,21 @@ def _choose_pool_to_resume(pools: dict[str, list[str]]) -> tuple[list[str], str 
     leave a person with a USD pool no way to start a JPY one, since every
     Tokyo ticker they typed would be refused against the pool they were
     forced into.
+
+    `benchmarks` names each pool's recorded benchmark so the listing shows it
+    beside the tickers - which pool a person means to resume is often decided
+    by what it is measured against, and a pool with none recorded is about to
+    be asked about, so seeing that in advance is useful rather than noise.
     """
     if not pools:
         return [], None
 
+    benchmarks = benchmarks or {}
     print("\nSaved candidate pools:")
     for currency, tickers in sorted(pools.items()):
-        print(f"  {currency} ({len(tickers)}): {', '.join(tickers)}")
+        benchmark = benchmarks.get(currency)
+        count = f"{len(tickers)}, benchmark {benchmark}" if benchmark else str(len(tickers))
+        print(f"  {currency} ({count}): {', '.join(tickers)}")
 
     if len(pools) == 1:
         only_currency, only_tickers = next(iter(pools.items()))
@@ -270,7 +345,9 @@ def _run_user_provided_confirm_loop(
     ticker added to an empty pool establishes that currency and later adds
     are measured against it.
     """
-    initial_pool, resumed_currency = _choose_pool_to_resume(initial_pools)
+    initial_pool, resumed_currency = _choose_pool_to_resume(
+        initial_pools, load_pool_benchmarks(memory_path)
+    )
 
     pool, invalid, currencies = validate_and_ingest_tickers(initial_pool, rebalance_date, db_path)
     if invalid:
@@ -328,6 +405,98 @@ def _run_user_provided_confirm_loop(
         print(f"Candidate pool ({len(pool)}): {', '.join(pool)}")
 
 
+def _prompt_for_benchmark(
+    prompt: str,
+    currency: str,
+    rebalance_date: date,
+    db_path: str,
+    allow_fetch: bool,
+) -> BenchmarkSource | None:
+    """Ask for a benchmark ticker until one is usable or the person declines
+    with a blank answer, returning the PREPARED source rather than the bare
+    ticker.
+
+    Returning the source matters: validating an answer means resolving the
+    ticker and reading its return history anyway, so handing that back means
+    the fetch which proved the answer good is the same one the report then
+    uses, instead of a second identical round trip.
+
+    A blank answer returns `None`, which every caller reads as "leave things
+    as they were" - no benchmark at all on the first ask, or the previous one
+    when changing it mid-session.
+    """
+    while True:
+        raw = input(prompt).strip().upper()
+        if not raw:
+            return None
+
+        source = prepare_benchmark(raw, currency, rebalance_date, db_path, allow_fetch=allow_fetch)
+        if source.unavailable_reason is None:
+            print(f"Benchmark set to {source.ticker}.")
+            return source
+        print(f"Refused: {source.unavailable_reason}")
+
+
+def _settle_benchmark(
+    pool: list[str],
+    currency: str,
+    rebalance_date: date,
+    db_path: str,
+    override: str | None = None,
+    enabled: bool = True,
+    allow_fetch: bool = True,
+    pool_memory_path: str | None = None,
+) -> BenchmarkSource | None:
+    """Decide what this session's report compares the portfolio against, and
+    resolve it into the return history the report will slice.
+
+    Precedence is `resolve_benchmark_ticker`'s: this run's `--benchmark`, then
+    what the pool recorded, then the currency's default. Only if all three
+    come up empty - a pool in a currency `DEFAULT_BENCHMARKS` makes no
+    assumption about, which today is every currency but USD - is the person
+    asked, because guessing an index for them would quietly measure their
+    portfolio against something they never chose.
+
+    `pool_memory_path` is both where a recorded benchmark is read from and
+    the signal that this is a `user_provided` session: a selection whose
+    candidates come from an agent has no pool file to record a benchmark in
+    and nobody mid-conversation to ask, and is USD by construction anyway, so
+    it passes `None` and simply takes the default.
+
+    A benchmark is written to that file only when it was chosen EXPLICITLY -
+    named with `--benchmark` or typed at the prompt - never when it merely
+    came from `DEFAULT_BENCHMARKS`. That way the file records decisions
+    rather than defaults, and improving a default later still reaches every
+    pool that never made one.
+
+    `enabled=False` (from `--benchmark none`) returns `None`, which prints no
+    benchmark line at all rather than an explanation.
+    """
+    if not enabled:
+        return None
+
+    saved = load_candidate_benchmark(pool_memory_path, currency) if pool_memory_path else None
+    ticker = resolve_benchmark_ticker(currency, override=override, saved=saved)
+
+    if ticker is None:
+        if pool_memory_path is None:
+            return prepare_benchmark(None, currency, rebalance_date, db_path, allow_fetch=allow_fetch)
+
+        print(f"\nNo benchmark recorded for this {currency} pool.")
+        source = _prompt_for_benchmark(
+            "Benchmark ticker (blank to skip): ", currency, rebalance_date, db_path, allow_fetch
+        )
+        if source is None:
+            return prepare_benchmark(None, currency, rebalance_date, db_path, allow_fetch=allow_fetch)
+        save_candidate_pool(pool, path=pool_memory_path, currency=currency, benchmark=source.ticker)
+        return source
+
+    source = prepare_benchmark(ticker, currency, rebalance_date, db_path, allow_fetch=allow_fetch)
+    if pool_memory_path and override and source.unavailable_reason is None:
+        save_candidate_pool(pool, path=pool_memory_path, currency=currency, benchmark=source.ticker)
+    return source
+
+
 def _prompt_target_return(prompt: str, current: float) -> float:
     """Ask for a new MV target annual return, returning `current` unchanged
     when the user presses enter or types something unparseable - the same
@@ -355,8 +524,11 @@ def _run_edit_loop(
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
     currency: str = DEFAULT_CURRENCY,
+    benchmark: BenchmarkSource | None = None,
+    allow_benchmark_fetch: bool = True,
 ) -> None:
-    """Prompt in a loop for add/remove/objective/target-return/finish; each
+    """Prompt in a loop for add/remove/objective/target-return/benchmark/
+    finish; each
     edit recomputes weights and allocation against the current `candidates`
     and reprints them. Returns when the user chooses to finish.
 
@@ -380,11 +552,19 @@ def _run_edit_loop(
     every recompute has to use the rate the command line supplied, or a
     `--risk-free-rate` would apply to the initial run and then silently
     revert to the configured default on the first edit.
+
+    `benchmark` is carried for the same reason and re-narrowed to the
+    portfolio's window on every recompute, so the comparison line follows
+    each edit rather than describing the run as it was before it. `[b]`
+    changes it, prompting until an answer is usable; a refused or blank
+    answer keeps the benchmark already in force, the same keep-what-you-had
+    treatment `[o]bjective` gives a rejected edit. A benchmark chosen here is
+    always an explicit choice, so for `user_provided` it is persisted.
     """
     while True:
         choice = input(
             "\nEdit candidates? [a]dd tickers / [r]emove tickers / [o]bjective / "
-            "[t]arget-return / [f]inish: "
+            "[t]arget-return / [b]enchmark / [f]inish: "
         ).strip().lower()
 
         if choice in ("", "f", "finish"):
@@ -425,6 +605,19 @@ def _run_edit_loop(
             if new_target == target_annual_return:
                 continue
             target_annual_return = new_target
+        elif choice in ("b", "benchmark"):
+            current = benchmark.ticker if benchmark is not None else None
+            new_benchmark = _prompt_for_benchmark(
+                f"New benchmark ticker (current {current or 'none'}): ",
+                currency, rebalance_date, db_path, allow_benchmark_fetch,
+            )
+            if new_benchmark is None:
+                continue
+            benchmark = new_benchmark
+            if selection == "user_provided":
+                save_candidate_pool(
+                    candidates, path=memory_path, currency=currency, benchmark=benchmark.ticker
+                )
         else:
             print(f"Unrecognized choice {choice!r}.")
             continue
@@ -457,7 +650,12 @@ def _run_edit_loop(
         if selection == "user_provided" and choice in ("a", "add", "r", "remove"):
             save_candidate_pool(candidates, path=memory_path, currency=currency)
 
-        print_weights_and_allocation(stats, allocation, objective, currency)
+        print_weights_and_allocation(
+            stats, allocation, objective, currency,
+            benchmark=benchmark_stats_for_window(
+                benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
+            ),
+        )
 
 
 def main() -> None:
@@ -489,6 +687,23 @@ def main() -> None:
     )
     parser.add_argument("--db-path", default="data/portfolio.duckdb")
     parser.add_argument(
+        "--benchmark",
+        default=None,
+        help="Ticker the report compares the portfolio against, over the same months and with "
+             f"the same estimators - or '{BENCHMARK_DISABLED}' to leave the comparison out. "
+             "Defaults to the pool's recorded benchmark, else the currency's default (SPY for "
+             "USD); a pool in a currency with no default is asked for one. Must trade in the "
+             "portfolio's own currency. For --selection user_provided, a benchmark named here "
+             "is remembered with the pool.",
+    )
+    parser.add_argument(
+        "--no-benchmark-fetch",
+        action="store_true",
+        help="Take the benchmark only from returns this session's database already holds, "
+             "never by fetching. Keeps a backtest-window run entirely offline, at the cost of "
+             "reporting the benchmark as unavailable when the cache does not contain it.",
+    )
+    parser.add_argument(
         "--memory-path",
         default=DEFAULT_CANDIDATES_PATH,
         help="Which file the user_provided selection's candidate pools are persisted in - an "
@@ -499,6 +714,9 @@ def main() -> None:
     args = parser.parse_args()
 
     rebalance_date = _parse_date(args.date)
+
+    benchmark_enabled = args.benchmark != BENCHMARK_DISABLED
+    benchmark_override = args.benchmark if benchmark_enabled else None
 
     with open_pipeline_session(rebalance_date, args.selection, args.db_path) as (session_db_path, mode):
         candidates = None
@@ -511,10 +729,24 @@ def main() -> None:
                 memory_path=args.memory_path,
             )
 
+        # Settled after the confirm loop, never before: an empty pool has no
+        # currency until the first ticker is added, and the benchmark has to
+        # be measured against the currency the pool actually ended up in.
+        benchmark = _settle_benchmark(
+            candidates or [],
+            currency,
+            rebalance_date,
+            session_db_path,
+            override=benchmark_override,
+            enabled=benchmark_enabled,
+            allow_fetch=not args.no_benchmark_fetch,
+            pool_memory_path=args.memory_path if args.selection == "user_provided" else None,
+        )
+
         result = run_pipeline_against(
             rebalance_date, args.objective, args.value, args.selection, session_db_path, mode,
             candidates=candidates, target_annual_return=args.target_return,
-            risk_free_rate=args.risk_free_rate, currency=currency,
+            risk_free_rate=args.risk_free_rate, currency=currency, benchmark=benchmark,
         )
         print_pipeline_result(result)
 
@@ -522,7 +754,8 @@ def main() -> None:
             result["scan_detail"]["candidates"], args.objective, args.value, rebalance_date, session_db_path,
             selection=args.selection, memory_path=args.memory_path,
             target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
-            currency=currency,
+            currency=currency, benchmark=benchmark,
+            allow_benchmark_fetch=not args.no_benchmark_fetch,
         )
 
 

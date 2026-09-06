@@ -308,3 +308,25 @@ def test_build_returns_for_tickers_computes_from_prices_and_leaves_other_tickers
     august = returns.loc[returns["rebalance_date"] == pd.Timestamp("2026-08-03"), "monthly_return"]
     assert august.iloc[0] == 1.0  # 200/100 - 1
     assert ("OTHER", 0.42) in _read(db_path, "SELECT ticker, monthly_return FROM returns")
+
+
+def test_build_returns_for_tickers_survives_a_prices_table_with_no_rows(tmp_path):
+    """The shape that happens when every ticker in a batch fails to resolve -
+    a typo typed on its own, or a benchmark symbol that does not exist. The
+    ticker gets null returns, which is what `attach_nearest_price` documents
+    for a ticker with no price row.
+
+    This is a regression test for a real crash: DuckDB's `fetchdf()` types an
+    empty `ticker` column as `object` but a non-empty one as pandas' `str`,
+    and `pd.merge_asof` refused to join across that difference with
+    "MergeError: incompatible merge keys ... must be the same type". Every
+    other test of this function stubs it out or supplies prices, so nothing
+    caught it until a single unresolvable ticker was ingested on its own.
+    """
+    db_path = str(tmp_path / "session.duckdb")
+    upsert_prices_tables(_prices(), _unresolved(("ZZZZ", "no data")), ["ZZZZ"], db_path)
+
+    returns = build_returns_for_tickers(["ZZZZ"], db_path, start="2026-07-01", end="2026-08-31")
+
+    assert set(returns["ticker"]) == {"ZZZZ"}
+    assert returns["monthly_return"].isna().all()

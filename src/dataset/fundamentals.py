@@ -367,9 +367,21 @@ def attach_nearest_price(membership: pd.DataFrame, prices: pd.DataFrame) -> pd.D
 
     NOTE for future implementers of returns.py: reuse this function rather
     than reimplementing the same nearest-price-on-or-before-per-ticker join.
+
+    Both `ticker` columns are cast to pandas' string dtype before the join.
+    That is not cosmetic: DuckDB's `fetchdf()` returns `ticker` as `object`
+    dtype for an EMPTY result but as `str` dtype for a non-empty one, and
+    `pd.merge_asof` refuses to join across that difference with
+    "MergeError: incompatible merge keys ... must be the same type". Without
+    the cast, an empty `prices` table therefore crashes instead of yielding
+    the all-NaN prices this function's contract promises - which is exactly
+    what happens when every ticker in a batch fails to resolve (a typo'd
+    ticker typed on its own, or a benchmark symbol that does not exist).
     """
     m = membership.sort_values("rebalance_date")
     p = prices[["date", "ticker", "adj_close"]].sort_values("date")
+    m = m.assign(ticker=m["ticker"].astype(str))
+    p = p.assign(ticker=p["ticker"].astype(str))
     merged = pd.merge_asof(m, p, left_on="rebalance_date", right_on="date", by="ticker", direction="backward")
     merged.index = m.index
     return merged

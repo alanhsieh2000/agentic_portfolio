@@ -9,23 +9,30 @@ sequencing those shells are responsible for: when a pool is persisted, when
 an edit is refused, and which selections touch the candidate memory at all.
 Scripted input is fed via `builtins.input`; `validate_and_ingest_tickers`
 (the one call that would reach yfinance) and the optimizer step are
-monkeypatched, per AGENTS.md.
+monkeypatched, per AGENTS.md. The benchmark is monkeypatched at whichever
+seam a test is not about - `prepare_benchmark` when the sequencing around it
+is under test, `_settle_benchmark` when only `main`'s wiring is - since
+resolving one for real reaches yfinance too.
 """
 
 from contextlib import contextmanager
 from datetime import date
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 from src.flow.cli import (
     _choose_pool_to_resume,
     _run_edit_loop,
     _run_user_provided_confirm_loop,
+    _settle_benchmark,
+    format_benchmark,
     main,
     print_weights_and_allocation,
 )
 from src.config.settings import settings
+from src.optimizer.benchmark import BenchmarkSource, BenchmarkStats
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
 REBALANCE_DATE = date(2026, 9, 5)
@@ -660,7 +667,7 @@ def test_run_edit_loop_passes_the_currency_into_every_recompute(monkeypatch, stu
     printed: list[str] = []
     monkeypatch.setattr(
         "src.flow.cli.print_weights_and_allocation",
-        lambda stats, allocation, objective, currency=None: printed.append(currency),
+        lambda stats, allocation, objective, currency=None, **kwargs: printed.append(currency),
     )
     _fake_ingestion(monkeypatch)
     monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
@@ -719,9 +726,13 @@ def test_print_weights_and_allocation_marks_target_return_not_applicable_for_gmv
 # ---------------------------------------------------------------------------
 
 
-def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock]:
+def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
     """Stub everything `main` calls after argument parsing, returning the
-    `run_pipeline_against` and `_run_edit_loop` spies.
+    `run_pipeline_against`, `_run_edit_loop` and `_settle_benchmark` spies.
+
+    `_settle_benchmark` must be stubbed and not merely tolerated: left real,
+    it would resolve USD's default `SPY` and go to yfinance for its history,
+    putting a network call inside every one of these tests.
     """
 
     @contextmanager
@@ -730,15 +741,17 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock]:
 
     pipeline_spy = MagicMock(return_value={"scan_detail": {"candidates": ["AAPL"]}})
     edit_spy = MagicMock()
+    benchmark_spy = MagicMock(return_value=_benchmark_source("SPY"))
     monkeypatch.setattr("src.flow.cli.open_pipeline_session", fake_session)
     monkeypatch.setattr("src.flow.cli.run_pipeline_against", pipeline_spy)
     monkeypatch.setattr("src.flow.cli.print_pipeline_result", lambda result: None)
     monkeypatch.setattr("src.flow.cli._run_edit_loop", edit_spy)
-    return pipeline_spy, edit_spy
+    monkeypatch.setattr("src.flow.cli._settle_benchmark", benchmark_spy)
+    return pipeline_spy, edit_spy, benchmark_spy
 
 
 def test_main_threads_the_target_return_argument_into_the_pipeline_and_the_edit_loop(monkeypatch):
-    pipeline_spy, edit_spy = _stub_main_pipeline(monkeypatch)
+    pipeline_spy, edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
         "sys.argv",
         ["portfolio", "--date", "2024-03-01", "--objective", "MV", "--value", "1000", "--target-return", "0.09"],
@@ -751,7 +764,7 @@ def test_main_threads_the_target_return_argument_into_the_pipeline_and_the_edit_
 
 
 def test_main_target_return_defaults_when_the_argument_is_omitted(monkeypatch):
-    pipeline_spy, _edit_spy = _stub_main_pipeline(monkeypatch)
+    pipeline_spy, _edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
         "sys.argv", ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000"]
     )
@@ -766,7 +779,7 @@ def test_main_threads_the_risk_free_rate_argument_into_the_pipeline_and_the_edit
     initial run would silently revert to the configured default on the
     first interactive edit.
     """
-    pipeline_spy, edit_spy = _stub_main_pipeline(monkeypatch)
+    pipeline_spy, edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
         "sys.argv",
         ["portfolio", "--date", "2024-03-01", "--objective", "MSR", "--value", "1000",
@@ -780,7 +793,7 @@ def test_main_threads_the_risk_free_rate_argument_into_the_pipeline_and_the_edit
 
 
 def test_main_risk_free_rate_defaults_to_the_configured_setting(monkeypatch):
-    pipeline_spy, _edit_spy = _stub_main_pipeline(monkeypatch)
+    pipeline_spy, _edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
         "sys.argv", ["portfolio", "--date", "2024-03-01", "--objective", "MSR", "--value", "1000"]
     )
@@ -803,3 +816,438 @@ def test_run_edit_loop_carries_the_risk_free_rate_into_every_recompute(monkeypat
     )
 
     assert stub_optimizer.call_args.kwargs["risk_free_rate"] == 0.015
+
+
+# ---------------------------------------------------------------------------
+# the benchmark: report line, prompt, [b], and main's wiring
+# ---------------------------------------------------------------------------
+
+
+def _benchmark_source(ticker: str | None = "SPY", currency: str = "USD", reason: str | None = None):
+    """A `BenchmarkSource` standing in for one already resolved - the return
+    history is irrelevant wherever the source is passed through rather than
+    measured.
+    """
+    return BenchmarkSource(
+        ticker=ticker,
+        currency=currency,
+        monthly_returns=pd.Series(dtype=float, index=pd.DatetimeIndex([], name="rebalance_date")),
+        unavailable_reason=reason,
+    )
+
+
+def _benchmark_stats(**overrides) -> BenchmarkStats:
+    fields = {
+        "ticker": "SPY",
+        "currency": "USD",
+        "annual_return": 0.1225,
+        "annual_volatility": 0.1553,
+        "sharpe": 0.66,
+        "risk_free_rate": 0.02,
+        "window_start": date(2020, 5, 1),
+        "window_end": date(2025, 4, 1),
+        "window_months": 60,
+        "unavailable_reason": None,
+    }
+    return BenchmarkStats(**{**fields, **overrides})
+
+
+def _fake_benchmark_prepare(monkeypatch, outcomes: dict[str, str | None]) -> MagicMock:
+    """Stand in for `prepare_benchmark`: each ticker in `outcomes` maps to the
+    refusal reason it should come back with, or `None` for "usable".
+    """
+    spy = MagicMock(
+        side_effect=lambda ticker, currency, rebalance_date, db_path, allow_fetch=True: _benchmark_source(
+            ticker, currency, outcomes.get(ticker, f"{ticker} is unknown to this stub")
+        )
+    )
+    monkeypatch.setattr("src.flow.cli.prepare_benchmark", spy)
+    return spy
+
+
+def test_print_weights_and_allocation_reports_the_benchmark_line(capsys):
+    stats = _stats(weights={"SPY": 1.0}, expected_returns={"SPY": 0.13}, volatility={"SPY": 0.16})
+
+    print_weights_and_allocation(
+        stats, ({"SPY": 1}, 0.0), "GMV", "USD", benchmark=_benchmark_stats()
+    )
+
+    out = capsys.readouterr().out
+    assert "Benchmark SPY: return=0.1225  volatility=0.1553  Sharpe=0.6600  (60 of 60 month(s))" in out
+
+
+def test_the_benchmark_line_sits_directly_below_the_portfolios_own_figures(capsys):
+    """The adjacency is the point: the comparison only reads as a comparison
+    when the two triplets are on consecutive lines.
+    """
+    print_weights_and_allocation(_stats(), ({}, 0.0), "GMV", "USD", benchmark=_benchmark_stats())
+
+    lines = capsys.readouterr().out.splitlines()
+    portfolio_line = next(i for i, line in enumerate(lines) if line.startswith("Portfolio expected return:"))
+    assert lines[portfolio_line + 1].startswith("Benchmark SPY:")
+    assert lines[portfolio_line + 2].startswith("Risk-free rate used:")
+
+
+def test_print_weights_and_allocation_notes_a_shorter_benchmark_window(capsys):
+    print_weights_and_allocation(
+        _stats(), ({}, 0.0), "GMV", "USD", benchmark=_benchmark_stats(window_months=58)
+    )
+
+    assert "(58 of 60 month(s))" in capsys.readouterr().out
+
+
+def test_print_weights_and_allocation_prints_an_unavailable_benchmark_with_its_reason(capsys):
+    print_weights_and_allocation(
+        _stats(), ({}, 0.0), "GMV", "JPY",
+        benchmark=_benchmark_stats(
+            annual_return=None, annual_volatility=None, sharpe=None, window_months=0,
+            unavailable_reason="SPY trades in USD but this portfolio is JPY",
+        ),
+    )
+
+    out = capsys.readouterr().out
+    assert "Benchmark SPY: n/a - SPY trades in USD but this portfolio is JPY" in out
+
+
+def test_print_weights_and_allocation_omits_the_benchmark_line_when_there_is_none(capsys):
+    """Protects every caller that never asked for a benchmark, and is what
+    `--benchmark none` produces.
+    """
+    print_weights_and_allocation(_stats(), ({}, 0.0), "GMV", "USD")
+
+    assert "Benchmark" not in capsys.readouterr().out
+
+
+def test_format_benchmark_names_no_ticker_when_none_was_chosen():
+    line = format_benchmark(
+        _benchmark_stats(
+            ticker=None, annual_return=None, annual_volatility=None, sharpe=None, window_months=0,
+            unavailable_reason="no benchmark is set for this SGD portfolio",
+        ),
+        60,
+    )
+
+    assert line == "Benchmark: n/a - no benchmark is set for this SGD portfolio"
+
+
+def test_choose_pool_to_resume_shows_each_pools_benchmark(monkeypatch, capsys):
+    _script(monkeypatch, "USD")
+
+    _choose_pool_to_resume(
+        {"USD": ["AAPL", "SPY"], "JPY": ["7203.T"]}, {"USD": "SPY", "JPY": None}
+    )
+
+    out = capsys.readouterr().out
+    assert "USD (2, benchmark SPY): AAPL, SPY" in out
+    assert "JPY (1): 7203.T" in out
+
+
+def test_settle_benchmark_takes_the_currency_default_without_asking(monkeypatch):
+    prepare_spy = _fake_benchmark_prepare(monkeypatch, {"SPY": None})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    _script(monkeypatch)  # any input() call would raise StopIteration
+
+    source = _settle_benchmark(
+        ["AAPL"], "USD", REBALANCE_DATE, "session.duckdb", pool_memory_path="mem.json"
+    )
+
+    assert source.ticker == "SPY"
+    assert prepare_spy.call_args.args[0] == "SPY"
+    assert save_spy.called is False, "a default is never written into the pool file"
+
+
+def test_settle_benchmark_prefers_what_the_pool_recorded(monkeypatch):
+    _fake_benchmark_prepare(monkeypatch, {"VOO": None})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: "VOO")
+
+    source = _settle_benchmark(
+        ["AAPL"], "USD", REBALANCE_DATE, "session.duckdb", pool_memory_path="mem.json"
+    )
+
+    assert source.ticker == "VOO"
+
+
+def test_settle_benchmark_persists_an_explicit_override(monkeypatch):
+    _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+
+    _settle_benchmark(
+        ["AAPL"], "USD", REBALANCE_DATE, "session.duckdb",
+        override="QQQ", pool_memory_path="mem.json",
+    )
+
+    assert save_spy.call_args.kwargs["benchmark"] == "QQQ"
+    assert save_spy.call_args.kwargs["currency"] == "USD"
+
+
+def test_settle_benchmark_does_not_persist_an_override_that_was_refused(monkeypatch):
+    _fake_benchmark_prepare(monkeypatch, {"QQQ": "QQQ trades in USD but this portfolio is JPY"})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+
+    source = _settle_benchmark(
+        ["7203.T"], "JPY", REBALANCE_DATE, "session.duckdb",
+        override="QQQ", pool_memory_path="mem.json",
+    )
+
+    assert source.unavailable_reason is not None
+    assert save_spy.called is False
+
+
+def test_settle_benchmark_asks_when_the_currency_has_no_default(monkeypatch, capsys):
+    _fake_benchmark_prepare(monkeypatch, {"1306.T": None})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    _script(monkeypatch, "1306.t")
+
+    source = _settle_benchmark(
+        ["7203.T"], "JPY", REBALANCE_DATE, "session.duckdb", pool_memory_path="mem.json"
+    )
+
+    out = capsys.readouterr().out
+    assert "No benchmark recorded for this JPY pool." in out
+    assert "Benchmark set to 1306.T." in out
+    assert source.ticker == "1306.T"
+    assert save_spy.call_args.kwargs["benchmark"] == "1306.T"
+
+
+def test_settle_benchmark_refuses_a_wrong_currency_answer_and_asks_again(monkeypatch, capsys):
+    _fake_benchmark_prepare(
+        monkeypatch,
+        {"SPY": "SPY trades in USD but this portfolio is JPY", "1306.T": None},
+    )
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    _script(monkeypatch, "SPY", "1306.T")
+
+    source = _settle_benchmark(
+        ["7203.T"], "JPY", REBALANCE_DATE, "session.duckdb", pool_memory_path="mem.json"
+    )
+
+    out = capsys.readouterr().out
+    assert "Refused: SPY trades in USD but this portfolio is JPY" in out
+    assert source.ticker == "1306.T"
+
+
+def test_settle_benchmark_skips_on_a_blank_answer(monkeypatch):
+    prepare_spy = _fake_benchmark_prepare(monkeypatch, {})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    _script(monkeypatch, "")
+
+    _settle_benchmark(
+        ["7203.T"], "JPY", REBALANCE_DATE, "session.duckdb", pool_memory_path="mem.json"
+    )
+
+    assert prepare_spy.call_args.args[0] is None, "the skip is reported, not silently dropped"
+    assert save_spy.called is False
+
+
+def test_settle_benchmark_never_asks_a_selection_with_no_pool_file(monkeypatch):
+    """An agent-chosen candidate list has nowhere to record a benchmark and
+    nobody mid-conversation to ask, so it takes the default and moves on.
+    """
+    prepare_spy = _fake_benchmark_prepare(monkeypatch, {"SPY": None})
+    _script(monkeypatch)
+
+    source = _settle_benchmark(["AAPL"], "USD", REBALANCE_DATE, "session.duckdb")
+
+    assert source.ticker == "SPY"
+    assert prepare_spy.call_count == 1
+
+
+def test_settle_benchmark_disabled_returns_nothing(monkeypatch):
+    prepare_spy = _fake_benchmark_prepare(monkeypatch, {"SPY": None})
+
+    assert _settle_benchmark(["AAPL"], "USD", REBALANCE_DATE, "session.duckdb", enabled=False) is None
+    assert prepare_spy.called is False
+
+
+def test_settle_benchmark_threads_allow_fetch_through(monkeypatch):
+    prepare_spy = _fake_benchmark_prepare(monkeypatch, {"SPY": None})
+
+    _settle_benchmark(["AAPL"], "USD", REBALANCE_DATE, "session.duckdb", allow_fetch=False)
+
+    assert prepare_spy.call_args.kwargs["allow_fetch"] is False
+
+
+def test_run_edit_loop_reprints_the_benchmark_after_every_edit(monkeypatch, stub_optimizer):
+    """The comparison has to follow each edit, not describe the run as it was
+    before it - the same reason the returns-window line lives in
+    `print_weights_and_allocation` rather than the header.
+    """
+    printed: list[object] = []
+    monkeypatch.setattr(
+        "src.flow.cli.print_weights_and_allocation",
+        lambda *args, benchmark=None, **kwargs: printed.append(benchmark),
+    )
+    _fake_ingestion(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "NVDA", "r", "NVDA", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        benchmark=_benchmark_source("SPY"),
+    )
+
+    assert len(printed) == 2
+    assert all(b is not None and b.ticker == "SPY" for b in printed)
+
+
+def test_run_edit_loop_can_change_the_benchmark(monkeypatch, stub_optimizer, capsys):
+    printed: list[object] = []
+    monkeypatch.setattr(
+        "src.flow.cli.print_weights_and_allocation",
+        lambda *args, benchmark=None, **kwargs: printed.append(benchmark),
+    )
+    _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "b", "QQQ", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        benchmark=_benchmark_source("SPY"),
+    )
+
+    assert "Benchmark set to QQQ." in capsys.readouterr().out
+    assert [b.ticker for b in printed] == ["QQQ"]
+
+
+def test_run_edit_loop_keeps_the_previous_benchmark_when_a_new_one_fails(
+    monkeypatch, stub_optimizer, capsys
+):
+    """The same keep-what-you-had treatment `[o]bjective` gives a rejected
+    edit - and no recompute, since nothing changed.
+    """
+    printed: list[object] = []
+    monkeypatch.setattr(
+        "src.flow.cli.print_weights_and_allocation",
+        lambda *args, benchmark=None, **kwargs: printed.append(benchmark),
+    )
+    _fake_benchmark_prepare(monkeypatch, {"ZZZZ": "no price data found"})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "b", "ZZZZ", "", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        benchmark=_benchmark_source("SPY"),
+    )
+
+    assert "Refused: no price data found" in capsys.readouterr().out
+    assert printed == []
+
+
+def test_run_edit_loop_persists_a_changed_benchmark_for_user_provided(monkeypatch, stub_optimizer):
+    _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    _script(monkeypatch, "b", "QQQ", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        selection="user_provided", memory_path="mem.json",
+        benchmark=_benchmark_source("SPY"),
+    )
+
+    assert save_spy.call_args.kwargs["benchmark"] == "QQQ"
+    assert save_spy.call_args.kwargs["path"] == "mem.json"
+
+
+def test_run_edit_loop_non_user_provided_never_persists_a_benchmark(monkeypatch, stub_optimizer):
+    _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    _script(monkeypatch, "b", "QQQ", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        selection="llm_s_only", benchmark=_benchmark_source("SPY"),
+    )
+
+    assert save_spy.called is False
+
+
+def test_main_threads_the_benchmark_into_the_pipeline_and_the_edit_loop(monkeypatch):
+    pipeline_spy, edit_spy, benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--benchmark", "QQQ"],
+    )
+
+    main()
+
+    assert benchmark_spy.call_args.kwargs["override"] == "QQQ"
+    assert benchmark_spy.call_args.kwargs["enabled"] is True
+    assert pipeline_spy.call_args.kwargs["benchmark"] is benchmark_spy.return_value
+    assert edit_spy.call_args.kwargs["benchmark"] is benchmark_spy.return_value
+
+
+def test_main_defaults_the_benchmark_override_to_nothing(monkeypatch):
+    """Left out, the flag overrides nothing - the pool's own record and then
+    the currency's default decide.
+    """
+    _pipeline_spy, _edit_spy, benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "sys.argv", ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000"]
+    )
+
+    main()
+
+    assert benchmark_spy.call_args.kwargs["override"] is None
+    assert benchmark_spy.call_args.kwargs["enabled"] is True
+
+
+def test_main_benchmark_none_disables_the_comparison(monkeypatch):
+    pipeline_spy, edit_spy, benchmark_spy = _stub_main_pipeline(monkeypatch)
+    benchmark_spy.return_value = None
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--benchmark", "none"],
+    )
+
+    main()
+
+    assert benchmark_spy.call_args.kwargs["enabled"] is False
+    assert benchmark_spy.call_args.kwargs["override"] is None
+    assert pipeline_spy.call_args.kwargs["benchmark"] is None
+    assert edit_spy.call_args.kwargs["benchmark"] is None
+
+
+def test_main_no_benchmark_fetch_is_threaded_through(monkeypatch):
+    _pipeline_spy, edit_spy, benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--no-benchmark-fetch"],
+    )
+
+    main()
+
+    assert benchmark_spy.call_args.kwargs["allow_fetch"] is False
+    assert edit_spy.call_args.kwargs["allow_benchmark_fetch"] is False
+
+
+def test_main_only_offers_pool_memory_to_the_user_provided_selection(monkeypatch):
+    """An agent-chosen list must not be able to write a benchmark into a pool
+    file it does not own.
+    """
+    _pipeline_spy, _edit_spy, benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--selection", "llm_s_only"],
+    )
+
+    main()
+
+    assert benchmark_spy.call_args.kwargs["pool_memory_path"] is None

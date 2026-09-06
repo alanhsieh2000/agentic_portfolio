@@ -9,7 +9,10 @@ never writes to the shared cache) and `validate_and_ingest_tickers` (the
 one call that would otherwise reach yfinance).
 
 Per AGENTS.md, no test here calls yfinance's live API, any LLM, or hits
-`data/portfolio.duckdb`. `run_pipeline`'s selection-mode tests exercise
+`data/portfolio.duckdb`. `prepare_benchmark`'s tests monkeypatch the same
+ingestion seam plus `build_scratch_snapshot`, so the "benchmark rows land in
+their own database, never the session's" guarantee is asserted rather than
+assumed. `run_pipeline`'s selection-mode tests exercise
 the real `screen`/`scan_with_detail`/`load_returns_matrix`/
 `compute_weights`/`load_latest_prices`/`allocate_shares` chain against a
 small hand-built fixture DuckDB (mirroring `tests/test_llm_s.py`'s
@@ -26,6 +29,7 @@ manual runs recorded in `plans/06_interactive_flow.md`.
 
 from contextlib import contextmanager
 from datetime import date
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import duckdb
@@ -39,11 +43,14 @@ from src.flow.interactive import (
     compute_weights_and_allocation,
     edit_candidates,
     open_pipeline_session,
+    prepare_benchmark,
     run_pipeline,
     run_pipeline_against,
     run_scan,
     validate_and_edit_candidates,
 )
+from src.flow.live import build_scratch_snapshot
+from src.optimizer.benchmark import BENCHMARK_MIN_MONTHS, BenchmarkSource
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
 # ---------------------------------------------------------------------------
@@ -550,3 +557,223 @@ def test_compute_sharpe_ratio_uses_settings_default_risk_free_rate():
     expected = (net_returns.mean() - settings.risk_free_rate / 12) / net_returns.std() * (12**0.5)
 
     assert compute_sharpe_ratio(net_returns) == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# prepare_benchmark / build_scratch_snapshot
+# ---------------------------------------------------------------------------
+
+
+def _bench_months(n: int = 24, end: str = "2024-03-01") -> list[tuple[str, float]]:
+    """`n` (date, monthly_return) pairs on the month-start grid ending at
+    `end`, varying so the covariance is not degenerately zero.
+    """
+    months = pd.date_range(end=end, periods=n, freq="MS")
+    return [(m.date().isoformat(), 0.02 + (0.01 if i % 2 == 0 else -0.008)) for i, m in enumerate(months)]
+
+
+def _insert_returns(db_path: str, ticker: str, rows: list[tuple[str, float]]) -> None:
+    con = duckdb.connect(db_path)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS returns (rebalance_date DATE, ticker VARCHAR, monthly_return DOUBLE)")
+        con.executemany(f"INSERT INTO returns VALUES (?, '{ticker}', ?)", rows)
+    finally:
+        con.close()
+
+
+def _fake_benchmark_fetch(monkeypatch, scratch_db_path, rows, currency="USD", invalid=None, raises=None):
+    """Stand in for the yfinance round trip `prepare_benchmark` makes when a
+    benchmark is not already in the session database: `build_scratch_snapshot`
+    yields `scratch_db_path`, and the ingestion writes `rows` into whichever
+    database it is handed (which is how a test can prove those rows landed in
+    the scratch database and not the session's).
+    """
+
+    @contextmanager
+    def fake_scratch(prefix: str = "benchmark_snapshot_"):
+        yield scratch_db_path
+
+    def fake_ingest(tickers, as_of, db_path):
+        if raises is not None:
+            raise raises
+        if invalid:
+            return [], dict(invalid), {}
+        _insert_returns(db_path, tickers[0], rows)
+        return list(tickers), {}, {tickers[0]: currency}
+
+    monkeypatch.setattr("src.flow.interactive.build_scratch_snapshot", fake_scratch)
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fake_ingest)
+
+
+def test_prepare_benchmark_reads_existing_returns_without_fetching(tmp_path, monkeypatch):
+    """A benchmark the session database already has enough history for costs
+    nothing - no scratch database, no network call.
+    """
+    db_path = str(tmp_path / "session.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    ingest_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+
+    source = prepare_benchmark("AAA", "USD", date(2024, 3, 1), db_path)
+
+    assert ingest_spy.called is False
+    assert source.unavailable_reason is None
+    assert source.ticker == "AAA"
+    assert len(source.monthly_returns) == BENCHMARK_MIN_MONTHS
+
+
+def test_prepare_benchmark_fetches_into_a_scratch_database(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    scratch_path = str(tmp_path / "scratch.duckdb")
+    _fake_benchmark_fetch(monkeypatch, scratch_path, _bench_months())
+
+    source = prepare_benchmark("SPY", "USD", date(2024, 3, 1), db_path)
+
+    assert source.unavailable_reason is None
+    assert source.currency == "USD"
+    assert len(source.monthly_returns) == 24
+
+
+def test_prepare_benchmark_never_writes_to_the_session_database(tmp_path, monkeypatch):
+    """The structural guarantee: benchmark rows can never reach the database
+    the portfolio's own returns window is derived from.
+    """
+    db_path = tmp_path / "session.duckdb"
+    _build_fixture_db(str(db_path), include_factors=False)
+    before_mtime = db_path.stat().st_mtime_ns
+    scratch_path = str(tmp_path / "scratch.duckdb")
+    _fake_benchmark_fetch(monkeypatch, scratch_path, _bench_months())
+
+    prepare_benchmark("SPY", "USD", date(2024, 3, 1), str(db_path))
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        assert con.execute("SELECT count(*) FROM returns WHERE ticker = 'SPY'").fetchone()[0] == 0
+    finally:
+        con.close()
+    assert db_path.stat().st_mtime_ns == before_mtime
+
+
+def test_prepare_benchmark_refuses_a_benchmark_in_another_currency(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    _fake_benchmark_fetch(monkeypatch, str(tmp_path / "scratch.duckdb"), _bench_months(), currency="USD")
+
+    source = prepare_benchmark("SPY", "JPY", date(2024, 3, 1), db_path)
+
+    assert "USD" in source.unavailable_reason and "JPY" in source.unavailable_reason
+    assert "exchange-rate" in source.unavailable_reason
+    assert source.monthly_returns.empty
+
+
+def test_prepare_benchmark_reports_an_unresolvable_benchmark_without_raising(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    _fake_benchmark_fetch(
+        monkeypatch, str(tmp_path / "scratch.duckdb"), [], invalid={"ZZZZ": "no price data found"}
+    )
+
+    source = prepare_benchmark("ZZZZ", "USD", date(2024, 3, 1), db_path)
+
+    assert source.unavailable_reason == "no price data found"
+    assert source.ticker == "ZZZZ"
+
+
+def test_prepare_benchmark_survives_an_ingestion_exception(tmp_path, monkeypatch):
+    """Losing a live session's fetched snapshot over a benchmark would cost
+    far more than the benchmark is worth, so anything thrown becomes a line.
+    """
+    db_path = str(tmp_path / "session.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    _fake_benchmark_fetch(
+        monkeypatch, str(tmp_path / "scratch.duckdb"), [], raises=RuntimeError("yfinance exploded")
+    )
+
+    source = prepare_benchmark("SPY", "USD", date(2024, 3, 1), db_path)
+
+    assert "yfinance exploded" in source.unavailable_reason
+    assert source.ticker == "SPY"
+
+
+def test_prepare_benchmark_with_no_ticker_points_at_the_benchmark_flag(tmp_path):
+    source = prepare_benchmark(None, "SGD", date(2024, 3, 1), str(tmp_path / "absent.duckdb"))
+
+    assert source.ticker is None
+    assert "SGD" in source.unavailable_reason
+    assert "--benchmark" in source.unavailable_reason
+
+
+def test_prepare_benchmark_respects_allow_fetch_false(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    ingest_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+
+    source = prepare_benchmark("SPY", "USD", date(2024, 3, 1), db_path, allow_fetch=False)
+
+    assert ingest_spy.called is False
+    assert "--no-benchmark-fetch" in source.unavailable_reason
+
+
+def test_run_pipeline_against_reports_the_benchmark_and_gives_it_no_weight(tmp_path):
+    """The benchmark is reported over the portfolio's own window and is not a
+    holding - it never appears among the candidates or the weights.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+    months = pd.date_range(end="2024-03-01", periods=24, freq="MS", name="rebalance_date")
+    series = pd.Series([0.02 + (0.01 if i % 2 == 0 else -0.008) for i in range(24)], index=months, name="SPY")
+    source = BenchmarkSource("SPY", "USD", series, None)
+
+    result = run_pipeline_against(
+        date(2024, 3, 1), "GMV", 1000.0, "user_provided", db_path, "backtest",
+        candidates=["AAA"], benchmark=source,
+    )
+
+    benchmark = result["benchmark"]
+    assert benchmark.unavailable_reason is None
+    assert benchmark.ticker == "SPY"
+    assert benchmark.window_months == result["stats"].returns_window_months
+    assert benchmark.window_start == result["stats"].returns_window_start
+    assert benchmark.window_end == result["stats"].returns_window_end
+    assert benchmark.risk_free_rate == result["stats"].risk_free_rate
+    assert "SPY" not in result["scan_detail"]["candidates"]
+    assert "SPY" not in result["weights"]
+
+
+def test_run_pipeline_against_without_a_benchmark_source_reports_none(tmp_path):
+    """The library layer defaults to no benchmark, so no programmatic caller
+    acquires a network fetch it did not ask for.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _build_fixture_db(db_path, include_factors=False)
+
+    result = run_pipeline_against(
+        date(2024, 3, 1), "GMV", 1000.0, "user_provided", db_path, "backtest", candidates=["AAA"]
+    )
+
+    assert result["benchmark"] is None
+
+
+def test_build_scratch_snapshot_yields_empty_tables_and_always_deletes_the_file():
+    """`src/flow/live.py`'s scratch database: usable immediately by the
+    ingestion path, and gone afterwards even when the body raises.
+    """
+    with build_scratch_snapshot() as db_path:
+        con = duckdb.connect(db_path)
+        try:
+            for table in ("prices", "unresolved_tickers", "returns", "ticker_currency"):
+                assert con.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+        finally:
+            con.close()
+        held_path = db_path
+
+    assert not Path(held_path).exists()
+
+    with pytest.raises(RuntimeError):
+        with build_scratch_snapshot() as db_path:
+            failed_path = db_path
+            raise RuntimeError("boom")
+
+    assert not Path(failed_path).exists()

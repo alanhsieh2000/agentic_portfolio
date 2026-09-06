@@ -17,10 +17,18 @@ candidate lists), tearing it down only when the `with` block exits -
 `run_pipeline` itself is a single-call convenience wrapper around exactly
 one such session, for callers (a future backtest runner, tests) that only
 need one shot and never edit anything.
+
+`prepare_benchmark` is the third thing a session sets up, beside the
+snapshot and the candidates: the ticker standing in for "the market" in the
+report, resolved once into its whole monthly-return history so every
+subsequent recompute re-slices that history in memory. Its history is always
+fetched into a database of its own rather than the session's - see that
+function for why that is a correctness rule and not merely a tidy one.
 """
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from datetime import date
 from typing import NamedTuple
@@ -38,7 +46,14 @@ from src.dataset.ticker_currency import (
     partition_by_currency,
 )
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
-from src.flow.live import build_live_snapshot
+from src.flow.live import build_live_snapshot, build_scratch_snapshot
+from src.optimizer.benchmark import (
+    BENCHMARK_MIN_MONTHS,
+    BenchmarkSource,
+    benchmark_stats_for_window,
+    empty_benchmark_returns,
+    load_benchmark_returns,
+)
 from src.optimizer.portfolio import (
     DEFAULT_TARGET_ANNUAL_RETURN,
     PortfolioStats,
@@ -48,6 +63,8 @@ from src.optimizer.portfolio import (
     load_returns_matrix,
 )
 from src.scanner.candidate_scanner import scan_with_detail
+
+logger = logging.getLogger(__name__)
 
 VALID_SELECTIONS = ("llm_s_only", "llm_f_only", "llm_s_and_f", "user_provided")
 
@@ -105,6 +122,140 @@ def _require_single_currency(candidates: list[str], db_path: str) -> None:
         raise MixedCurrencyPoolError(
             f"refusing to build a portfolio that mixes currencies ({detail}). "
             "A portfolio cannot mix currencies; run them as separate portfolios."
+        )
+
+
+def _benchmark_currency_gate(
+    ticker: str, found_currency: str, pool_currency: str, monthly_returns
+) -> BenchmarkSource:
+    """A `BenchmarkSource` for `ticker`, refused when it does not trade in
+    `pool_currency`.
+
+    A benchmark in another currency is not arithmetically broken - a monthly
+    return is a ratio of one ticker's own prices, so it is a perfectly valid
+    number - it is the COMPARISON that breaks: `SPY`'s dollar return set
+    beside a yen portfolio's yen return differs by the year's yen/dollar
+    move, and the report would present that exchange-rate drift as though it
+    were the benchmark out- or under-performing. So it is declined by name
+    with the reason, exactly as a cross-currency candidate ticker is.
+    """
+    if found_currency != pool_currency:
+        return BenchmarkSource(
+            ticker=ticker,
+            currency=found_currency,
+            monthly_returns=empty_benchmark_returns(ticker),
+            unavailable_reason=(
+                f"{ticker} trades in {found_currency} but this portfolio is {pool_currency}; "
+                "comparing them would fold an exchange-rate move into the comparison"
+            ),
+        )
+    return BenchmarkSource(ticker, found_currency, monthly_returns, None)
+
+
+def _resolve_benchmark_source(
+    ticker: str, currency: str, rebalance_date: date, db_path: str, allow_fetch: bool
+) -> BenchmarkSource:
+    """`prepare_benchmark`'s body, split out so every failure mode it can
+    raise is caught in one place by its caller.
+
+    Reads `db_path` first because that read is free, offline and read-only,
+    and it hits whenever the benchmark is already a pool member (a JPY pool
+    benchmarked against `1321.T` that also holds it) or, in a future rebuilt
+    cache, already stored. Only when that yields less than
+    `BENCHMARK_MIN_MONTHS` of history - the same bar below which the report
+    would decline to print figures anyway - is a fetch worth making.
+    """
+    stored = load_benchmark_returns(ticker, rebalance_date, db_path)
+    if len(stored) >= BENCHMARK_MIN_MONTHS:
+        found = load_ticker_currencies([ticker], db_path).get(ticker, DEFAULT_CURRENCY)
+        return _benchmark_currency_gate(ticker, found, currency, stored)
+
+    if not allow_fetch:
+        return BenchmarkSource(
+            ticker=ticker,
+            currency=None,
+            monthly_returns=stored,
+            unavailable_reason=(
+                f"{ticker} has {len(stored)} month(s) of returns in this session's database "
+                "and fetching more was disabled with --no-benchmark-fetch"
+            ),
+        )
+
+    with build_scratch_snapshot() as scratch_db_path:
+        valid, invalid, currencies = validate_and_ingest_tickers([ticker], rebalance_date, scratch_db_path)
+        if ticker not in valid:
+            return BenchmarkSource(
+                ticker=ticker,
+                currency=None,
+                monthly_returns=empty_benchmark_returns(ticker),
+                unavailable_reason=invalid.get(ticker, f"{ticker} produced no usable price history"),
+            )
+        fetched = load_benchmark_returns(ticker, rebalance_date, scratch_db_path)
+        found = currencies.get(ticker, DEFAULT_CURRENCY)
+
+    return _benchmark_currency_gate(ticker, found, currency, fetched)
+
+
+def prepare_benchmark(
+    ticker: str | None,
+    currency: str,
+    rebalance_date: date,
+    db_path: str,
+    allow_fetch: bool = True,
+) -> BenchmarkSource:
+    """Resolve one benchmark ticker into the whole monthly-return history the
+    report will slice, once per session.
+
+    The history is fetched into its OWN throwaway database
+    (`build_scratch_snapshot`), never into `db_path`, and this is a
+    correctness requirement rather than tidiness. Two reasons. The shared
+    `data/portfolio.duckdb` cache holds the S&P 500 universe and must not
+    gain rows as a side effect of printing a report. And
+    `src/optimizer/portfolio.py`'s `_load_window_dates` derives the
+    portfolio's own returns window from `SELECT DISTINCT rebalance_date FROM
+    returns` - the whole table, not the candidate tickers - so writing
+    benchmark months into the session's database could move the very window
+    the benchmark is supposed to be measured over. Keeping the two databases
+    apart makes "the benchmark never influences the portfolio" structural
+    instead of a convention someone has to remember.
+
+    `ticker=None` is the "nobody chose a benchmark and no default applies to
+    this currency" case and comes back as an unavailable source naming how to
+    choose one - the report then prints that sentence instead of figures.
+    Turning benchmarking off entirely is a different thing, expressed by the
+    caller passing `None` where a `BenchmarkSource` is expected, which prints
+    no benchmark line at all.
+
+    `allow_fetch=False` restricts this to what `db_path` already holds, so a
+    backtest-window run against the cached historical tables stays exactly as
+    offline as it was before benchmarks existed.
+
+    Never raises. Anything that goes wrong - a yfinance error, a malformed
+    response, an unwritable temp directory - becomes an unavailable source
+    with the reason attached and a logged warning, because losing a live
+    session's fetched snapshot over a benchmark would cost far more than the
+    benchmark is worth.
+    """
+    if ticker is None:
+        return BenchmarkSource(
+            ticker=None,
+            currency=None,
+            monthly_returns=empty_benchmark_returns(),
+            unavailable_reason=(
+                f"no benchmark is set for this {currency} portfolio and none is assumed for "
+                f"{currency}; name one with --benchmark TICKER"
+            ),
+        )
+
+    try:
+        return _resolve_benchmark_source(ticker, currency, rebalance_date, db_path, allow_fetch)
+    except Exception as e:  # noqa: BLE001 - yfinance and duckdb raise assorted types here
+        logger.warning("could not prepare benchmark %s: %s", ticker, e)
+        return BenchmarkSource(
+            ticker=ticker,
+            currency=None,
+            monthly_returns=empty_benchmark_returns(ticker),
+            unavailable_reason=f"could not prepare {ticker} as a benchmark: {e}",
         )
 
 
@@ -221,6 +372,7 @@ def run_pipeline_against(
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
     currency: str = DEFAULT_CURRENCY,
+    benchmark: BenchmarkSource | None = None,
 ) -> dict:
     """The shared sequence behind both modes: `run_scan` (LLM-S/LLM-F/the
     scanner) followed by the optimizer (`compute_weights_and_allocation`)
@@ -235,6 +387,13 @@ def run_pipeline_against(
     `"weights"` stays a plain ticker-to-weight mapping, which is what every
     caller reading that key means by it; the `PortfolioStats` carrying the
     figures behind those weights is added alongside it under `"stats"`.
+
+    `benchmark` is an already-resolved `BenchmarkSource` (see
+    `prepare_benchmark`), narrowed here to the portfolio's own returns window
+    and reported under `"benchmark"`. It defaults to `None`, meaning no
+    benchmark, so no programmatic caller of this function ever acquires a
+    network fetch it did not ask for - applying a per-currency default is the
+    CLI's job, not this layer's.
     """
     scan = run_scan(rebalance_date, selection, db_path, rule=rule, candidates=candidates)
     stats, allocation = compute_weights_and_allocation(
@@ -252,6 +411,9 @@ def run_pipeline_against(
         "allocation": allocation,
         "stats": stats,
         "currency": currency,
+        "benchmark": benchmark_stats_for_window(
+            benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
+        ),
     }
 
 
@@ -361,6 +523,7 @@ def run_pipeline(
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
     currency: str = DEFAULT_CURRENCY,
+    benchmark: BenchmarkSource | None = None,
 ) -> dict:
     """Run the full pipeline for one `rebalance_date`, as a single,
     self-contained call - see `open_pipeline_session` for a CLI-style
@@ -401,9 +564,12 @@ def run_pipeline(
     DataFrame, `None` if skipped), `scan_detail` (`scan_with_detail`'s full
     output, including the branch taken), `weights`, `allocation` (the
     `(shares_per_ticker, leftover_cash)` tuple from `allocate_shares`), and
-    `stats` (the `PortfolioStats` behind those weights) - so a CLI layer can
-    display why each ticker is or is not a candidate, and what the optimizer
-    expected of the ones it kept, not just the final share counts.
+    `stats` (the `PortfolioStats` behind those weights), and `benchmark` (the
+    `BenchmarkStats` for `benchmark`'s ticker over the same returns window, or
+    `None` when no `BenchmarkSource` was supplied) - so a CLI layer can
+    display why each ticker is or is not a candidate, what the optimizer
+    expected of the ones it kept, and how that compares with simply holding
+    the market, not just the final share counts.
     """
     if selection not in VALID_SELECTIONS:
         raise ValueError(f"selection must be one of {VALID_SELECTIONS}, got {selection!r}")
@@ -412,5 +578,5 @@ def run_pipeline(
         return run_pipeline_against(
             rebalance_date, objective, portfolio_value, selection, effective_db_path, mode,
             candidates=candidates, target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
-            currency=currency,
+            currency=currency, benchmark=benchmark,
         )

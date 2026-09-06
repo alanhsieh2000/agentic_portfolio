@@ -1,6 +1,7 @@
 """Tests for src/flow/candidate_memory.py's memory/candidates.json
-read/write round trip, including the per-currency pools it holds and the
-migration of the old single-pool file shape.
+read/write round trip, including the per-currency pools it holds, each
+pool's optional benchmark ticker, and the migration of the old single-pool
+file shape.
 
 Pure filesystem tests against `tmp_path` - no DuckDB, no network, no LLM,
 per AGENTS.md.
@@ -13,7 +14,9 @@ import pytest
 
 from src.flow.candidate_memory import (
     load_all_pools,
+    load_candidate_benchmark,
     load_candidate_pool,
+    load_pool_benchmarks,
     migrate_candidate_pools,
     save_candidate_pool,
 )
@@ -223,3 +226,121 @@ def test_migrate_leaves_a_legacy_file_without_a_timestamp_null(tmp_path):
     migrate_candidate_pools(str(path))
 
     assert json.loads(path.read_text())["pools"]["USD"]["updated_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# per-pool benchmarks
+# ---------------------------------------------------------------------------
+
+
+def test_save_candidate_pool_records_a_benchmark(tmp_path):
+    path = str(tmp_path / "candidates.json")
+    save_candidate_pool(["AAPL", "MSFT"], path, currency="USD", benchmark="spy")
+
+    assert load_candidate_benchmark(path, "USD") == "SPY"
+    assert load_candidate_pool(path, "USD") == ["AAPL", "MSFT"]
+
+
+def test_saving_without_a_benchmark_preserves_a_previously_saved_one(tmp_path):
+    """The asymmetry that matters: every ordinary add/remove edit saves the
+    pool with no benchmark argument, so `None` must mean "leave it alone"
+    rather than "clear it", or the first ticker edit after choosing a
+    benchmark would silently throw that choice away.
+    """
+    path = str(tmp_path / "candidates.json")
+    save_candidate_pool(["AAPL"], path, currency="USD", benchmark="QQQ")
+
+    save_candidate_pool(["AAPL", "NVDA"], path, currency="USD")
+
+    assert load_candidate_benchmark(path, "USD") == "QQQ"
+    assert load_candidate_pool(path, "USD") == ["AAPL", "NVDA"]
+
+
+def test_naming_a_different_benchmark_replaces_the_recorded_one(tmp_path):
+    path = str(tmp_path / "candidates.json")
+    save_candidate_pool(["AAPL"], path, currency="USD", benchmark="SPY")
+
+    save_candidate_pool(["AAPL"], path, currency="USD", benchmark="VOO")
+
+    assert load_candidate_benchmark(path, "USD") == "VOO"
+
+
+def test_saving_a_benchmark_leaves_another_currencys_benchmark_untouched(tmp_path):
+    path = str(tmp_path / "candidates.json")
+    save_candidate_pool(["7203.T"], path, currency="JPY", benchmark="1306.T")
+
+    save_candidate_pool(["AAPL"], path, currency="USD", benchmark="SPY")
+
+    assert load_pool_benchmarks(path) == {"JPY": "1306.T", "USD": "SPY"}
+
+
+def test_load_candidate_benchmark_is_none_when_none_was_recorded(tmp_path):
+    path = str(tmp_path / "candidates.json")
+    save_candidate_pool(["7203.T"], path, currency="JPY")
+
+    assert load_candidate_benchmark(path, "JPY") is None
+    assert load_candidate_benchmark(path, "USD") is None
+
+
+def test_load_pool_benchmarks_is_empty_when_the_file_is_missing(tmp_path):
+    assert load_pool_benchmarks(str(tmp_path / "memory" / "candidates.json")) == {}
+
+
+def test_write_omits_the_benchmark_key_when_there_is_none(tmp_path):
+    """A pool that never named a benchmark stays byte-identical to how it was
+    written before benchmarks existed, which is what keeps the migration a
+    genuine no-op on such a file.
+    """
+    path = tmp_path / "candidates.json"
+    save_candidate_pool(["AAPL"], str(path), currency="USD")
+
+    entry = json.loads(path.read_text())["pools"]["USD"]
+    assert "benchmark" not in entry
+    assert sorted(entry) == ["tickers", "updated_at"]
+
+
+def test_an_empty_benchmark_string_records_nothing(tmp_path):
+    path = tmp_path / "candidates.json"
+    save_candidate_pool(["AAPL"], str(path), currency="USD", benchmark="   ")
+
+    assert "benchmark" not in json.loads(path.read_text())["pools"]["USD"]
+
+
+def test_a_non_string_benchmark_is_a_value_error_naming_the_currency(tmp_path):
+    path = tmp_path / "candidates.json"
+    path.write_text(json.dumps({"pools": {"USD": {"tickers": ["AAPL"], "benchmark": 42}}}))
+
+    with pytest.raises(ValueError) as excinfo:
+        load_pool_benchmarks(str(path))
+
+    assert "USD" in str(excinfo.value)
+    assert "benchmark" in str(excinfo.value)
+
+
+def test_migrate_preserves_a_recorded_benchmark(tmp_path):
+    path = tmp_path / "candidates.json"
+    path.write_text(
+        json.dumps(
+            {
+                "pools": {
+                    "USD": {"tickers": ["AAPL"], "benchmark": "SPY", "updated_at": "2026-01-01T00:00:00+00:00"},
+                    "JPY": {"tickers": ["7203.T"], "updated_at": "2026-02-01T00:00:00+00:00"},
+                }
+            },
+            indent=2,
+        )
+    )
+    before = path.read_text()
+
+    migrate_candidate_pools(str(path))
+
+    assert path.read_text() == before
+    assert load_pool_benchmarks(str(path)) == {"USD": "SPY", "JPY": None}
+
+
+def test_the_old_flat_file_shape_has_no_benchmark(tmp_path):
+    path = tmp_path / "candidates.json"
+    path.write_text(json.dumps({"tickers": ["AAPL"], "updated_at": "2026-01-01T00:00:00+00:00"}))
+
+    assert load_pool_benchmarks(str(path)) == {"USD": None}
+    assert load_candidate_benchmark(str(path)) is None

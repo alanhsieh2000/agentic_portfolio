@@ -125,6 +125,32 @@ def _copy_news_archive(source_db_path: str, dest_db_path: str) -> None:
 
 
 @contextmanager
+def build_scratch_snapshot(prefix: str = "benchmark_snapshot_"):
+    """A throwaway DuckDB file holding only the empty `prices`/
+    `unresolved_tickers`/`returns`/`ticker_currency` tables, yielded as a
+    path and deleted on exit regardless of success.
+
+    This is the one place the "temporary database nobody owns" discipline
+    lives: `mkstemp` to get a name nothing else will take, remove the empty
+    file it created (`duckdb.connect` must create the file itself, or it is
+    confused by a zero-byte one), create the tables, and always delete on the
+    way out. `build_live_snapshot`'s `user_provided` branch is one caller;
+    `src/flow/interactive.py`'s `prepare_benchmark` is the other, which needs
+    somewhere to fetch a benchmark's price and return history that is
+    emphatically NOT the session's own database - see that function for why.
+    """
+    fd, temp_db_path = tempfile.mkstemp(suffix=".duckdb", prefix=prefix)
+    os.close(fd)
+    os.remove(temp_db_path)  # duckdb.connect must create this file itself; an empty file confuses it
+    try:
+        _init_empty_price_and_returns_tables(temp_db_path)
+        yield temp_db_path
+    finally:
+        if os.path.exists(temp_db_path):
+            os.remove(temp_db_path)
+
+
+@contextmanager
 def build_live_snapshot(as_of: date, selection: str, source_db_path: str):
     """Build a throwaway DuckDB file covering `as_of` (always) and,
     when `selection` needs LLM-S, the causal-masking December date too -
@@ -138,44 +164,47 @@ def build_live_snapshot(as_of: date, selection: str, source_db_path: str):
     always removed before returning satisfies that intent even though it
     technically touches disk briefly).
 
-    `selection="user_provided"` skips every fetch and build above, yielding
-    a scratch file holding only empty `prices`/`unresolved_tickers`/
-    `returns` tables for `src/dataset/ticker_ingestion.py` to fill in as
-    the user names tickers - see this module's docstring.
+    `selection="user_provided"` skips every fetch and build above, delegating
+    to `build_scratch_snapshot` for a file holding only the empty
+    `prices`/`unresolved_tickers`/`returns`/`ticker_currency` tables that
+    `src/dataset/ticker_ingestion.py` fills in as the user names tickers -
+    see this module's docstring.
     """
+    if selection == "user_provided":
+        with build_scratch_snapshot("live_snapshot_") as scratch_db_path:
+            yield scratch_db_path
+        return
+
     fd, temp_db_path = tempfile.mkstemp(suffix=".duckdb", prefix="live_snapshot_")
     os.close(fd)
     os.remove(temp_db_path)  # duckdb.connect must create this file itself; an empty file confuses it
     try:
-        if selection == "user_provided":
-            _init_empty_price_and_returns_tables(temp_db_path)
-        else:
-            current, changes = fetch_and_normalize_membership()
+        current, changes = fetch_and_normalize_membership()
 
-            snapshot_dates = [as_of]
-            if selection in ("llm_s_only", "llm_s_and_f"):
-                snapshot_dates = [_causal_masking_date(as_of), as_of]
+        snapshot_dates = [as_of]
+        if selection in ("llm_s_only", "llm_s_and_f"):
+            snapshot_dates = [_causal_masking_date(as_of), as_of]
 
-            frames = []
-            for d in snapshot_dates:
-                members = apply_changes_asof(current, changes, d).copy()
-                members.insert(0, "rebalance_date", pd.Timestamp(d))
-                frames.append(members)
-                logger.info("live snapshot: rebalance_date=%s membership_count=%d", d, len(members))
-            write_membership_table(pd.concat(frames, ignore_index=True), db_path=temp_db_path)
+        frames = []
+        for d in snapshot_dates:
+            members = apply_changes_asof(current, changes, d).copy()
+            members.insert(0, "rebalance_date", pd.Timestamp(d))
+            frames.append(members)
+            logger.info("live snapshot: rebalance_date=%s membership_count=%d", d, len(members))
+        write_membership_table(pd.concat(frames, ignore_index=True), db_path=temp_db_path)
 
-            price_start = (pd.Timestamp(as_of) - pd.DateOffset(months=LOOKBACK_MONTHS)).date().isoformat()
-            price_end = (as_of + timedelta(days=5)).isoformat()
-            build_price_history(db_path=temp_db_path, start=price_start, end=price_end)
+        price_start = (pd.Timestamp(as_of) - pd.DateOffset(months=LOOKBACK_MONTHS)).date().isoformat()
+        price_end = (as_of + timedelta(days=5)).isoformat()
+        build_price_history(db_path=temp_db_path, start=price_start, end=price_end)
 
-            if selection in ("llm_s_only", "llm_s_and_f"):
-                build_factors(db_path=temp_db_path)
-                build_momentum_factors(db_path=temp_db_path)
+        if selection in ("llm_s_only", "llm_s_and_f"):
+            build_factors(db_path=temp_db_path)
+            build_momentum_factors(db_path=temp_db_path)
 
-            build_returns(db_path=temp_db_path, start=price_start, end=as_of.isoformat())
+        build_returns(db_path=temp_db_path, start=price_start, end=as_of.isoformat())
 
-            if selection in ("llm_f_only", "llm_s_and_f"):
-                _copy_news_archive(source_db_path, temp_db_path)
+        if selection in ("llm_f_only", "llm_s_and_f"):
+            _copy_news_archive(source_db_path, temp_db_path)
 
         yield temp_db_path
     finally:
