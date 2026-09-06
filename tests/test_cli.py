@@ -15,8 +15,10 @@ is under test, `_settle_benchmark` when only `main`'s wiring is - since
 resolving one for real reaches yfinance too.
 """
 
+import json
 from contextlib import contextmanager
 from datetime import date
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -33,6 +35,13 @@ from src.flow.cli import (
 )
 from src.config.settings import settings
 from src.optimizer.benchmark import BenchmarkSource, BenchmarkStats
+from src.flow.backtest import compute_sharpe_ratio
+from src.flow.rate_memory import (
+    DEFAULT_RATES_PATH,
+    load_all_risk_free_rates,
+    load_risk_free_rate,
+    save_risk_free_rate,
+)
 from src.optimizer.holdings import unavailable_holdings
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
@@ -748,7 +757,7 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
     benchmark_spy = MagicMock(return_value=_benchmark_source("SPY"))
     monkeypatch.setattr("src.flow.cli.open_pipeline_session", fake_session)
     monkeypatch.setattr("src.flow.cli.run_pipeline_against", pipeline_spy)
-    monkeypatch.setattr("src.flow.cli.print_pipeline_result", lambda result: None)
+    monkeypatch.setattr("src.flow.cli.print_pipeline_result", lambda result, **kwargs: None)
     monkeypatch.setattr("src.flow.cli._run_edit_loop", edit_spy)
     monkeypatch.setattr("src.flow.cli._settle_benchmark", benchmark_spy)
     monkeypatch.setattr(
@@ -756,7 +765,29 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
         MagicMock(return_value=unavailable_holdings("USD", {}, 0.02, "stubbed")),
     )
     monkeypatch.setattr("src.flow.cli.load_portfolio", MagicMock(return_value={}))
+    # The rate memory is stubbed for the same reason `load_portfolio` is: left
+    # real, these tests would read - and, for any run passing
+    # `--risk-free-rate`, WRITE - the developer's own `memory/rates.json`,
+    # passing on a clean checkout and failing on a machine that has ever
+    # remembered a rate. The tests that exercise the file itself use
+    # `_rates_argv` instead, which points a real path into `tmp_path`.
+    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", MagicMock(return_value=None))
+    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", MagicMock(return_value=True))
     return pipeline_spy, edit_spy, benchmark_spy
+
+
+def _rates_argv(tmp_path, *extra: str) -> list[str]:
+    """A minimal `portfolio` argv with `--rates-path` pointed inside
+    `tmp_path`, for the tests that exercise the real rate memory.
+
+    The flag is required rather than optional: an argparse default is bound
+    at parse time, so monkeypatching `DEFAULT_RATES_PATH` would not take
+    effect.
+    """
+    return [
+        "portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+        "--rates-path", str(tmp_path / "rates.json"), *extra,
+    ]
 
 
 def _stub_main_holdings(monkeypatch, positions=None) -> MagicMock:
@@ -1354,3 +1385,206 @@ def test_main_measures_the_holdings_against_the_session_database_not_the_shared_
     main()
 
     assert holdings_spy.call_args.args[3] == "session.duckdb"
+
+
+# ---------------------------------------------------------------------------
+# main's per-currency risk-free rate
+# ---------------------------------------------------------------------------
+
+
+def test_main_threads_one_resolved_rate_into_all_three_report_blocks(monkeypatch, tmp_path):
+    """The pool's figures, the benchmark's and the holdings' are printed one
+    under another so they can be compared; that is only legitimate if a
+    single resolved float reaches all three. `run_pipeline_against` feeds the
+    benchmark internally, so asserting on it covers the middle block.
+    """
+    pipeline_spy, edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
+    holdings_spy = _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
+
+    main()
+
+    assert pipeline_spy.call_args.kwargs["risk_free_rate"] == 0.045
+    assert holdings_spy.call_args.kwargs["risk_free_rate"] == 0.045
+    assert edit_spy.call_args.kwargs["risk_free_rate"] == 0.045
+
+
+def test_main_remembers_a_rate_given_on_the_command_line(monkeypatch, tmp_path, capsys):
+    _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_risk_free_rate)
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
+
+    main()
+
+    assert load_all_risk_free_rates(str(tmp_path / "rates.json")) == {"USD": 0.045}
+    assert "Remembered 0.0450 as the USD risk-free rate" in capsys.readouterr().out
+
+
+def test_main_writes_the_rate_to_the_given_rates_path_and_not_the_default(monkeypatch, tmp_path):
+    """The guard against a test suite that edits the developer's own memory."""
+    _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_risk_free_rate)
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
+
+    main()
+
+    assert (tmp_path / "rates.json").exists()
+    assert not Path(DEFAULT_RATES_PATH).exists() or "USD" not in json.loads(
+        Path(DEFAULT_RATES_PATH).read_text()
+    ).get("rates", {})
+
+
+def test_main_applies_a_remembered_rate_when_the_flag_is_left_out(monkeypatch, tmp_path):
+    pipeline_spy, _edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    save_risk_free_rate(0.0425, path=str(tmp_path / "rates.json"), currency="USD")
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path))
+
+    main()
+
+    assert pipeline_spy.call_args.kwargs["risk_free_rate"] == 0.0425
+
+
+def test_main_does_not_rewrite_a_rate_it_merely_inherited(monkeypatch, tmp_path):
+    """Only an explicit choice is recorded, so a run that used a remembered
+    rate must not restamp its `updated_at`.
+    """
+    _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    save_spy = MagicMock(return_value=True)
+    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_spy)
+    save_risk_free_rate(0.0425, path=str(tmp_path / "rates.json"), currency="USD")
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path))
+
+    main()
+
+    assert save_spy.called is False
+
+
+def test_main_refuses_a_nan_rate_before_opening_a_session(monkeypatch, tmp_path, capsys):
+    """A live session builds a real snapshot, so a mistyped rate has to be
+    refused before that cost is paid, not after.
+    """
+    session_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "nan"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    assert "finite" in capsys.readouterr().err
+    assert session_spy.called is False
+    assert not (tmp_path / "rates.json").exists()
+
+
+def test_main_refuses_a_mistyped_percentage_rate_before_opening_a_session(
+    monkeypatch, tmp_path, capsys
+):
+    session_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "4.5"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    assert "4.5% is 0.045" in capsys.readouterr().err
+    assert session_spy.called is False
+
+
+def test_main_does_not_remember_a_rate_when_the_run_never_produced_a_report(monkeypatch, tmp_path):
+    """A rate that governed no output must not outlive the run - the same
+    ordering `test_run_edit_loop_an_unoptimizable_edit_is_never_persisted`
+    pins for the candidate pool.
+    """
+    _pipeline_spy, _edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_risk_free_rate)
+    monkeypatch.setattr(
+        "src.flow.cli.run_pipeline_against",
+        MagicMock(side_effect=ValueError("at least one of the assets must have an expected return")),
+    )
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.05"))
+
+    with pytest.raises(ValueError):
+        main()
+
+    assert not (tmp_path / "rates.json").exists()
+
+
+def test_main_reports_which_source_the_rate_came_from(monkeypatch, tmp_path):
+    print_spy = MagicMock()
+    _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.print_pipeline_result", print_spy)
+    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    save_risk_free_rate(0.005, path=str(tmp_path / "rates.json"), currency="USD")
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path))
+
+    main()
+
+    assert print_spy.call_args.kwargs["risk_free_rate_origin"] == "remembered for USD"
+
+
+def test_main_carries_the_rates_origin_into_the_edit_loop(monkeypatch, tmp_path):
+    """Provenance that appeared on the initial report and vanished on the
+    first edit would be worse than none - the same bug plan 10 fixed for the
+    rate itself.
+    """
+    _pipeline_spy, edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
+
+    main()
+
+    assert edit_spy.call_args.kwargs["risk_free_rate_origin"] == (
+        "--risk-free-rate, remembered for USD"
+    )
+
+
+def test_run_edit_loop_reprints_the_rates_origin_on_every_recompute(monkeypatch, stub_optimizer):
+    print_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.print_weights_and_allocation", print_spy)
+    _script(monkeypatch, "a", "NVDA", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        risk_free_rate_origin="remembered for USD",
+    )
+
+    assert print_spy.call_args.kwargs["risk_free_rate_origin"] == "remembered for USD"
+
+
+def test_a_remembered_rate_never_reaches_the_backtest_sharpe_ratio(tmp_path):
+    """`src/flow/backtest.py` produces the figure this project compares
+    against the paper's published 0.6324 baseline. A per-currency rate must
+    not move it.
+    """
+    save_risk_free_rate(0.0425, path=str(tmp_path / "rates.json"), currency="USD")
+    net_returns = pd.Series([0.01, -0.005, 0.02, 0.0, 0.015])
+
+    expected = (
+        (net_returns.mean() - settings.risk_free_rate / 12) / net_returns.std() * (12**0.5)
+    )
+    assert compute_sharpe_ratio(net_returns) == pytest.approx(expected)
+
+
+def test_main_names_the_rates_source_in_the_holdings_block_too(monkeypatch, tmp_path):
+    """Caught in a live run, not by a test: the origin was threaded into the
+    pool block and the edit loop but not into this one, so the holdings block
+    printed a bare `Risk-free rate used: 0.0050` - a plausible-looking number
+    with no provenance, which is the very failure the provenance line exists
+    to prevent. Nothing failed, because the parameter defaults to None.
+    """
+    _stub_main_pipeline(monkeypatch)
+    _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
+    print_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.print_user_portfolio", print_spy)
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
+
+    main()
+
+    assert print_spy.call_args.kwargs["risk_free_rate_origin"] == (
+        "--risk-free-rate, remembered for USD"
+    )

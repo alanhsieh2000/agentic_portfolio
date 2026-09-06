@@ -278,7 +278,7 @@ To build a yen portfolio and see a dollar ticker refused:
     uv run portfolio --date today --objective GMV --value 15000000 \
         --selection user_provided --risk-free-rate 0.005
 
-If anything is already saved, the session opens with `Saved candidate pools:` and asks which to resume; press `n` for a new pool in another currency. Then type `a`, then `7203.T 6758.T`, then `a` again and `AAPL`. Expect the two Tokyo tickers accepted, then `Refused: AAPL is priced in USD but this pool is JPY. A portfolio cannot mix currencies; run them separately.` with the pool still holding exactly the two Tokyo tickers. Type `d` to confirm and expect `Saved 2 JPY ticker(s)`, then `Portfolio currency: JPY` above the weights and a `JPY`-labelled leftover cash line. Note `--risk-free-rate 0.005` is passed because the 2% default is a dollar rate.
+If anything is already saved, the session opens with `Saved candidate pools:` and asks which to resume; press `n` for a new pool in another currency. Then type `a`, then `7203.T 6758.T`, then `a` again and `AAPL`. Expect the two Tokyo tickers accepted, then `Refused: AAPL is priced in USD but this pool is JPY. A portfolio cannot mix currencies; run them separately.` with the pool still holding exactly the two Tokyo tickers. Type `d` to confirm and expect `Saved 2 JPY ticker(s)`, then `Portfolio currency: JPY` above the weights and a `JPY`-labelled leftover cash line. Note `--risk-free-rate 0.005` is passed because the 2% default is a dollar rate. (Since `plans/14_per_currency_risk_free_rate.md`, that flag needs typing only ONCE: the rate is remembered per currency in `memory/rates.json`, so every later JPY run — from either entry point — picks up 0.5% on its own and says so. The observation recorded here, that a global 2% is wrong for a yen portfolio, is what motivated that plan.)
 
 Run the same command again and expect the yen pool listed beside whatever else is saved, each with its ticker count — which is the check that they coexist rather than overwrite one another.
 
@@ -359,7 +359,7 @@ The yen portfolio, live, abridged of `yfinance`'s stderr noise. This is the acce
       7203.T: 2429
     Leftover cash: ¥2,661.00 JPY
 
-The share counts are the check that the yen arithmetic is right rather than merely labelled: 2,429 shares of Toyota at roughly ¥3,081 is about ¥7.5 million, half of the ¥15 million allocated, which is what a near-50/50 weighting should buy. Note `--risk-free-rate 0.005` was passed, since the 2% default is a dollar rate; the reported `Risk-free rate used: 0.0050` confirms it reached the Sharpe calculation.
+The share counts are the check that the yen arithmetic is right rather than merely labelled: 2,429 shares of Toyota at roughly ¥3,081 is about ¥7.5 million, half of the ¥15 million allocated, which is what a near-50/50 weighting should buy. Note `--risk-free-rate 0.005` was passed, since the 2% default is a dollar rate; the reported `Risk-free rate used: 0.0050` confirms it reached the Sharpe calculation. (Since `plans/14_per_currency_risk_free_rate.md` the rate is remembered per currency, so this flag is needed only on the first yen run, and the line now reads `Risk-free rate used: 0.0050 (remembered for JPY)` — naming its source, because a bare number was indistinguishable from the dollar default this plan had to work around.)
 
 The pound portfolio, live. `Portfolio currency` reads `GBP`, the major unit, not the `GBp` Yahoo Finance reports:
 

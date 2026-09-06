@@ -586,3 +586,13 @@ In `src/flow/cli.py`:
     ) -> BenchmarkSource | None
 
 plus a trailing `benchmark: BenchmarkStats | None = None` on `print_weights_and_allocation`, an optional `benchmarks` argument on `_choose_pool_to_resume`, and `benchmark`/`allow_benchmark_fetch` parameters on `_run_edit_loop`.
+
+
+## Revision Note — 2026-09-06, per-currency risk-free rates
+
+
+`plans/14_per_currency_risk_free_rate.md` changed one line of every transcript in this plan. `Risk-free rate used: 0.0200` now carries the source the rate came from, as in `Risk-free rate used: 0.0050 (remembered for JPY)`, because the rate is resolved per currency from `memory/rates.json` and a bare number could not be told from an inherited dollar default. Nothing about the benchmark's arithmetic changed: `benchmark_stats_for_window` still takes `risk_free_rate` as a plain float and still measures the benchmark's Sharpe ratio against exactly the rate the portfolio's was measured against — which is now that currency's own rate rather than a global 2%, so the two figures this plan exists to put side by side remain comparable and are both finally right for a non-dollar pool.
+
+Two of this plan's designs were reused rather than merely referenced, and the resemblance is deliberate. The rate's precedence — this run's `--risk-free-rate`, then what the currency remembered, then the configured default — is `resolve_benchmark_ticker`'s override-then-saved-then-default shape, and `resolve_risk_free_rate` is likewise a pure function taking `saved` as a parameter rather than reading a file. And the rate is written only after the run has actually produced a report, which is this plan's `_settle_benchmark` gate (`... and source.unavailable_reason is None`, writing only a benchmark that resolved) applied to a different value.
+
+One design was deliberately NOT reused: there is no per-currency table of default rates to match `DEFAULT_BENCHMARKS`. That constant's own docstring argues `SPY` is defensible because it is the uncontested stand-in for "the US market"; a policy rate moves several times a year, so a table of them compiled into source would rot silently, which is exactly why a rate must be remembered from the user instead. The rule that constant states about `memory/candidates.json` — that a default is never written to the file, only an explicit choice, so improving the default later still reaches everything that never chose — does carry over verbatim.

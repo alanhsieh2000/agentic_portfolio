@@ -25,6 +25,15 @@ assumption about - whatever the person is asked for once and thereafter
 remembered. `--benchmark` overrides it for a run, `[b]` changes it
 mid-session, and `--benchmark none` leaves the comparison out.
 
+The risk-free rate every Sharpe ratio here is measured against is
+per-currency, remembered in `memory/rates.json` (see
+`src/flow/rate_memory.py`) and shared with `uv run portfolio-holdings`.
+`--risk-free-rate` overrides it for the run and is remembered for the run's
+currency; left out, the rate is whatever that currency remembered, else the
+configured `RISK_FREE_RATE`, else 2%. One resolved rate reaches the pool's
+figures, the benchmark line and the holdings block alike, and every one of
+them prints which source it came from.
+
 The report ends with the portfolio the user ACTUALLY holds, read from
 `memory/portfolio.json` (maintained by `uv run portfolio-holdings`) for
 this run's own currency: what is held, what it is worth, and its
@@ -68,6 +77,14 @@ from src.flow.interactive import (
     prepare_holdings,
     run_pipeline_against,
     validate_and_edit_candidates,
+)
+from src.flow.rate_memory import (
+    DEFAULT_RATES_PATH,
+    ResolvedRiskFreeRate,
+    load_risk_free_rate,
+    resolve_risk_free_rate,
+    save_risk_free_rate,
+    validate_risk_free_rate,
 )
 from src.flow.user_portfolio import DEFAULT_PORTFOLIO_PATH, load_portfolio
 from src.optimizer.benchmark import (
@@ -139,12 +156,29 @@ def format_benchmark(benchmark: BenchmarkStats, portfolio_window_months: int) ->
     )
 
 
+def format_risk_free_rate(rate: float, origin: str | None = None) -> str:
+    """The one report line stating which risk-free rate the Sharpe ratios
+    above it were measured against, and where that rate came from.
+
+    `origin` (from `src/flow/rate_memory.py`'s `ResolvedRiskFreeRate`) is
+    optional only so that the many existing direct callers of the two
+    printing functions - and their tests - need no change. Every real
+    reporting path supplies it, and it is populated in every case including
+    the plain default, because a rate printed without its source is exactly
+    what the per-currency bug looked like: a bare, entirely plausible
+    `0.0200` that a reader could not tell from a deliberate choice.
+    """
+    suffix = f" ({origin})" if origin else ""
+    return f"Risk-free rate used: {rate:.4f}{suffix}"
+
+
 def print_weights_and_allocation(
     stats: PortfolioStats,
     allocation: tuple[dict[str, int], float],
     objective: str,
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkStats | None = None,
+    risk_free_rate_origin: str | None = None,
 ) -> None:
     """Human-readable rendering of one `compute_weights_and_allocation`
     result, including the figures the optimizer decided from.
@@ -173,6 +207,13 @@ def print_weights_and_allocation(
     `None` prints nothing at all, which is both the default (so every caller
     that never asked for a benchmark is unaffected) and what `--benchmark
     none` produces.
+
+    `risk_free_rate_origin` names where the rate on the line below came from
+    - this run's flag, the currency's remembered rate, or the configured
+    default - see `format_risk_free_rate`. It is carried through the edit
+    loop for the same reason the rate itself is: provenance that appeared on
+    the initial report and vanished on the first edit would be worse than
+    none.
     """
     print(f"\nPortfolio currency: {currency} - --value is interpreted as {currency}")
     print(f"Returns window: {stats.returns_window_start} to {stats.returns_window_end} "
@@ -193,7 +234,7 @@ def print_weights_and_allocation(
           f"Portfolio Sharpe: {stats.portfolio_sharpe:.4f}")
     if benchmark is not None:
         print(format_benchmark(benchmark, stats.returns_window_months))
-    print(f"Risk-free rate used: {stats.risk_free_rate:.4f}")
+    print(format_risk_free_rate(stats.risk_free_rate, risk_free_rate_origin))
     if objective == "MV":
         print(f"Target annual return: {stats.target_annual_return:.4f}")
     else:
@@ -219,7 +260,9 @@ def format_share_count(shares: float) -> str:
     return f"{shares:,.4f}".rstrip("0").rstrip(".")
 
 
-def print_user_portfolio(holdings: HoldingsStats, path: str) -> None:
+def print_user_portfolio(
+    holdings: HoldingsStats, path: str, risk_free_rate_origin: str | None = None
+) -> None:
     """Human-readable rendering of the user's OWN saved portfolio (see
     `src/flow/user_portfolio.py` and `src/optimizer/holdings.py`) - what is
     held, what it is worth, and its annualized return, volatility and
@@ -275,6 +318,11 @@ def print_user_portfolio(holdings: HoldingsStats, path: str) -> None:
 
     if holdings.unavailable_reason is not None:
         print(f"Figures: n/a - {holdings.unavailable_reason}")
+        # The rate is printed here too, not only alongside figures. Someone
+        # reading an `n/a` block is the reader most likely to be working out
+        # why the numbers moved or vanished, and withholding the rate and its
+        # provenance from exactly them would be backwards.
+        print(format_risk_free_rate(holdings.risk_free_rate, risk_free_rate_origin))
     else:
         print(f"Returns window: {holdings.window_start} to {holdings.window_end} "
               f"({holdings.window_months} month(s) of monthly returns)")
@@ -291,7 +339,7 @@ def print_user_portfolio(holdings: HoldingsStats, path: str) -> None:
         print(f"Annual return: {holdings.annual_return:.4f}  "
               f"Annual volatility: {holdings.annual_volatility:.4f}  "
               f"Sharpe: {holdings.sharpe:.4f}")
-        print(f"Risk-free rate used: {holdings.risk_free_rate:.4f}")
+        print(format_risk_free_rate(holdings.risk_free_rate, risk_free_rate_origin))
 
     if holdings.excluded:
         print("Excluded from the figures:")
@@ -303,8 +351,14 @@ def print_user_portfolio(holdings: HoldingsStats, path: str) -> None:
             print(f"  {ticker}: {holdings.excluded[ticker]}{share}")
 
 
-def print_pipeline_result(result: dict) -> None:
-    """Human-readable rendering of one `run_pipeline_against` result dict."""
+def print_pipeline_result(result: dict, risk_free_rate_origin: str | None = None) -> None:
+    """Human-readable rendering of one `run_pipeline_against` result dict.
+
+    `risk_free_rate_origin` is a parameter rather than a key inside `result`
+    on purpose: it is a display string, and `run_pipeline_against` lives in
+    the orchestration layer, which should not acquire resolution's vocabulary
+    just so a parenthetical can ride along.
+    """
     print(f"Mode: {result['mode']}  Rebalance date: {result['rebalance_date']}  "
           f"Objective: {result['objective']}  Selection: {result['selection']}")
 
@@ -323,7 +377,7 @@ def print_pipeline_result(result: dict) -> None:
 
     print_weights_and_allocation(
         result["stats"], result["allocation"], result["objective"], result["currency"],
-        benchmark=result.get("benchmark"),
+        benchmark=result.get("benchmark"), risk_free_rate_origin=risk_free_rate_origin,
     )
 
 
@@ -613,6 +667,61 @@ def _settle_benchmark(
     return source
 
 
+def _settle_risk_free_rate(
+    override: float | None, currency: str, rates_path: str
+) -> ResolvedRiskFreeRate:
+    """Decide which risk-free rate this session's Sharpe ratios are measured
+    against, and what to call its source.
+
+    Precedence is `resolve_risk_free_rate`'s: this run's `--risk-free-rate`,
+    then whatever `currency` remembered in `rates_path`, then the configured
+    `settings.risk_free_rate` (which already reflects any `RISK_FREE_RATE`
+    environment variable or `.env` entry). A remembered rate outranking the
+    environment variable is deliberate: a per-currency entry is the more
+    specific statement, and one global variable cannot express "0.5% for yen,
+    4.25% for dollars" at all.
+
+    Called once the pool's currency has settled, never before - the rate is
+    a property of the currency, and before the confirm loop returns there is
+    no currency to look one up for. The single resolved float then reaches
+    the pool's figures, the benchmark line AND the holdings block, which is
+    what keeps the three sets of numbers a report prints one under another on
+    one scale.
+
+    Deliberately does NOT write. Remembering is `_remember_risk_free_rate`'s
+    job, called only once the run has actually produced a report - the same
+    ordering the candidate-pool save observes (see `_run_edit_loop`, where a
+    rejected edit must not survive on disk) and the same gate
+    `_settle_benchmark` applies by writing only a benchmark that resolved.
+    """
+    return resolve_risk_free_rate(
+        override, currency, load_risk_free_rate(rates_path, currency), settings.risk_free_rate
+    )
+
+
+def _remember_risk_free_rate(resolved: ResolvedRiskFreeRate, currency: str, rates_path: str) -> None:
+    """Record an explicitly-given rate as `currency`'s remembered rate,
+    announcing the write.
+
+    Only a rate that came from the command line is written; a default or an
+    already-remembered value is not. That is `DEFAULT_BENCHMARKS`' rule for
+    `memory/candidates.json` applied here - the file records decisions, not
+    defaults, so improving the default later still reaches every currency
+    that never made one.
+
+    Announced because this project has no silent writes, and because
+    remembering is a side effect of a flag rather than an explicit command.
+    The message names the file, since editing it is the only way to
+    un-remember a rate.
+    """
+    if not resolved.from_override:
+        return
+    if save_risk_free_rate(resolved.rate, path=rates_path, currency=currency):
+        print(
+            f"\nRemembered {resolved.rate:.4f} as the {currency} risk-free rate in {rates_path}."
+        )
+
+
 def _prompt_target_return(prompt: str, current: float) -> float:
     """Ask for a new MV target annual return, returning `current` unchanged
     when the user presses enter or types something unparseable - the same
@@ -642,6 +751,7 @@ def _run_edit_loop(
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkSource | None = None,
     allow_benchmark_fetch: bool = True,
+    risk_free_rate_origin: str | None = None,
 ) -> None:
     """Prompt in a loop for add/remove/objective/target-return/benchmark/
     finish; each
@@ -665,9 +775,17 @@ def _run_edit_loop(
     default the command line supplied.
 
     `risk_free_rate` is not editable here, but it must still be carried:
-    every recompute has to use the rate the command line supplied, or a
-    `--risk-free-rate` would apply to the initial run and then silently
-    revert to the configured default on the first edit.
+    every recompute has to use the rate the session settled on, or a
+    `--risk-free-rate` - or a rate this currency remembered - would apply to
+    the initial run and then silently revert to the configured default on the
+    first edit. The rate stays deliberately non-editable because, unlike
+    MV's target, it is a property of the market environment rather than of
+    the portfolio being designed, so changing it mid-session invites treating
+    it as a knob to make a Sharpe ratio look better.
+
+    `risk_free_rate_origin` is carried for exactly the same reason as the
+    rate: provenance that appeared on the initial report and vanished on the
+    first edit would be worse than none at all.
 
     `benchmark` is carried for the same reason and re-narrowed to the
     portfolio's window on every recompute, so the comparison line follows
@@ -771,6 +889,7 @@ def _run_edit_loop(
             benchmark=benchmark_stats_for_window(
                 benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
             ),
+            risk_free_rate_origin=risk_free_rate_origin,
         )
 
 
@@ -796,10 +915,14 @@ def main() -> None:
     parser.add_argument(
         "--risk-free-rate",
         type=float,
-        default=settings.risk_free_rate,
+        default=None,
         help="Rate --objective MSR maximizes its Sharpe ratio against, and that every "
-             "objective's reported Sharpe ratio is measured against. Defaults to the "
-             "configured RISK_FREE_RATE.",
+             "objective's reported Sharpe ratio - the pool's, the benchmark's and your own "
+             "holdings' - is measured against. A decimal (4.25%% is 0.0425; negative rates are "
+             "allowed). A value given here is REMEMBERED as this run's currency's rate and used "
+             "by later runs of both this command and 'uv run portfolio-holdings'. Left out, the "
+             "rate is whatever that currency remembered, else the configured RISK_FREE_RATE, "
+             "else 2%%. The report always says which of those it used.",
     )
     parser.add_argument("--db-path", default="data/portfolio.duckdb")
     parser.add_argument(
@@ -828,6 +951,12 @@ def main() -> None:
              "when several pools are saved you are asked which to resume.",
     )
     parser.add_argument(
+        "--rates-path",
+        default=DEFAULT_RATES_PATH,
+        help="Which file the per-currency risk-free rates are remembered in. One file holds "
+             "one rate per currency, shared with 'uv run portfolio-holdings'.",
+    )
+    parser.add_argument(
         "--holdings-path",
         default=DEFAULT_PORTFOLIO_PATH,
         help="Which file the portfolio you actually hold is read from, for the holdings block at "
@@ -850,6 +979,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.risk_free_rate is not None:
+        # Checked here, before `open_pipeline_session` builds a live snapshot
+        # (a real Wikipedia/yfinance/SEC fetch) and before the user_provided
+        # confirm loop re-ingests every saved ticker. Refusing a mistyped rate
+        # only after all that would be gratuitous - and note argparse's
+        # `type=float` accepts `nan` and `inf` quite happily, so this is the
+        # only place they can be caught.
+        #
+        # Reported through `parser.error`, which exits 2 with argparse's own
+        # formatting, because a malformed argument value is precisely what
+        # argparse already reports that way (`--value abc`); a traceback for
+        # a typo would be a worse answer to the same class of mistake. This
+        # is not the case `plans/10_performance_reporting_and_target_return.md`
+        # decided to let propagate - that was an unreachable `--target-return`,
+        # which only the optimizer can discover.
+        try:
+            args.risk_free_rate = validate_risk_free_rate(args.risk_free_rate, "--risk-free-rate")
+        except ValueError as e:
+            parser.error(str(e))
+
     rebalance_date = parse_date(args.date)
 
     benchmark_enabled = args.benchmark != BENCHMARK_DISABLED
@@ -869,6 +1018,17 @@ def main() -> None:
         # Settled after the confirm loop, never before: an empty pool has no
         # currency until the first ticker is added, and the benchmark has to
         # be measured against the currency the pool actually ended up in.
+        # Settled here for the same reason the benchmark is, and immediately
+        # before it: the rate is a property of the pool's currency, which an
+        # empty pool does not have until the confirm loop returns. The single
+        # resolved float below then reaches the pool's figures, the benchmark
+        # line and the holdings block, which is what keeps the three sets of
+        # numbers this report prints one under another on one scale.
+        resolved_rate = _settle_risk_free_rate(args.risk_free_rate, currency, args.rates_path)
+        # Rebound so that no consumption site can silently keep using the raw
+        # flag (which is now `None` whenever it was not given).
+        args.risk_free_rate = resolved_rate.rate
+
         benchmark = _settle_benchmark(
             candidates or [],
             currency,
@@ -885,7 +1045,18 @@ def main() -> None:
             candidates=candidates, target_annual_return=args.target_return,
             risk_free_rate=args.risk_free_rate, currency=currency, benchmark=benchmark,
         )
-        print_pipeline_result(result)
+        print_pipeline_result(result, risk_free_rate_origin=resolved_rate.origin)
+
+        # Remembered only now, after the run has actually produced a report.
+        # `plans/10_performance_reporting_and_target_return.md` established
+        # this ordering for the candidate pool ("the save now happens after a
+        # successful recompute"), and `_settle_benchmark` applies the same gate
+        # by writing only a benchmark that resolved. Without it, an
+        # `--objective MSR --risk-free-rate 0.05` run against a pool where no
+        # ticker clears 5% would write 0.05 to disk and then raise out of
+        # PyPortfolioOpt, leaving standing state from a run that printed
+        # nothing.
+        _remember_risk_free_rate(resolved_rate, currency, args.rates_path)
 
         # Printed once, here, rather than from inside
         # `print_weights_and_allocation`: that function reprints the pool's
@@ -906,6 +1077,7 @@ def main() -> None:
                     allow_fetch=not args.no_holdings_fetch,
                 ),
                 args.holdings_path,
+                risk_free_rate_origin=resolved_rate.origin,
             )
 
         _run_edit_loop(
@@ -914,6 +1086,7 @@ def main() -> None:
             target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
             currency=currency, benchmark=benchmark,
             allow_benchmark_fetch=not args.no_benchmark_fetch,
+            risk_free_rate_origin=resolved_rate.origin,
         )
 
 

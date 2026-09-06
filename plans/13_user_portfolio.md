@@ -742,3 +742,19 @@ In `pyproject.toml`, under `[project.scripts]`:
   That is the shrinkage behaviour `src/optimizer/benchmark.py`'s module docstring already
   documents at length, it is identical to what an optimized pool's report does, and it is the
   reason the benchmark is deliberately never folded into a pool's matrix.
+- 2026-09-06, superseded in part by `plans/14_per_currency_risk_free_rate.md`: the risk-free rate is
+  no longer one global value. Three things this plan specifies are now out of date. The
+  `--risk-free-rate` flag on `uv run portfolio-holdings` no longer defaults to
+  `settings.risk_free_rate` but to `None`, so that "not given" can be told from "given 0.02" and a
+  remembered per-currency rate can fill the gap; a value given there is now REMEMBERED for that
+  currency. Its help text no longer says "Use the same value here as for 'uv run portfolio' if you
+  intend to compare the two reports" — the two commands now share the value through
+  `memory/rates.json` automatically, which was the point. And `print_user_portfolio` gained a
+  trailing optional `risk_free_rate_origin`, so the `Risk-free rate used:` line names which of the
+  sources the rate came from; that line now also prints in the `Figures: n/a` branch, where it was
+  previously withheld from exactly the reader trying to work out why the numbers had gone.
+
+  Worth recording because this plan's own claim made it matter: the sentence here that "the three
+  figures use the same estimators and the same `--risk-free-rate` as the pool's and the benchmark's,
+  so all three lines read on one scale" was true for a USD portfolio and quietly false for a JPY one,
+  since the 2% default is a dollar rate. The claim now holds for both.

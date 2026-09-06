@@ -29,6 +29,15 @@ annualized return, volatility and Sharpe ratio, through the very same
 one formatter, so the two commands' reports cannot drift into two
 different-looking blocks.
 
+The risk-free rate those Sharpe ratios are measured against is likewise per
+currency, remembered in `memory/rates.json` (see
+`src/flow/rate_memory.py`) and shared with `uv run portfolio`. It is
+resolved once per REPORTED currency, so a `show` spanning a dollar and a
+yen portfolio subtracts each one's own riskless return instead of applying a
+dollar rate to both. `--risk-free-rate` overrides it for the run and is
+remembered for that currency; it is refused when the command names no single
+currency to remember it against.
+
 Unlike `src/flow/cli.py` this command is entirely non-interactive: it never
 calls `input()`, so it is usable from a script or a one-line edit.
 """
@@ -36,11 +45,19 @@ calls `input()`, so it is usable from a script or a one-line edit.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from src.config.settings import settings
 from src.dataset.ticker_currency import DEFAULT_CURRENCY, partition_by_currency
 from src.flow.cli import parse_date, print_user_portfolio
+from src.flow.rate_memory import (
+    DEFAULT_RATES_PATH,
+    load_risk_free_rate,
+    resolve_risk_free_rate,
+    save_risk_free_rate,
+    validate_risk_free_rate,
+)
 from src.flow.interactive import in_typed_order, prepare_holdings
 from src.flow.live import build_scratch_snapshot
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
@@ -102,22 +119,102 @@ def _parse_pairs(tokens: list[str]) -> list[tuple[str, float]]:
     return pairs
 
 
+def _resolve_rate(currency: str, args):
+    """The risk-free rate to measure `currency`'s portfolio against, and
+    where it came from.
+
+    Resolved PER REPORTED CURRENCY rather than once for the whole
+    invocation, which is the point of the whole feature: `_run_show` loops
+    over every saved currency, and each iteration must subtract that
+    currency's own riskless return rather than a dollar rate applied to
+    everything alike.
+    """
+    return resolve_risk_free_rate(
+        args.risk_free_rate,
+        currency,
+        load_risk_free_rate(args.rates_path, currency),
+        settings.risk_free_rate,
+    )
+
+
 def _report(currency: str, args) -> None:
     """Print one currency's portfolio and its figures - the last thing every
     subcommand does, so an edit's effect is always visible immediately
     rather than requiring a second command to see.
+
+    Resolves the rate but deliberately never PERSISTS it. `_run_show` calls
+    this in a loop, so a write here would make a bare
+    `show --risk-free-rate 0.03` record the same rate under every currency -
+    the exact error class this feature exists to fix. Remembering is
+    `_remember_rate`'s job, called at most once per invocation.
     """
+    resolved = _resolve_rate(currency, args)
     print_user_portfolio(
         prepare_holdings(
             load_portfolio(args.path, currency),
             currency,
             parse_date(args.date),
             args.db_path,
-            risk_free_rate=args.risk_free_rate,
+            risk_free_rate=resolved.rate,
             allow_fetch=not args.no_holdings_fetch,
         ),
         args.path,
+        risk_free_rate_origin=resolved.origin,
     )
+
+
+AMBIGUOUS_RATE_CURRENCY = (
+    "--risk-free-rate has to be remembered for one currency, and this command names none; "
+    "add --currency (for example --currency JPY)"
+)
+
+
+def _remember_rate(currency: str | None, args) -> None:
+    """Record an explicit `--risk-free-rate` as `currency`'s remembered rate,
+    announcing the write.
+
+    Called at most once per invocation, and only after the report it applied
+    to actually printed - a value that governed no output should not outlive
+    the run, the same ordering `src/flow/cli.py`'s candidate-pool save and
+    `_settle_benchmark` both observe.
+
+    Announced because this project has no silent writes, and because
+    remembering here is a side effect of a flag rather than an explicit
+    command - which makes it exactly the kind of write a user needs told
+    about. The message names the file too, since editing it is the only way
+    to un-remember a rate.
+
+    `currency=None` means the command determined no single currency to
+    remember against; that is refused rather than guessed, because writing a
+    rate under a currency nobody named is how the bug this fixes got started.
+    """
+    if args.risk_free_rate is None:
+        return
+    if currency is None:
+        raise ValueError(AMBIGUOUS_RATE_CURRENCY)
+
+    if save_risk_free_rate(args.risk_free_rate, path=args.rates_path, currency=currency):
+        print(
+            f"Remembered {args.risk_free_rate:.4f} as the {currency} risk-free rate "
+            f"in {args.rates_path}."
+        )
+
+
+def _rate_currency_for_report(args) -> str | None:
+    """Which currency a `show`-shaped invocation would remember a rate for:
+    an explicit `--currency`, else the single saved portfolio's currency,
+    else `None`.
+
+    `None` covers two cases that must not become a write. Several saved
+    portfolios with no `--currency` is ambiguous. And nothing saved at all is
+    not a determination either: `_run_show` reports `DEFAULT_CURRENCY` there
+    only so the "add some holdings" hint gets printed, and recording a dollar
+    rate on the strength of that fallback would be recording a guess.
+    """
+    if args.currency:
+        return args.currency
+    saved = sorted(load_all_portfolios(args.path))
+    return saved[0] if len(saved) == 1 else None
 
 
 def _run_show(args) -> None:
@@ -130,11 +227,13 @@ def _run_show(args) -> None:
     """
     if args.currency:
         _report(args.currency, args)
+        _remember_rate(args.currency, args)
         return
 
     saved = sorted(load_all_portfolios(args.path))
     for currency in saved or [DEFAULT_CURRENCY]:
         _report(currency, args)
+    _remember_rate(_rate_currency_for_report(args), args)
 
 
 def _validate_set_targets(
@@ -171,6 +270,12 @@ def _run_set(args) -> None:
     A share count of `0` retires a holding rather than storing a zero row -
     it is this command's way of saying "I sold all of it", and it needs no
     separate spelling from an ordinary edit.
+
+    An explicit `--risk-free-rate` is remembered for the currency this edit
+    landed in - determined by the tickers themselves, so unlike `show` it
+    needs no `--currency` to be unambiguous. When nothing was saved at all
+    (every ticker unresolvable), nothing is remembered either: there is no
+    currency to attach it to.
     """
     pairs = _parse_pairs(args.args)
     if not pairs:
@@ -190,6 +295,7 @@ def _run_set(args) -> None:
         print("Nothing was saved.")
         if currency:
             _report(currency, args)
+            _remember_rate(currency, args)
         return
 
     positions = load_portfolio(args.path, currency)
@@ -211,6 +317,7 @@ def _run_set(args) -> None:
         print(f"Retired from the {currency} portfolio: {', '.join(sorted(retired))}.")
 
     _report(currency, args)
+    _remember_rate(currency, args)
 
 
 def _resolve_remove_currency(tickers: list[str], args) -> str | None:
@@ -270,6 +377,33 @@ def _run_remove(args) -> None:
         print(f"Not held in the {currency} portfolio: {', '.join(missing)}.")
 
     _report(currency, args)
+    _remember_rate(currency, args)
+
+
+def _guard_rate_is_rememberable(args) -> None:
+    """Refuse an explicit `--risk-free-rate` that names no single currency,
+    BEFORE the command does any work.
+
+    `_remember_rate` would refuse it anyway, but only at the end - after
+    `set` has already paid for a Yahoo Finance round trip, or after `remove`
+    has printed "Not held in any saved portfolio". Checking here means the
+    complaint arrives before the cost.
+
+    `set` is exempt: its typed tickers determine the currency, so there is
+    nothing to disambiguate and nothing yet to check.
+    """
+    if args.currency or args.command == "set":
+        return
+
+    if args.command == "remove":
+        tickers = [_normalize_ticker(token) for token in args.args if _normalize_ticker(token)]
+        # Raises on its own if the tickers span several portfolios, which is
+        # the same refusal in a more specific wording.
+        if _resolve_remove_currency(tickers, args) is not None:
+            return
+
+    if _rate_currency_for_report(args) is None:
+        raise ValueError(AMBIGUOUS_RATE_CURRENCY)
 
 
 def main() -> None:
@@ -320,10 +454,18 @@ def main() -> None:
     parser.add_argument(
         "--risk-free-rate",
         type=float,
-        default=settings.risk_free_rate,
-        help="Rate the reported Sharpe ratio is measured against. Defaults to the configured "
-             "RISK_FREE_RATE. Use the same value here as for 'uv run portfolio' if you intend "
-             "to compare the two reports.",
+        default=None,
+        help="Rate the reported Sharpe ratio is measured against, as a decimal (4.25%% is "
+             "0.0425; negative rates are allowed). A value given here is REMEMBERED as this "
+             "currency's rate and used by later runs of both this command and 'uv run "
+             "portfolio'. Left out, the rate is whatever this currency remembered, else the "
+             "configured RISK_FREE_RATE, else 2%%. Every report says which of those it used.",
+    )
+    parser.add_argument(
+        "--rates-path",
+        default=DEFAULT_RATES_PATH,
+        help="Which file the per-currency risk-free rates are remembered in. One file holds "
+             "one rate per currency, shared with 'uv run portfolio'.",
     )
     parser.add_argument(
         # Spelled the same as `uv run portfolio`'s flag, with the shorter
@@ -345,11 +487,29 @@ def main() -> None:
 
     runners = {"show": _run_show, "set": _run_set, "remove": _run_remove}
     try:
+        if args.risk_free_rate is not None:
+            # Checked here, before any Yahoo Finance round trip: `set` would
+            # otherwise refuse a mistyped rate only after validating and
+            # ingesting every typed ticker.
+            args.risk_free_rate = validate_risk_free_rate(
+                args.risk_free_rate, "--risk-free-rate"
+            )
+            _guard_rate_is_rememberable(args)
         runners[args.command](args)
+    except json.JSONDecodeError as e:
+        # MUST precede the `ValueError` branch: `json.JSONDecodeError`
+        # subclasses `ValueError`, so the broader clause would otherwise
+        # swallow it and report a bare "Expecting property name..." with no
+        # hint that a memory file is the culprit. Worth its own branch at all
+        # because `--rates-path` now sits on the startup path of even a bare
+        # `show`, and a raw parser message is a poor answer to a stray comma.
+        print(f"error: could not read a memory file as JSON: {e}", file=sys.stderr)
+        raise SystemExit(2)
     except ValueError as e:
-        # A mistyped pair, a negative share count, or an ambiguous removal is
-        # the user's input to fix, not a stack trace to read: reported on
-        # stderr with a non-zero exit so a script can tell it failed.
+        # A mistyped pair, a negative share count, an ambiguous removal, or a
+        # rate that names no single currency is the user's input to fix, not a
+        # stack trace to read: reported on stderr with a non-zero exit so a
+        # script can tell it failed.
         print(f"error: {e}", file=sys.stderr)
         raise SystemExit(2)
 

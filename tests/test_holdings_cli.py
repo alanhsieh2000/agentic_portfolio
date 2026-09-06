@@ -11,10 +11,13 @@ or the real `memory/portfolio.json`.
 """
 
 from datetime import date
+from pathlib import Path
 
 import pytest
 
+from src.config.settings import settings
 from src.flow.holdings_cli import _normalize_ticker, _parse_pairs, main
+from src.flow.rate_memory import load_all_risk_free_rates, load_risk_free_rate
 from src.flow.user_portfolio import load_all_portfolios, load_portfolio
 from src.optimizer.holdings import HoldingsStats, unavailable_holdings
 from src.flow.cli import format_share_count, print_user_portfolio
@@ -42,15 +45,28 @@ def _stub_report(monkeypatch) -> list[tuple[str, dict]]:
     seen: list[tuple[str, dict]] = []
 
     def fake(positions, currency, rebalance_date, db_path, risk_free_rate=0.02, allow_fetch=True):
-        seen.append((currency, dict(positions)))
+        seen.append((currency, dict(positions), risk_free_rate))
         return unavailable_holdings(currency, dict(positions), risk_free_rate, "stubbed")
 
     monkeypatch.setattr("src.flow.holdings_cli.prepare_holdings", fake)
     return seen
 
 
-def _run(monkeypatch, path, argv: list[str]) -> None:
-    monkeypatch.setattr("sys.argv", ["portfolio-holdings", *argv, "--path", str(path)])
+def _run(monkeypatch, path, argv: list[str], rates_path=None) -> None:
+    """Drive `main()` with both memory files pointed inside `tmp_path`.
+
+    `--rates-path` is not optional politeness: an argparse default is bound
+    at parse time, so monkeypatching `DEFAULT_RATES_PATH` would not take
+    effect. Without the flag these tests would READ and, for any run passing
+    `--risk-free-rate`, WRITE the developer's real `memory/rates.json` -
+    green on a clean checkout, failing on a machine that has ever remembered
+    a rate, and invisible in `git status` because `memory/` is gitignored.
+    """
+    rates_path = rates_path or Path(path).with_name("rates.json")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio-holdings", *argv, "--path", str(path), "--rates-path", str(rates_path)],
+    )
     main()
 
 
@@ -92,7 +108,7 @@ def test_set_records_the_share_counts_and_reports_the_portfolio(monkeypatch, tmp
     _run(monkeypatch, path, ["set", "SPY", "1000", "T", "500"])
 
     assert load_portfolio(str(path), "USD") == {"SPY": 1000.0, "T": 500.0}
-    assert seen == [("USD", {"SPY": 1000.0, "T": 500.0})]
+    assert [(c, p) for c, p, _ in seen] == [("USD", {"SPY": 1000.0, "T": 500.0})]
     assert "Recorded in the USD portfolio" in capsys.readouterr().out
 
 
@@ -253,7 +269,7 @@ def test_show_reports_every_saved_currency(monkeypatch, tmp_path):
     seen = _stub_report(monkeypatch)
     _run(monkeypatch, path, [])
 
-    assert [currency for currency, _ in seen] == ["JPY", "USD"]
+    assert [currency for currency, _, _ in seen] == ["JPY", "USD"]
 
 
 def test_show_with_nothing_saved_still_reports_usd_so_the_hint_is_printed(monkeypatch, tmp_path):
@@ -262,7 +278,7 @@ def test_show_with_nothing_saved_still_reports_usd_so_the_hint_is_printed(monkey
 
     _run(monkeypatch, path, ["show"])
 
-    assert seen == [("USD", {})]
+    assert [(c, p) for c, p, _ in seen] == [("USD", {})]
 
 
 # --- print_user_portfolio ---------------------------------------------------
@@ -398,3 +414,229 @@ def test_a_fractional_share_count_is_not_padded_with_false_precision():
     assert format_share_count(1234567.0) == "1,234,567"
     assert format_share_count(0.5) == "0.5"
     assert format_share_count(10.25) == "10.25"
+
+
+# --- the per-currency risk-free rate ---------------------------------------
+
+
+def test_a_rate_given_on_the_command_line_is_remembered_and_announced(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"1321.T": "JPY"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "1321.T", "50"])
+
+    _run(monkeypatch, path, ["--currency", "JPY", "--risk-free-rate", "0.005", "show"])
+
+    assert load_risk_free_rate(str(tmp_path / "rates.json"), "JPY") == 0.005
+    assert "Remembered 0.0050 as the JPY risk-free rate" in capsys.readouterr().out
+
+
+def test_a_remembered_rate_applies_with_no_flag_on_a_later_run(monkeypatch, tmp_path):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"1321.T": "JPY"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "1321.T", "50"])
+    _run(monkeypatch, path, ["--currency", "JPY", "--risk-free-rate", "0.005", "show"])
+
+    seen = _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["--currency", "JPY", "show"])
+
+    assert [rate for _, _, rate in seen] == [0.005]
+
+
+def test_each_currency_is_measured_against_its_own_remembered_rate_in_one_show(
+    monkeypatch, tmp_path
+):
+    """The reported bug: before this, one `show` applied the 2% dollar
+    default to a yen portfolio and a dollar portfolio alike.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "1321.T": "JPY"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    _run(monkeypatch, path, ["set", "1321.T", "50"])
+    _run(monkeypatch, path, ["--currency", "JPY", "--risk-free-rate", "0.005", "show"])
+    _run(monkeypatch, path, ["--currency", "USD", "--risk-free-rate", "0.0425", "show"])
+
+    seen = _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["show"])
+
+    assert [(currency, rate) for currency, _, rate in seen] == [("JPY", 0.005), ("USD", 0.0425)]
+
+
+def test_a_rate_never_leaks_from_one_currency_into_another(monkeypatch, tmp_path):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "1321.T": "JPY"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    _run(monkeypatch, path, ["set", "1321.T", "50"])
+    _run(monkeypatch, path, ["--currency", "JPY", "--risk-free-rate", "0.005", "show"])
+
+    seen = _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["--currency", "USD", "show"])
+
+    assert [rate for _, _, rate in seen] == [pytest.approx(settings.risk_free_rate)]
+
+
+def test_a_negative_rate_is_remembered_for_a_yen_portfolio(monkeypatch, tmp_path):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"1321.T": "JPY"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "1321.T", "50"])
+
+    _run(monkeypatch, path, ["--currency", "JPY", "--risk-free-rate", "-0.001", "show"])
+
+    assert load_risk_free_rate(str(tmp_path / "rates.json"), "JPY") == -0.001
+
+
+def test_a_set_remembers_the_rate_for_the_currency_the_tickers_landed_in(monkeypatch, tmp_path):
+    """`set` needs no --currency: the tickers determine it."""
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"1321.T": "JPY"})
+    _stub_report(monkeypatch)
+
+    _run(monkeypatch, path, ["set", "1321.T", "50", "--risk-free-rate", "0.005"])
+
+    assert load_risk_free_rate(str(tmp_path / "rates.json"), "JPY") == 0.005
+
+
+def test_a_set_that_saved_nothing_remembers_no_rate(monkeypatch, tmp_path):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {})
+    _stub_report(monkeypatch)
+
+    _run(monkeypatch, path, ["set", "NOTATICKER", "10", "--risk-free-rate", "0.04"])
+
+    assert not (tmp_path / "rates.json").exists()
+
+
+def test_a_rate_on_a_show_spanning_two_currencies_is_refused_as_ambiguous(
+    monkeypatch, tmp_path, capsys
+):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "1321.T": "JPY"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    _run(monkeypatch, path, ["set", "1321.T", "50"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run(monkeypatch, path, ["--risk-free-rate", "0.03", "show"])
+
+    assert excinfo.value.code == 2
+    assert "--currency" in capsys.readouterr().err
+    assert not (tmp_path / "rates.json").exists()
+
+
+def test_a_rate_on_a_show_with_exactly_one_saved_currency_needs_no_flag(monkeypatch, tmp_path):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _run(monkeypatch, path, ["--risk-free-rate", "0.0425", "show"])
+
+    assert load_all_risk_free_rates(str(tmp_path / "rates.json")) == {"USD": 0.0425}
+
+
+def test_a_rate_with_nothing_saved_at_all_is_refused_rather_than_inventing_usd(
+    monkeypatch, tmp_path
+):
+    """`_run_show` reports USD there only so the "add some holdings" hint
+    prints; that fallback is not a determination worth writing down.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_report(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, path, ["--risk-free-rate", "0.0425", "show"])
+
+    assert not (tmp_path / "rates.json").exists()
+
+
+def test_a_mistyped_percentage_rate_is_refused_before_any_ticker_lookup(
+    monkeypatch, tmp_path, capsys
+):
+    """4.5 meaning 4.5% must not be remembered - it would make every later
+    MSR run fail inside PyPortfolioOpt naming neither the rate nor the file.
+    """
+    path = tmp_path / "portfolio.json"
+
+    def _fail_if_called(tickers, as_of, db_path):
+        raise AssertionError("validated the tickers before refusing the rate")
+
+    monkeypatch.setattr("src.flow.holdings_cli.validate_and_ingest_tickers", _fail_if_called)
+    _stub_report(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run(monkeypatch, path, ["set", "SPY", "1000", "--risk-free-rate", "4.5"])
+
+    assert excinfo.value.code == 2
+    assert "4.5% is 0.045" in capsys.readouterr().err
+    assert not (tmp_path / "rates.json").exists()
+
+
+def test_a_nan_rate_is_refused(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_report(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        _run(monkeypatch, path, ["--currency", "USD", "--risk-free-rate", "nan", "show"])
+
+    assert "finite" in capsys.readouterr().err
+
+
+def test_a_malformed_rates_file_exits_two_rather_than_printing_a_traceback(
+    monkeypatch, tmp_path, capsys
+):
+    path = tmp_path / "portfolio.json"
+    rates_path = tmp_path / "rates.json"
+    rates_path.write_text("{not json")
+    _stub_report(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run(monkeypatch, path, ["--currency", "USD", "show"])
+
+    assert excinfo.value.code == 2
+    assert "JSON" in capsys.readouterr().err
+
+
+def test_re_remembering_the_same_rate_announces_nothing(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    _run(monkeypatch, path, ["--currency", "USD", "--risk-free-rate", "0.0425", "show"])
+
+    capsys.readouterr()
+    _run(monkeypatch, path, ["--currency", "USD", "--risk-free-rate", "0.0425", "show"])
+
+    assert "Remembered" not in capsys.readouterr().out
+
+
+# --- the provenance line ---------------------------------------------------
+
+
+def test_the_report_names_where_the_rate_came_from(capsys):
+    print_user_portfolio(_stats(), "memory/portfolio.json", "remembered for USD")
+    assert "Risk-free rate used: 0.0200 (remembered for USD)" in capsys.readouterr().out
+
+
+def test_the_report_states_the_configured_default_as_a_source_too(capsys):
+    """A bare number is what the bug looked like; every rate names a source."""
+    print_user_portfolio(_stats(), "memory/portfolio.json", "the configured default")
+    assert "Risk-free rate used: 0.0200 (the configured default)" in capsys.readouterr().out
+
+
+def test_the_rate_and_its_origin_print_even_when_there_are_no_figures(capsys):
+    """The reader of an n/a block is the one most likely to be working out
+    why the numbers moved.
+    """
+    print_user_portfolio(
+        unavailable_holdings("JPY", {"1321.T": 50.0}, 0.005, "fetching was disabled"),
+        "memory/portfolio.json",
+        "remembered for JPY",
+    )
+    out = capsys.readouterr().out
+
+    assert "Figures: n/a - fetching was disabled" in out
+    assert "Risk-free rate used: 0.0050 (remembered for JPY)" in out
