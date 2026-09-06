@@ -274,6 +274,8 @@ def _stats(**overrides) -> HoldingsStats:
         positions={"SPY": 1000.0, "T": 500.0},
         weights={"SPY": 0.8, "T": 0.2},
         market_values={"SPY": 80_000.0, "T": 20_000.0},
+        expected_returns={"SPY": 0.1225, "T": 0.0810},
+        volatility={"SPY": 0.1481, "T": 0.2033},
         total_value=100_000.0,
         annual_return=0.1234,
         annual_volatility=0.1500,
@@ -301,10 +303,51 @@ def test_the_report_states_the_window_and_the_rate_the_figures_came_from(capsys)
 
 def test_holdings_are_listed_heaviest_first_with_value_and_weight(capsys):
     print_user_portfolio(_stats(), "memory/portfolio.json")
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("  ")]
+    lines = [line for line in capsys.readouterr().out.splitlines() if "shares" in line]
 
     assert lines[0] == "  SPY: 1,000 shares  $80,000.00 USD  weight 0.8000"
     assert lines[1] == "  T: 500 shares  $20,000.00 USD  weight 0.2000"
+
+
+def test_each_holdings_own_annualized_return_and_volatility_are_reported(capsys):
+    """The same section, wording and position `print_weights_and_allocation`
+    gives an optimized pool, so the two blocks of one report read against
+    each other line for line.
+    """
+    print_user_portfolio(_stats(), "memory/portfolio.json")
+    out = capsys.readouterr().out
+
+    assert "Expected return / volatility (annualized):" in out
+    assert "  SPY: return=0.1225  volatility=0.1481" in out
+    assert "  T: return=0.0810  volatility=0.2033" in out
+
+
+def test_the_per_holding_figures_follow_the_same_order_as_the_positions(capsys):
+    print_user_portfolio(_stats(), "memory/portfolio.json")
+    figures = [line for line in capsys.readouterr().out.splitlines() if "return=" in line]
+
+    assert figures[0].startswith("  SPY:")
+    assert figures[1].startswith("  T:")
+
+
+def test_an_excluded_holding_gets_no_per_holding_figure_line(capsys):
+    """It has no estimate to print - the same reason
+    `print_weights_and_allocation` covers only the weighted tickers.
+    """
+    print_user_portfolio(
+        _stats(
+            positions={"SPY": 1000.0, "NEWCO": 40.0},
+            weights={"SPY": 1.0},
+            market_values={"SPY": 98_000.0, "NEWCO": 2_000.0},
+            expected_returns={"SPY": 0.1225},
+            volatility={"SPY": 0.1481},
+            excluded={"NEWCO": "8 month(s) of monthly returns in the window, under 24"},
+        ),
+        "memory/portfolio.json",
+    )
+    figures = [line for line in capsys.readouterr().out.splitlines() if "return=" in line]
+
+    assert figures == ["  SPY: return=0.1225  volatility=0.1481"]
 
 
 def test_an_excluded_holding_is_named_with_its_reason_and_value_share(capsys):
@@ -313,6 +356,8 @@ def test_an_excluded_holding_is_named_with_its_reason_and_value_share(capsys):
             positions={"SPY": 1000.0, "NEWCO": 40.0},
             weights={"SPY": 1.0},
             market_values={"SPY": 98_000.0, "NEWCO": 2_000.0},
+            expected_returns={"SPY": 0.1225},
+            volatility={"SPY": 0.1481},
             total_value=100_000.0,
             excluded={"NEWCO": "8 month(s) of monthly returns in the window, under 24"},
         ),

@@ -11,8 +11,12 @@ derives weights from what is owned - `shares * price` as a fraction of the
 whole. The measurement itself is deliberately not reimplemented here: it
 comes from that module's `stats_for_weights`, which shares its estimators
 with the optimizer and with `src/optimizer/benchmark.py`, so a held
-portfolio's three figures can be printed directly beneath an optimized
-pool's and the market's and honestly compared with them.
+portfolio's figures can be printed directly beneath an optimized pool's and
+the market's and honestly compared with them. That covers the per-HOLDING
+annualized return and volatility as well as the portfolio-level three:
+knowing that a portfolio returned 12% at 15% volatility raises the
+immediate question of which holding contributed what, and the report for an
+optimized pool has always answered it.
 
 Two reporting rules shape this module, both chosen deliberately (see
 `plans/13_user_portfolio.md`'s Decision Log):
@@ -85,12 +89,24 @@ class HoldingsStats(NamedTuple):
     likewise survive an unavailable report whenever they are knowable - a
     portfolio whose value can be priced but whose history is too short to
     measure should still tell the user what it is worth.
+
+    `expected_returns` and `volatility` are the annualized per-HOLDING
+    estimates the three portfolio-level figures were computed from, named to
+    match `src/optimizer/portfolio.py`'s `PortfolioStats` fields so the
+    report can render a held portfolio's "Expected return / volatility
+    (annualized)" section exactly as it renders an optimized pool's. They
+    cover only the measured holdings, since an excluded one has no estimate
+    to report - which is the one place these two records legitimately
+    differ, `PortfolioStats` carrying every ticker the optimizer considered
+    including the ones it gave no weight.
     """
 
     currency: str
     positions: dict[str, float]
     weights: dict[str, float]
     market_values: dict[str, float]
+    expected_returns: dict[str, float]
+    volatility: dict[str, float]
     total_value: float | None
     annual_return: float | None
     annual_volatility: float | None
@@ -126,6 +142,8 @@ def unavailable_holdings(
         positions=positions,
         weights={},
         market_values=market_values or {},
+        expected_returns={},
+        volatility={},
         total_value=total_value,
         annual_return=None,
         annual_volatility=None,
@@ -295,19 +313,19 @@ def holdings_stats(
     measured_value = float(sum(market_values[t] for t in measured))
     measured_weights = {t: market_values[t] / measured_value for t in measured}
 
-    annual_return, annual_volatility, sharpe = stats_for_weights(
-        matrix, measured_weights, risk_free_rate
-    )
+    measured_stats = stats_for_weights(matrix, measured_weights, risk_free_rate)
 
     return HoldingsStats(
         currency=currency,
         positions=positions,
         weights=measured_weights,
         market_values=market_values,
+        expected_returns={t: measured_stats.expected_returns[t] for t in measured},
+        volatility={t: measured_stats.volatility[t] for t in measured},
         total_value=total_value,
-        annual_return=annual_return,
-        annual_volatility=annual_volatility,
-        sharpe=sharpe,
+        annual_return=measured_stats.portfolio_expected_return,
+        annual_volatility=measured_stats.portfolio_volatility,
+        sharpe=measured_stats.portfolio_sharpe,
         risk_free_rate=float(risk_free_rate),
         window_start=matrix.index.min().date(),
         window_end=matrix.index.max().date(),

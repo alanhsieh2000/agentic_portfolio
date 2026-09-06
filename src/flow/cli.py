@@ -239,6 +239,15 @@ def print_user_portfolio(holdings: HoldingsStats, path: str) -> None:
     whose derivation is not stated beside it invites being compared with one
     derived differently.
 
+    The per-holding `Expected return / volatility (annualized)` section is
+    the same section, in the same wording and the same position relative to
+    the portfolio-level line, that `print_weights_and_allocation` prints for
+    an optimized pool - deliberately, so the two blocks of one report can be
+    read against each other line for line. It covers only the holdings
+    behind the figures, in the same order as the positions above it, for the
+    same reason that function covers only the weighted tickers: a holding
+    with no estimate has nothing to print.
+
     A portfolio with no figures at all prints its reason in the `n/a -
     reason` shape `format_benchmark` already uses, and prints nothing else
     when there are also no positions to list.
@@ -269,6 +278,16 @@ def print_user_portfolio(holdings: HoldingsStats, path: str) -> None:
     else:
         print(f"Returns window: {holdings.window_start} to {holdings.window_end} "
               f"({holdings.window_months} month(s) of monthly returns)")
+        # Same section, same wording and same position relative to the
+        # portfolio-level line as `print_weights_and_allocation` gives an
+        # optimized pool - so the two blocks of one report can be read
+        # against each other line for line, which is the whole reason for
+        # printing them together.
+        print("Expected return / volatility (annualized):")
+        for ticker in ordered:
+            if ticker in holdings.expected_returns:
+                print(f"  {ticker}: return={holdings.expected_returns[ticker]:.4f}  "
+                      f"volatility={holdings.volatility[ticker]:.4f}")
         print(f"Annual return: {holdings.annual_return:.4f}  "
               f"Annual volatility: {holdings.annual_volatility:.4f}  "
               f"Sharpe: {holdings.sharpe:.4f}")

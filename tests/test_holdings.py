@@ -30,6 +30,7 @@ from src.optimizer.holdings import (
     stored_month_counts,
     weights_from_positions,
 )
+from src.optimizer.portfolio import compute_weights_and_stats
 
 
 def _monthly_returns(n: int, ticker: str, start: str = "2020-01-01", shift: int = 0) -> pd.Series:
@@ -131,6 +132,58 @@ def test_a_one_holding_portfolio_equals_its_own_benchmark(tmp_path):
     assert held.annual_return == pytest.approx(benchmark.annual_return, abs=1e-9)
     assert held.annual_volatility == pytest.approx(benchmark.annual_volatility, abs=1e-9)
     assert held.sharpe == pytest.approx(benchmark.sharpe, abs=1e-9)
+
+
+def test_each_holdings_own_figures_match_what_the_optimizer_reports_for_it(tmp_path):
+    """The per-holding estimates must be the same numbers
+    `compute_weights_and_stats` reports for the same tickers over the same
+    months, because both blocks appear in one report and a reader will
+    compare a holding's line against the same ticker's line in the pool
+    above it. Same estimators, same shrinkage, same cross-section - so same
+    numbers.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    spy, t = _monthly_returns(60, "SPY"), _monthly_returns(60, "T", shift=1)
+    _make_db(db_path, [spy, t], {"SPY": 600.0, "T": 20.0})
+
+    held = holdings_stats({"SPY": 100.0, "T": 500.0}, AS_OF, db_path, "USD")
+    pool = compute_weights_and_stats(
+        pd.concat([spy, t], axis=1), "GMV", risk_free_rate=held.risk_free_rate
+    )
+
+    for ticker in ("SPY", "T"):
+        assert held.expected_returns[ticker] == pytest.approx(
+            pool.expected_returns[ticker], abs=1e-9
+        )
+        assert held.volatility[ticker] == pytest.approx(pool.volatility[ticker], abs=1e-9)
+
+
+def test_an_excluded_holding_has_no_per_holding_figures(tmp_path):
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(
+        db_path,
+        [_monthly_returns(60, "SPY"), _monthly_returns(8, "NEWCO", start="2025-05-01")],
+        {"SPY": 600.0, "NEWCO": 25.0},
+    )
+
+    held = holdings_stats({"SPY": 100.0, "NEWCO": 40.0}, AS_OF, db_path, "USD")
+
+    assert set(held.expected_returns) == {"SPY"}
+    assert set(held.volatility) == {"SPY"}
+
+
+def test_a_one_holding_portfolios_own_figure_is_the_portfolio_figure(tmp_path):
+    """With a single holding at full weight the per-holding line and the
+    portfolio line describe the same thing, and printing two different
+    numbers there would be visibly wrong.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+
+    held = holdings_stats({"SPY": 1000.0}, AS_OF, db_path, "USD")
+
+    assert held.expected_returns["SPY"] == pytest.approx(held.annual_return, abs=1e-9)
+    assert held.volatility["SPY"] == pytest.approx(held.annual_volatility, abs=1e-9)
 
 
 def test_the_reported_window_comes_from_the_data_actually_used(tmp_path):

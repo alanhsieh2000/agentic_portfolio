@@ -463,15 +463,15 @@ def compute_weights_and_stats(
     if objective == "MV":
         _validate_efficient_return_result(weights, ef, target_annual_return)
 
-    volatility = pd.Series(np.sqrt(np.diag(cov_matrix.to_numpy())), index=cov_matrix.columns)
+    expected_returns, volatility = _per_ticker_figures(mu, cov_matrix)
     portfolio_return, portfolio_volatility, sharpe = ef.portfolio_performance(risk_free_rate=risk_free_rate)
 
     window_index = returns_matrix.index
 
     return PortfolioStats(
         weights=weights,
-        expected_returns={t: float(v) for t, v in mu.items()},
-        volatility={t: float(v) for t, v in volatility.items()},
+        expected_returns=expected_returns,
+        volatility=volatility,
         portfolio_expected_return=float(portfolio_return),
         portfolio_volatility=float(portfolio_volatility),
         portfolio_sharpe=float(sharpe),
@@ -483,24 +483,71 @@ def compute_weights_and_stats(
     )
 
 
+def _per_ticker_figures(
+    mu: pd.Series, cov_matrix: pd.DataFrame
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Per-ticker annualized expected return and volatility as
+    `({ticker: mu}, {ticker: volatility})`.
+
+    Volatility is the square root of `cov_matrix`'s diagonal - deliberately
+    NOT each column's own `std * sqrt(12)`. `cov_matrix` comes from
+    `_estimate_mu_and_cov`, so it is Ledoit-Wolf shrunk and estimated on
+    `_covariance_input`'s complete-overlap window; taking the diagonal keeps
+    a ticker's reported volatility consistent with the covariance the
+    portfolio-level figure was computed from, rather than printing a number
+    that cannot be reconciled with the one below it.
+
+    Shared by `compute_weights_and_stats` and `stats_for_weights` so that an
+    optimized pool and a held portfolio report per-ticker figures the same
+    way - the same reason `_estimate_mu_and_cov` itself is shared.
+    """
+    volatility = pd.Series(np.sqrt(np.diag(cov_matrix.to_numpy())), index=cov_matrix.columns)
+    return (
+        {ticker: float(value) for ticker, value in mu.items()},
+        {ticker: float(value) for ticker, value in volatility.items()},
+    )
+
+
+class WeightedStats(NamedTuple):
+    """`stats_for_weights`'s result: the portfolio-level triplet for a given
+    weight vector, plus the per-ticker estimates behind it.
+
+    Field names deliberately match `PortfolioStats`' own, so a caller
+    rendering an optimized pool and a caller rendering a held portfolio read
+    the same names off the same-shaped record. `expected_returns` and
+    `volatility` cover every ticker in the returns matrix, not only the
+    weighted ones - narrowing to what actually carries weight is a display
+    decision, the same division of labour `PortfolioStats` documents.
+    """
+
+    expected_returns: dict[str, float]
+    volatility: dict[str, float]
+    portfolio_expected_return: float
+    portfolio_volatility: float
+    portfolio_sharpe: float
+
+
 def stats_for_weights(
     returns_matrix: pd.DataFrame,
     weights: dict[str, float],
     risk_free_rate: float = settings.risk_free_rate,
-) -> tuple[float, float, float]:
+) -> WeightedStats:
     """The annualized return, annualized volatility and Sharpe ratio of a
-    weight vector SOMEBODY ELSE chose, as `(annual_return,
-    annual_volatility, sharpe)`.
+    weight vector SOMEBODY ELSE chose, together with the per-ticker
+    estimates behind them.
 
     The counterpart to `compute_weights_and_stats`, which picks the weights
     itself: here the weights are a given - a user's actual share holdings
     turned into value shares by `src/optimizer/holdings.py` - and only the
     measurement is this function's job. Both route through
-    `_estimate_mu_and_cov` and PyPortfolioOpt's own definition of the three
-    figures (`portfolio_performance`, i.e. `w'mu`, `sqrt(w'Sigma w)` and
+    `_estimate_mu_and_cov`, `_per_ticker_figures`, and PyPortfolioOpt's own
+    definition of the three portfolio-level figures
+    (`portfolio_performance`, i.e. `w'mu`, `sqrt(w'Sigma w)` and
     `(w'mu - rf) / sqrt(w'Sigma w)`), so a held portfolio's figures are
     directly comparable with an optimized pool's and with a benchmark's
-    rather than merely resembling them.
+    rather than merely resembling them - per-ticker figures included, which
+    is what lets one report print an "Expected return / volatility
+    (annualized)" section for either kind of portfolio.
 
     Because `returns_matrix` is a genuine cross-section, its covariance is
     Ledoit-Wolf shrunk exactly as an optimized pool's is - see
@@ -527,7 +574,15 @@ def stats_for_weights(
     annual_return, annual_volatility, sharpe = portfolio_performance(
         aligned, mu, cov_matrix, verbose=False, risk_free_rate=float(risk_free_rate)
     )
-    return float(annual_return), float(annual_volatility), float(sharpe)
+    expected_returns, volatility = _per_ticker_figures(mu, cov_matrix)
+
+    return WeightedStats(
+        expected_returns=expected_returns,
+        volatility=volatility,
+        portfolio_expected_return=float(annual_return),
+        portfolio_volatility=float(annual_volatility),
+        portfolio_sharpe=float(sharpe),
+    )
 
 
 def _load_prices_up_to(tickers: list[str], as_of: date, db_path: str) -> pd.DataFrame:

@@ -398,10 +398,20 @@ Output shape, with money rendered through the existing `format_money` so the uni
       T:    500 shares   $21,905.00 USD  weight 0.0309
     Total value: $709,325.00 USD
     Returns window: 2021-10-01 to 2026-09-01 (60 month(s) of monthly returns)
+    Expected return / volatility (annualized):
+      SPY: return=0.1225  volatility=0.1736
+      T: return=0.1382  volatility=0.2554
     Annual return: 0.1198  Annual volatility: 0.1451  Sharpe: 0.6879
     Risk-free rate used: 0.0200
 
-with an indented `Excluded from the figures:` section appended, one entry per exclusion, whenever `excluded` is non-empty:
+The `Expected return / volatility (annualized)` section is the same section, in the same
+wording and the same position relative to the portfolio-level line, that
+`print_weights_and_allocation` prints for an optimized pool - so the two blocks of one report
+can be read against each other line for line. It covers only the holdings behind the figures,
+in the same order as the positions above it, for the same reason that function covers only the
+weighted tickers: a holding with no estimate has nothing to print.
+
+An indented `Excluded from the figures:` section is appended, one entry per exclusion, whenever `excluded` is non-empty:
 
     Excluded from the figures:
       NEWCO: 8 month(s) of monthly returns in the window, under 24 (2.0% of total value)
@@ -638,9 +648,13 @@ In `src/optimizer/portfolio.py`:
     def _estimate_mu_and_cov(returns_matrix: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]: ...
     def load_returns_matrix_unfiltered(tickers: list[str], as_of: date, lookback_months: int = 60,
                                        db_path: str = settings.db_path) -> pd.DataFrame: ...
+    def _per_ticker_figures(mu: pd.Series, cov_matrix: pd.DataFrame
+                            ) -> tuple[dict[str, float], dict[str, float]]: ...
+    class WeightedStats(NamedTuple): ...     # expected_returns, volatility, and the three
+                                             # portfolio-level figures
     def stats_for_weights(returns_matrix: pd.DataFrame, weights: dict[str, float],
                           risk_free_rate: float = settings.risk_free_rate
-                          ) -> tuple[float, float, float]: ...
+                          ) -> WeightedStats: ...
 
 In `src/optimizer/holdings.py`:
 
@@ -709,3 +723,22 @@ In `pyproject.toml`, under `[project.scripts]`:
   say why they are shared: the typed-order rule protects against the same first-ticker-picks-the-
   currency hazard for portfolios that it already protected candidate pools from, and two commands
   that disagreed about what `--date today` means would be worse than a shared name.
+- 2026-09-06, after a live test: the holdings block now prints each holding's own annualized
+  expected return and volatility, not only the portfolio-level three. The omission was a real
+  gap rather than a style choice - the report for an optimized pool has always answered "which
+  holding contributed what", and a reader looking at two blocks in one report will compare a
+  holding's line against the same ticker's line in the pool above it. Delivered by extracting
+  `_per_ticker_figures` from `compute_weights_and_stats` (so exactly one place turns `(mu,
+  cov_matrix)` into per-ticker figures) and widening `stats_for_weights`' return from a bare
+  triplet to a `WeightedStats` record carrying both maps, which `HoldingsStats` now echoes
+  under the same field names `PortfolioStats` uses. Pinned by
+  `tests/test_holdings.py::test_each_holdings_own_figures_match_what_the_optimizer_reports_for_it`,
+  which asserts the per-holding numbers equal what `compute_weights_and_stats` reports for the
+  same tickers over the same months.
+
+  Worth knowing when reading the output: a holding's printed volatility depends on the
+  cross-section it sits in, because the covariance is Ledoit-Wolf shrunk. `SPY` alone reports
+  0.1481; in a three-holding portfolio beside `GOOGL` and `T` the same `SPY` reports 0.1736.
+  That is the shrinkage behaviour `src/optimizer/benchmark.py`'s module docstring already
+  documents at length, it is identical to what an optimized pool's report does, and it is the
+  reason the benchmark is deliberately never folded into a pool's matrix.
