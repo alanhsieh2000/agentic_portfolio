@@ -25,6 +25,15 @@ assumption about - whatever the person is asked for once and thereafter
 remembered. `--benchmark` overrides it for a run, `[b]` changes it
 mid-session, and `--benchmark none` leaves the comparison out.
 
+The report ends with the portfolio the user ACTUALLY holds, read from
+`memory/portfolio.json` (maintained by `uv run portfolio-holdings`) for
+this run's own currency: what is held, what it is worth, and its
+annualized return, volatility and Sharpe ratio measured with the same
+estimators and the same `--risk-free-rate` as the pool's and the
+benchmark's - so the optimizer's suggestion, the market, and what the
+person owns can all be read on one scale. `--no-holdings` leaves that
+block out; `--no-holdings-fetch` restricts it to cached data.
+
 `--selection user_provided` runs neither agent. It instead shows the
 candidate pool persisted at `--memory-path` (`memory/candidates.json` by
 default) and prompts add/remove until the user confirms it, validating each
@@ -56,15 +65,18 @@ from src.flow.interactive import (
     edit_candidates,
     open_pipeline_session,
     prepare_benchmark,
+    prepare_holdings,
     run_pipeline_against,
     validate_and_edit_candidates,
 )
+from src.flow.user_portfolio import DEFAULT_PORTFOLIO_PATH, load_portfolio
 from src.optimizer.benchmark import (
     BenchmarkSource,
     BenchmarkStats,
     benchmark_stats_for_window,
     resolve_benchmark_ticker,
 )
+from src.optimizer.holdings import HoldingsStats
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
 
 
@@ -77,7 +89,14 @@ printed too. A currency absent from this table simply prints its code.
 """
 
 
-def _parse_date(value: str) -> date:
+def parse_date(value: str) -> date:
+    """A `--date` argument as a `date`: an ISO `YYYY-MM-DD`, or `"today"`.
+
+    Public because `src/flow/holdings_cli.py` parses the same `--date`
+    argument and must accept exactly the same values - two commands that
+    disagreed about what `"today"` means would be worse than the shared
+    name.
+    """
     return date.today() if value == "today" else date.fromisoformat(value)
 
 
@@ -185,6 +204,84 @@ def print_weights_and_allocation(
     for ticker, count in sorted(shares.items()):
         print(f"  {ticker}: {count}")
     print(f"Leftover cash: {format_money(leftover_cash, currency)}")
+
+
+def format_share_count(shares: float) -> str:
+    """A share count with a thousands separator and no decimal noise:
+    `'1,000'` for a whole holding, `'0.5432'` for a fractional one.
+
+    Brokers sell fractional shares, so the count cannot simply be rendered
+    as an integer - but neither should a plain 1000-share holding print as
+    `1,000.0000`, which reads like a precision claim nobody made.
+    """
+    if float(shares).is_integer():
+        return f"{int(shares):,}"
+    return f"{shares:,.4f}".rstrip("0").rstrip(".")
+
+
+def print_user_portfolio(holdings: HoldingsStats, path: str) -> None:
+    """Human-readable rendering of the user's OWN saved portfolio (see
+    `src/flow/user_portfolio.py` and `src/optimizer/holdings.py`) - what is
+    held, what it is worth, and its annualized return, volatility and
+    Sharpe ratio.
+
+    The file it came from is named in the header, because these figures
+    describe stored state rather than anything the current command line
+    said, and a reader who disagrees with them needs to know which file to
+    edit.
+
+    Every position is listed, including one excluded from the figures, since
+    this block doubles as the record of what the user owns; an excluded
+    holding shows `weight n/a` and is explained by name underneath. The
+    returns window and the risk-free rate are printed whenever figures are,
+    never only on request: the same holdings measured over a different
+    window or against a different rate are different numbers, and a figure
+    whose derivation is not stated beside it invites being compared with one
+    derived differently.
+
+    A portfolio with no figures at all prints its reason in the `n/a -
+    reason` shape `format_benchmark` already uses, and prints nothing else
+    when there are also no positions to list.
+    """
+    currency = holdings.currency
+    if not holdings.positions:
+        print(f"\nYour portfolio ({currency}): n/a - {holdings.unavailable_reason}")
+        return
+
+    print(f"\nYour portfolio ({currency}), from {path}:")
+    ordered = sorted(
+        holdings.positions,
+        key=lambda t: (-holdings.weights.get(t, -1.0), t),
+    )
+    for ticker in ordered:
+        value = holdings.market_values.get(ticker)
+        value_text = format_money(value, currency) if value is not None else "value n/a"
+        weight = holdings.weights.get(ticker)
+        weight_text = f"weight {weight:.4f}" if weight is not None else "weight n/a"
+        print(f"  {ticker}: {format_share_count(holdings.positions[ticker])} shares  "
+              f"{value_text}  {weight_text}")
+
+    if holdings.total_value is not None:
+        print(f"Total value: {format_money(holdings.total_value, currency)}")
+
+    if holdings.unavailable_reason is not None:
+        print(f"Figures: n/a - {holdings.unavailable_reason}")
+    else:
+        print(f"Returns window: {holdings.window_start} to {holdings.window_end} "
+              f"({holdings.window_months} month(s) of monthly returns)")
+        print(f"Annual return: {holdings.annual_return:.4f}  "
+              f"Annual volatility: {holdings.annual_volatility:.4f}  "
+              f"Sharpe: {holdings.sharpe:.4f}")
+        print(f"Risk-free rate used: {holdings.risk_free_rate:.4f}")
+
+    if holdings.excluded:
+        print("Excluded from the figures:")
+        for ticker in sorted(holdings.excluded):
+            share = ""
+            value = holdings.market_values.get(ticker)
+            if value is not None and holdings.total_value:
+                share = f" ({value / holdings.total_value:.1%} of total value)"
+            print(f"  {ticker}: {holdings.excluded[ticker]}{share}")
 
 
 def print_pipeline_result(result: dict) -> None:
@@ -711,9 +808,30 @@ def main() -> None:
              "One file holds one pool per currency, so this is not how currencies are kept apart; "
              "when several pools are saved you are asked which to resume.",
     )
+    parser.add_argument(
+        "--holdings-path",
+        default=DEFAULT_PORTFOLIO_PATH,
+        help="Which file the portfolio you actually hold is read from, for the holdings block at "
+             "the end of the report. Maintained by 'uv run portfolio-holdings'; one file holds "
+             "one portfolio per currency, and the one matching this run's currency is reported.",
+    )
+    parser.add_argument(
+        "--no-holdings",
+        action="store_true",
+        help="Leave the holdings block out of the report entirely - the counterpart of "
+             "'--benchmark none'. Use it when you keep no record of your holdings here and do "
+             "not want to be told so on every run.",
+    )
+    parser.add_argument(
+        "--no-holdings-fetch",
+        action="store_true",
+        help="Measure the holdings only from returns this session's database already holds, "
+             "never by fetching. Keeps a backtest-window run entirely offline, at the cost of "
+             "reporting the holdings as unmeasurable when the cache does not contain them.",
+    )
     args = parser.parse_args()
 
-    rebalance_date = _parse_date(args.date)
+    rebalance_date = parse_date(args.date)
 
     benchmark_enabled = args.benchmark != BENCHMARK_DISABLED
     benchmark_override = args.benchmark if benchmark_enabled else None
@@ -749,6 +867,27 @@ def main() -> None:
             risk_free_rate=args.risk_free_rate, currency=currency, benchmark=benchmark,
         )
         print_pipeline_result(result)
+
+        # Printed once, here, rather than from inside
+        # `print_weights_and_allocation`: that function reprints the pool's
+        # currency, window and benchmark after every interactive edit
+        # because those are what an edit changes, and an edit to the
+        # candidate pool changes nothing about what the user owns. Repeating
+        # three unchanged numbers after every keystroke would be noise, and
+        # would imply a relationship between the edit and the holdings that
+        # does not exist.
+        if not args.no_holdings:
+            print_user_portfolio(
+                prepare_holdings(
+                    load_portfolio(args.holdings_path, currency),
+                    currency,
+                    rebalance_date,
+                    session_db_path,
+                    risk_free_rate=args.risk_free_rate,
+                    allow_fetch=not args.no_holdings_fetch,
+                ),
+                args.holdings_path,
+            )
 
         _run_edit_loop(
             result["scan_detail"]["candidates"], args.objective, args.value, rebalance_date, session_db_path,

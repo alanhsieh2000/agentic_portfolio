@@ -18,6 +18,14 @@ candidate lists), tearing it down only when the `with` block exits -
 one such session, for callers (a future backtest runner, tests) that only
 need one shot and never edit anything.
 
+`prepare_holdings` is a fourth thing a session reports on, and the one
+piece here that is not about the candidate pool at all: the user's own
+saved holdings (`memory/portfolio.json`), measured with the same estimators
+so the three sets of figures - what the optimizer suggests, what the market
+did, and what the user actually owns - can be read on one scale. Like the
+benchmark, its data is resolved into a database of its own; see that
+function for why that is a correctness rule.
+
 `prepare_benchmark` is the third thing a session sets up, beside the
 snapshot and the candidates: the ticker standing in for "the market" in the
 report, resolved once into its whole monthly-return history so every
@@ -53,6 +61,13 @@ from src.optimizer.benchmark import (
     benchmark_stats_for_window,
     empty_benchmark_returns,
     load_benchmark_returns,
+)
+from src.optimizer.holdings import (
+    HOLDINGS_MIN_MONTHS,
+    HoldingsStats,
+    holdings_stats,
+    stored_month_counts,
+    unavailable_holdings,
 )
 from src.optimizer.portfolio import (
     DEFAULT_TARGET_ANNUAL_RETURN,
@@ -259,6 +274,188 @@ def prepare_benchmark(
         )
 
 
+def _holdings_currency_gate(
+    positions: dict[str, float], currency: str, currencies: dict[str, str]
+) -> dict[str, str]:
+    """Which held tickers do not trade in `currency`, mapped to a sentence
+    saying so - the holdings equivalent of `_benchmark_currency_gate`.
+
+    `memory/portfolio.json` keys its portfolios by currency, and
+    `uv run portfolio-holdings` refuses a cross-currency ticker as it is
+    typed, so this should normally find nothing. It is still worth checking,
+    for the same reason `_require_single_currency` guards the optimizer: the
+    file is hand-editable, and the failure this prevents is not a crash but
+    a silently wrong report. Summing a yen holding's value into a dollar
+    total would produce a `Total value` that is not an amount of anything,
+    and weights derived from it would be wrong for every holding, not just
+    the misplaced one.
+
+    Reported as exclusions rather than raised, because this is a report:
+    naming the offending holding and measuring the rest is more useful than
+    printing nothing.
+    """
+    return {
+        ticker: (
+            f"priced in {currencies.get(ticker, DEFAULT_CURRENCY)}, "
+            f"but this is the {currency} portfolio"
+        )
+        for ticker in positions
+        if currencies.get(ticker, DEFAULT_CURRENCY) != currency
+    }
+
+
+def _holdings_stats_excluding(
+    positions: dict[str, float],
+    currency: str,
+    rebalance_date: date,
+    db_path: str,
+    risk_free_rate: float,
+    excluded: dict[str, str],
+) -> HoldingsStats:
+    """`holdings_stats` over the holdings NOT in `excluded`, with those
+    exclusions merged back into the result and `positions` restored to the
+    full set the user actually owns.
+
+    An already-excluded holding is withheld from `holdings_stats` rather
+    than merely annotated afterwards, because that function's
+    `total_value` sums every position it is given - and a holding excluded
+    for trading in the wrong currency, or for not resolving at all, must not
+    contribute to a total denominated in this portfolio's currency.
+    """
+    measurable = {t: shares for t, shares in positions.items() if t not in excluded}
+    if not measurable:
+        return unavailable_holdings(
+            currency,
+            positions,
+            risk_free_rate,
+            "no holding could be measured: " + "; ".join(
+                f"{ticker} ({reason})" for ticker, reason in sorted(excluded.items())
+            ),
+            excluded=excluded,
+        )
+
+    stats = holdings_stats(measurable, rebalance_date, db_path, currency, risk_free_rate)
+    return stats._replace(positions=positions, excluded={**excluded, **stats.excluded})
+
+
+def _resolve_holdings(
+    positions: dict[str, float],
+    currency: str,
+    rebalance_date: date,
+    db_path: str,
+    risk_free_rate: float,
+    allow_fetch: bool,
+) -> HoldingsStats:
+    """`prepare_holdings`'s body, split out so every failure mode it can
+    raise is caught in one place by its caller.
+
+    Reads `db_path` first because that read is free, offline and read-only,
+    and it hits whenever the holdings are already cached - every holding of
+    a backtest-window run against `data/portfolio.duckdb`, for instance.
+    Only when that yields less than `HOLDINGS_MIN_MONTHS` for a holding -
+    the same bar below which the report would decline to measure it anyway -
+    is a fetch worth making.
+
+    The condition is deliberately "EVERY holding has enough" rather than
+    "some holding does". In a live `user_provided` run the session database
+    holds only the candidate pool's tickers, so a partial hit there would
+    quietly measure the holdings that happen to also be candidates and
+    exclude every other one for thin history - reporting a number for a
+    slice of the portfolio chosen by an unrelated coincidence.
+    """
+    tickers = sorted(positions)
+    counts = stored_month_counts(tickers, rebalance_date, db_path)
+    if all(count >= HOLDINGS_MIN_MONTHS for count in counts.values()):
+        currencies = load_ticker_currencies(tickers, db_path)
+        return _holdings_stats_excluding(
+            positions, currency, rebalance_date, db_path, risk_free_rate,
+            _holdings_currency_gate(positions, currency, currencies),
+        )
+
+    if not allow_fetch:
+        short = sorted(t for t in tickers if counts[t] < HOLDINGS_MIN_MONTHS)
+        return unavailable_holdings(
+            currency,
+            positions,
+            risk_free_rate,
+            f"{', '.join(short)} ha{'s' if len(short) == 1 else 've'} under "
+            f"{HOLDINGS_MIN_MONTHS} month(s) of returns in this session's database and "
+            "fetching more was disabled with --no-holdings-fetch",
+        )
+
+    with build_scratch_snapshot(prefix="holdings_snapshot_") as scratch_db_path:
+        valid, invalid, currencies = validate_and_ingest_tickers(
+            tickers, rebalance_date, scratch_db_path
+        )
+        excluded = {ticker: reason for ticker, reason in invalid.items()}
+        excluded.update(
+            _holdings_currency_gate(
+                {t: positions[t] for t in valid if t in positions}, currency, currencies
+            )
+        )
+        return _holdings_stats_excluding(
+            positions, currency, rebalance_date, scratch_db_path, risk_free_rate, excluded
+        )
+
+
+def prepare_holdings(
+    positions: dict[str, float],
+    currency: str,
+    rebalance_date: date,
+    db_path: str,
+    risk_free_rate: float = settings.risk_free_rate,
+    allow_fetch: bool = True,
+) -> HoldingsStats:
+    """Measure the user's own saved portfolio (`positions`, as read from
+    `memory/portfolio.json` by `src/flow/user_portfolio.py`), resolving the
+    prices and monthly returns it needs first.
+
+    The prices and returns are fetched into a throwaway database of their
+    OWN (`build_scratch_snapshot`), never into `db_path`, and this is a
+    correctness requirement rather than tidiness - the same rule
+    `prepare_benchmark` obeys, for the same two reasons. The shared
+    `data/portfolio.duckdb` cache holds the S&P 500 universe and must not
+    gain rows as a side effect of printing a report. And
+    `src/optimizer/portfolio.py`'s `_load_window_dates` derives a
+    portfolio's returns window from `SELECT DISTINCT rebalance_date FROM
+    returns` - the whole table, not the requested tickers - so writing the
+    holdings' months into the session's database could move the very window
+    the candidate pool being optimized is measured over. Keeping the
+    databases apart makes "the user's holdings never influence the
+    optimizer's inputs" structural instead of a convention someone has to
+    remember.
+
+    An empty `positions` never touches a database at all: it comes straight
+    back as the "nothing saved for this currency" report, which is a
+    legitimate state rather than an error.
+
+    `allow_fetch=False` restricts this to what `db_path` already holds, so a
+    backtest-window run stays entirely offline - at the cost of reporting
+    the holdings as unmeasurable when the cache does not contain them.
+
+    Never raises. Anything that goes wrong - a yfinance error, a malformed
+    response, an unwritable temp directory - becomes an unavailable report
+    with the reason attached and a logged warning, because losing a live
+    session's fetched snapshot over one report block would cost far more
+    than the block is worth.
+    """
+    if not positions:
+        return holdings_stats({}, rebalance_date, db_path, currency, risk_free_rate)
+
+    try:
+        return _resolve_holdings(
+            positions, currency, rebalance_date, db_path, risk_free_rate, allow_fetch
+        )
+    except Exception as e:  # noqa: BLE001 - yfinance and duckdb raise assorted types here
+        logger.warning("could not measure the saved %s portfolio: %s", currency, e)
+        return unavailable_holdings(
+            currency,
+            positions,
+            risk_free_rate,
+            f"could not measure the saved {currency} portfolio: {e}",
+        )
+
+
 def compute_weights_and_allocation(
     candidates: list[str],
     objective: str,
@@ -454,7 +651,7 @@ class CandidateEditResult(NamedTuple):
     pool_currency: str | None
 
 
-def _in_typed_order(valid_added: list[str], add: list[str]) -> list[str]:
+def in_typed_order(valid_added: list[str], add: list[str]) -> list[str]:
     """`valid_added` (which `validate_and_ingest_tickers` returns sorted) put
     back into the order the person typed in `add`.
 
@@ -462,6 +659,10 @@ def _in_typed_order(valid_added: list[str], add: list[str]) -> list[str]:
     the pool's currency: typing `AAPL 7203.T` must give a dollar pool, but
     sorted order puts `'7203.T'` first (digits sort before letters) and
     would silently make it a yen pool instead.
+
+    Public because `src/flow/holdings_cli.py` needs the identical guarantee
+    when a typed ticker establishes which currency's PORTFOLIO an edit lands
+    in - the same hazard, and it must not be solved twice.
     """
     first_seen: dict[str, int] = {}
     for i, ticker in enumerate(add):
@@ -497,7 +698,7 @@ def validate_and_edit_candidates(
         valid_added, invalid, currencies = [], {}, {}
 
     accepted, refused, pool_currency = partition_by_currency(
-        _in_typed_order(valid_added, add), pool_currency, currencies
+        in_typed_order(valid_added, add), pool_currency, currencies
     )
     new_pool = edit_candidates({"candidates": pool}, add=accepted, remove=remove)
 

@@ -21,6 +21,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 from pypfopt import DiscreteAllocation, EfficientFrontier, expected_returns, risk_models
+from pypfopt.base_optimizer import portfolio_performance
 
 from src.config.settings import settings
 from src.dataset.fundamentals import attach_nearest_price
@@ -175,6 +176,35 @@ def apply_min_history_rule(wide: pd.DataFrame, min_months: int) -> pd.DataFrame:
     return wide[kept]
 
 
+def load_returns_matrix_unfiltered(
+    tickers: list[str],
+    as_of: date,
+    lookback_months: int = 60,
+    db_path: str = settings.db_path,
+) -> pd.DataFrame:
+    """`load_returns_matrix` WITHOUT the minimum-history drop rule: the
+    trailing `lookback_months`-month matrix exactly as the `returns` table
+    holds it, with one column per requested ticker whether or not that
+    ticker has enough usable history.
+
+    Split out because a reporting caller needs the pre-rule matrix to say
+    WHY a ticker was dropped. `apply_min_history_rule` removes a column
+    without leaving any record of how many months it actually had, and a
+    report that tells a user "NEWCO was excluded" without saying "it has 8
+    months, and 24 are needed" is not actionable - see
+    `src/optimizer/holdings.py`, which subtracts this matrix's columns from
+    the filtered one's to name each exclusion and its month count.
+    """
+    window_dates = _load_window_dates(as_of, lookback_months, db_path)
+    long_df = load_returns_long(
+        tickers,
+        window_dates[0] if window_dates else None,
+        window_dates[-1] if window_dates else None,
+        db_path,
+    )
+    return pivot_returns_matrix(long_df, tickers, window_dates)
+
+
 def load_returns_matrix(
     tickers: list[str],
     as_of: date,
@@ -189,14 +219,7 @@ def load_returns_matrix(
     in `apply_min_history_rule`. Feeds `compute_weights`'s expected-return
     and covariance-matrix estimation.
     """
-    window_dates = _load_window_dates(as_of, lookback_months, db_path)
-    long_df = load_returns_long(
-        tickers,
-        window_dates[0] if window_dates else None,
-        window_dates[-1] if window_dates else None,
-        db_path,
-    )
-    wide = pivot_returns_matrix(long_df, tickers, window_dates)
+    wide = load_returns_matrix_unfiltered(tickers, as_of, lookback_months, db_path)
     return apply_min_history_rule(wide, min_months)
 
 
@@ -223,6 +246,33 @@ def _covariance_input(returns_matrix: pd.DataFrame) -> pd.DataFrame:
             partial_tickers,
         )
     return complete
+
+
+def _estimate_mu_and_cov(returns_matrix: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
+    """Annualized expected returns and an annualized shrunk covariance
+    matrix for `returns_matrix` (monthly returns, as produced by
+    `load_returns_matrix`).
+
+    Extracted so that there is exactly ONE place in this project where these
+    two estimates are made, and a second consumer cannot drift from the
+    first. `_fit_efficient_frontier` uses it to solve an objective;
+    `stats_for_weights` uses it to measure a weight vector somebody else
+    chose (a user's actual holdings, see `src/optimizer/holdings.py`). Those
+    two answer different questions and must not answer them with different
+    estimators, or the figures they print could not be compared.
+
+    `frequency=12` is PyPortfolioOpt's annualization multiplier for monthly
+    data, so both come out annual rather than monthly.
+    `mean_historical_return` compounds by default, making `mu` a geometric
+    annual growth rate. See `_covariance_input` for why the covariance is
+    estimated on the complete-overlap sub-window rather than the whole
+    matrix.
+    """
+    mu = expected_returns.mean_historical_return(returns_matrix, returns_data=True, frequency=12)
+    cov_matrix = risk_models.CovarianceShrinkage(
+        _covariance_input(returns_matrix), returns_data=True, frequency=12
+    ).ledoit_wolf()
+    return mu, cov_matrix
 
 
 def _validate_efficient_return_result(weights: dict[str, float], ef: EfficientFrontier, target_annual_return: float) -> None:
@@ -278,10 +328,10 @@ def _fit_efficient_frontier(
     `efficient_return` is defined purely by its target, so neither takes such
     a parameter.
 
-    `mu` and `cov_matrix` are estimated with `frequency=12`, PyPortfolioOpt's
-    annualization multiplier, so a monthly `returns_matrix` (as produced by
-    `load_returns_matrix`) is turned into true annualized figures directly
-    comparable to `target_annual_return`. This makes every quantity
+    `mu` and `cov_matrix` come from `_estimate_mu_and_cov`, which annualizes
+    a monthly `returns_matrix` (as produced by `load_returns_matrix`) with
+    `frequency=12` so its figures are directly comparable to
+    `target_annual_return`. This makes every quantity
     `EfficientFrontier` reports (`mu`, `cov_matrix`, and `efficient_return`'s
     realized return) annual, not monthly - the realized per-month portfolio
     return used elsewhere in this project (e.g. backtest scoring) is computed
@@ -291,10 +341,7 @@ def _fit_efficient_frontier(
     if objective not in VALID_OBJECTIVES:
         raise ValueError(f"objective must be one of {VALID_OBJECTIVES}, got {objective!r}")
 
-    mu = expected_returns.mean_historical_return(returns_matrix, returns_data=True, frequency=12)
-    cov_matrix = risk_models.CovarianceShrinkage(
-        _covariance_input(returns_matrix), returns_data=True, frequency=12
-    ).ledoit_wolf()
+    mu, cov_matrix = _estimate_mu_and_cov(returns_matrix)
 
     ef = EfficientFrontier(mu, cov_matrix)
     if objective == "GMV":
@@ -434,6 +481,53 @@ def compute_weights_and_stats(
         returns_window_end=window_index.max().date(),
         returns_window_months=len(window_index),
     )
+
+
+def stats_for_weights(
+    returns_matrix: pd.DataFrame,
+    weights: dict[str, float],
+    risk_free_rate: float = settings.risk_free_rate,
+) -> tuple[float, float, float]:
+    """The annualized return, annualized volatility and Sharpe ratio of a
+    weight vector SOMEBODY ELSE chose, as `(annual_return,
+    annual_volatility, sharpe)`.
+
+    The counterpart to `compute_weights_and_stats`, which picks the weights
+    itself: here the weights are a given - a user's actual share holdings
+    turned into value shares by `src/optimizer/holdings.py` - and only the
+    measurement is this function's job. Both route through
+    `_estimate_mu_and_cov` and PyPortfolioOpt's own definition of the three
+    figures (`portfolio_performance`, i.e. `w'mu`, `sqrt(w'Sigma w)` and
+    `(w'mu - rf) / sqrt(w'Sigma w)`), so a held portfolio's figures are
+    directly comparable with an optimized pool's and with a benchmark's
+    rather than merely resembling them.
+
+    Because `returns_matrix` is a genuine cross-section, its covariance is
+    Ledoit-Wolf shrunk exactly as an optimized pool's is - see
+    `src/optimizer/benchmark.py`'s module docstring for why a single-column
+    benchmark is deliberately NOT shrunk, and why that asymmetry is correct
+    rather than an inconsistency to fix.
+
+    Raises `ValueError` if `weights` names a ticker that is not a column of
+    `returns_matrix`. PyPortfolioOpt would silently drop such a weight,
+    leaving the rest summing to less than one and misreporting all three
+    figures as though the missing holding did not exist; the caller must
+    decide what to do about a holding it has no history for (see
+    `holdings_stats`, which excludes it by name) rather than have it
+    disappear here.
+    """
+    unknown = sorted(set(weights) - set(returns_matrix.columns))
+    if unknown:
+        raise ValueError(
+            f"weights name ticker(s) with no column in the returns matrix: {', '.join(unknown)}"
+        )
+
+    mu, cov_matrix = _estimate_mu_and_cov(returns_matrix)
+    aligned = {ticker: float(weights.get(ticker, 0.0)) for ticker in returns_matrix.columns}
+    annual_return, annual_volatility, sharpe = portfolio_performance(
+        aligned, mu, cov_matrix, verbose=False, risk_free_rate=float(risk_free_rate)
+    )
+    return float(annual_return), float(annual_volatility), float(sharpe)
 
 
 def _load_prices_up_to(tickers: list[str], as_of: date, db_path: str) -> pd.DataFrame:

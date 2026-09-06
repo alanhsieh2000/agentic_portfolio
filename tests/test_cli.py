@@ -33,6 +33,7 @@ from src.flow.cli import (
 )
 from src.config.settings import settings
 from src.optimizer.benchmark import BenchmarkSource, BenchmarkStats
+from src.optimizer.holdings import unavailable_holdings
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
 REBALANCE_DATE = date(2026, 9, 5)
@@ -732,7 +733,10 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
 
     `_settle_benchmark` must be stubbed and not merely tolerated: left real,
     it would resolve USD's default `SPY` and go to yfinance for its history,
-    putting a network call inside every one of these tests.
+    putting a network call inside every one of these tests. `prepare_holdings`
+    is stubbed for the same reason and one more: left real it would read the
+    developer's own `memory/portfolio.json`, so these tests would pass or
+    fetch depending on whose machine they ran on.
     """
 
     @contextmanager
@@ -747,7 +751,24 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
     monkeypatch.setattr("src.flow.cli.print_pipeline_result", lambda result: None)
     monkeypatch.setattr("src.flow.cli._run_edit_loop", edit_spy)
     monkeypatch.setattr("src.flow.cli._settle_benchmark", benchmark_spy)
+    monkeypatch.setattr(
+        "src.flow.cli.prepare_holdings",
+        MagicMock(return_value=unavailable_holdings("USD", {}, 0.02, "stubbed")),
+    )
+    monkeypatch.setattr("src.flow.cli.load_portfolio", MagicMock(return_value={}))
     return pipeline_spy, edit_spy, benchmark_spy
+
+
+def _stub_main_holdings(monkeypatch, positions=None) -> MagicMock:
+    """Replace `main`'s holdings resolution with a spy, so a test can assert
+    which currency, database and flags reached it without any I/O.
+    """
+    holdings_spy = MagicMock(
+        return_value=unavailable_holdings("USD", positions or {}, 0.02, "stubbed")
+    )
+    monkeypatch.setattr("src.flow.cli.prepare_holdings", holdings_spy)
+    monkeypatch.setattr("src.flow.cli.load_portfolio", MagicMock(return_value=positions or {}))
+    return holdings_spy
 
 
 def test_main_threads_the_target_return_argument_into_the_pipeline_and_the_edit_loop(monkeypatch):
@@ -1251,3 +1272,85 @@ def test_main_only_offers_pool_memory_to_the_user_provided_selection(monkeypatch
     main()
 
     assert benchmark_spy.call_args.kwargs["pool_memory_path"] is None
+
+
+# ---------------------------------------------------------------------------
+# main's holdings block
+# ---------------------------------------------------------------------------
+
+
+def test_main_reports_the_saved_portfolio_for_the_runs_own_currency(monkeypatch):
+    _stub_main_pipeline(monkeypatch)
+    holdings_spy = _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000"],
+    )
+
+    main()
+
+    assert holdings_spy.call_args.args[0] == {"SPY": 1000.0}
+    assert holdings_spy.call_args.args[1] == "USD"
+
+
+def test_main_measures_the_holdings_against_the_same_risk_free_rate_as_the_pool(monkeypatch):
+    """The whole point of the block is reading it beside the pool's and the
+    benchmark's figures, which only works if all three use one rate.
+    """
+    _stub_main_pipeline(monkeypatch)
+    holdings_spy = _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--risk-free-rate", "0.045"],
+    )
+
+    main()
+
+    assert holdings_spy.call_args.kwargs["risk_free_rate"] == 0.045
+
+
+def test_main_no_holdings_leaves_the_block_out_entirely(monkeypatch):
+    _stub_main_pipeline(monkeypatch)
+    holdings_spy = _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--no-holdings"],
+    )
+
+    main()
+
+    assert holdings_spy.called is False
+
+
+def test_main_no_holdings_fetch_is_threaded_through(monkeypatch):
+    _stub_main_pipeline(monkeypatch)
+    holdings_spy = _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--no-holdings-fetch"],
+    )
+
+    main()
+
+    assert holdings_spy.call_args.kwargs["allow_fetch"] is False
+
+
+def test_main_measures_the_holdings_against_the_session_database_not_the_shared_cache(monkeypatch):
+    """`--db-path` is the shared S&P 500 cache; the session database is what
+    `open_pipeline_session` yielded. The holdings must be resolved against
+    the latter, for the same reason the benchmark is.
+    """
+    _stub_main_pipeline(monkeypatch)
+    holdings_spy = _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--db-path", "data/portfolio.duckdb"],
+    )
+
+    main()
+
+    assert holdings_spy.call_args.args[3] == "session.duckdb"
