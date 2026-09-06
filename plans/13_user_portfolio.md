@@ -56,6 +56,11 @@ Define the terms used throughout, in plain language:
 - [x] (2026-09-06 04:29Z) Milestone 2 — the figures: `_estimate_mu_and_cov` and `stats_for_weights` in `src/optimizer/portfolio.py`, `load_returns_matrix_unfiltered` split out of `load_returns_matrix`, `src/optimizer/holdings.py`, `src/flow/interactive.py`'s `prepare_holdings`, and `tests/test_holdings.py` (15 tests). `tests/test_optimizer.py` passes unmodified.
 - [x] (2026-09-06 04:33Z) Milestone 3 — the entry point: `src/flow/holdings_cli.py`, `src/flow/cli.py`'s `print_user_portfolio`, the `pyproject.toml` script registration, and `tests/test_holdings_cli.py` (26 tests).
 - [x] (2026-09-06 04:40Z) Milestone 4 — the pipeline section and docs: the three new `cli.main` flags, the holdings block after `print_pipeline_result`, five new `tests/test_cli.py` tests, the two `README.md` bullets, and this plan's living sections. Full suite: 424 passed.
+- [x] (2026-09-06 07:10Z) Milestone 5a — one session, one window: `open_holdings_session` and `measure_holdings` in `src/flow/interactive.py`, a context-manager sibling of `open_pipeline_session` yielding one throwaway database with the holdings' prices and returns already resolved into it, so every variant an interactive loop measures shares one returns window and one fetch.
+- [x] (2026-09-06 07:14Z) Milestone 5b — the before/after report: a keyword-only `heading` on `src/flow/cli.py`'s `print_user_portfolio` (the current wording stays the default, so no existing caller or test changed), and `format_holdings_delta` printing the signed change in return, volatility and Sharpe - withholding the delta with a stated reason when either side has no figures or the two windows differ.
+- [x] (2026-09-06 07:22Z) Milestone 5c — the loop: `whatif` in `VALID_COMMANDS` and `_run_whatif`/`_whatif_set`/`_whatif_apply`/`_whatif_set_command` in `src/flow/holdings_cli.py`, prompting `[s]et shares / [r]emove / [u]ndo all / [f]inish`, reusing `_validate_set_targets` (which gained `db_path` and `pool_currency`) so a cross-currency ticker is refused by name exactly as `set` refuses it, calling neither `save_portfolio` nor `_remember_rate`, and closing with the `set` command that would apply the experiment. 21 new tests in `tests/test_holdings_cli.py`.
+- [x] (2026-09-06 07:26Z) Milestone 5d — closed Milestone 2's test gap: the four `prepare_holdings` tests this plan specified had never been written (`grep -rn prepare_holdings tests/` found only monkeypatches and docstrings). They land now, beside six new `open_holdings_session`/`measure_holdings` tests, in `tests/test_holdings.py`.
+- [x] (2026-09-06 07:34Z) Milestone 5e — documentation: the `holdings_cli` module docstring's non-interactive claim narrowed to the subcommands that change the record, a `README.md` bullet, and this plan's living sections. Full suite: 544 passed.
 - [ ] Optional follow-up, deliberately not done: a persistent holdings cache. Every `uv run portfolio` run currently refetches the holdings' 65 months of prices when the session database does not already hold them (a live `user_provided` run always). See the `Decision Log` entry on data resolution for why a dedicated `data/holdings.duckdb` was rejected for now, and `Surprises & Discoveries` for the measured cost.
 
 
@@ -77,6 +82,18 @@ Define the terms used throughout, in plain language:
 - Observation: refetching the holdings on every run is noticeable but tolerable. A two-holding portfolio's block took roughly ten seconds of the wall clock in a live `user_provided` run (one batched `yf.download` for the prices plus one `fast_info` request per ticker with `yfinance_fundamentals_pause_seconds` between them). It scales with the number of holdings, so a thirty-holding portfolio would be worth caching; see the open `Progress` item.
   Evidence: the live acceptance runs of 2026-09-06.
 
+
+- Observation: routing `whatif`'s typed tickers through `_validate_set_targets` was necessary but not sufficient - the first attempt accepted a yen ticker into a dollar experiment instead of refusing it. `partition_by_currency` takes a `pool_currency` and, when given `None`, lets the FIRST ticker establish it. That is exactly right for `set`, where `set 1321.T 50` should create a JPY portfolio; it is exactly wrong for a what-if, where the portfolio already has a currency. Fixed by giving `_validate_set_targets` a `pool_currency` parameter that `whatif` passes and `set` leaves alone.
+  Evidence: `test_whatif_refuses_a_cross_currency_ticker_by_name` failed with the hypothetical containing `7203.T` and the closing line reading `To keep it: uv run portfolio-holdings set 7203.T 100` - the experiment had silently become a yen one.
+
+- Observation: the first live run answered the question the feature exists for, and answered it counter-intuitively. Adding 100 NVDA to a 1,000-share SPY portfolio raised the expected return by 1.4 points but the volatility by 2.9, so the Sharpe ratio FELL. A person guessing which change would help would very likely have guessed wrong, which is the whole argument for computing the delta rather than eyeballing two blocks.
+  Evidence: a live run on 2026-09-06 printed `Change from your saved portfolio: return +0.0138  volatility +0.0293  Sharpe -0.0113`, with both blocks over the identical `2021-10-01 to 2026-09-01 (60 month(s))` window.
+
+- Observation: the report was initially claiming a write it had not made. `resolve_risk_free_rate` phrases an overridden rate as `--risk-free-rate, remembered for USD`, which is true of every other subcommand, so a `whatif --risk-free-rate 0.05` printed exactly that while writing nothing. The provenance line added by `plans/14` exists to stop a rate being printed without an honest source; this was its mirror image, an honest-looking source that was false.
+  Evidence: the live run printed `Risk-free rate used: 0.0500 (--risk-free-rate, remembered for USD)` while `md5sum -c` confirmed `rates.json` unchanged. Now pinned by `test_whatif_does_not_claim_the_rate_was_remembered`.
+
+- Observation: plan 13's own Milestone 2 specified four `prepare_holdings` tests that were never written - `grep -rn prepare_holdings tests/` found only monkeypatches and docstring mentions, so the function was exclusively stubbed and never directly exercised. Milestone 5a builds its sibling in the same module, which made this the moment to close the gap rather than widen it.
+  Evidence: `grep -rn "prepare_holdings" tests/` before Milestone 5d returned seven hits, every one a `monkeypatch.setattr` or a docstring.
 
 ## Decision Log
 
@@ -139,6 +156,30 @@ Define the terms used throughout, in plain language:
   Date/Author: 2026-09-06, during Milestone 3.
 
 
+- Decision: `whatif` is INTERACTIVE, the only subcommand of `portfolio-holdings` that is, and the module docstring's "entirely non-interactive" claim is narrowed rather than abandoned.
+  Rationale: chosen by the user from three offered shapes. The docstring's justification for the rule was scriptability, and that survives intact: every subcommand that changes the record is still a single non-interactive line. What a flag-per-run shape could not give is the actual workflow - trying five variations in a row and watching the numbers - because each variation would re-pay the Yahoo Finance round trip that one open session pays once. The two facts belong together, and the docstring now says so: exploring is inherently a conversation, and it is safe to make this one because nothing it does can outlive the session.
+  Date/Author: 2026-09-06, agreed with the user.
+
+- Decision: the baseline and every variant are measured against ONE throwaway database, kept open for the whole loop, rather than each resolving its own.
+  Rationale: correctness first, speed second. `src/optimizer/portfolio.py`'s `_load_window_dates` derives the returns window from `SELECT DISTINCT rebalance_date FROM returns` over the WHOLE table, so two variants resolved separately can come back measured over two different windows - and the difference between two Sharpe ratios computed over different months is partly just the difference between the months. A what-if's entire output is that subtraction, so one database makes the shared window structural instead of a coincidence to be checked. `format_holdings_delta` still checks it and withholds the delta if it ever fails to hold, because a plausible wrong number is worse than a stated refusal. The speed is the bonus: the first measurement fetches, every later one is instant. The shape is `open_pipeline_session`'s, which already does exactly this for `_run_edit_loop`.
+  Date/Author: 2026-09-06.
+
+- Decision: a what-if never saves, and closes by printing the `set` command that would apply it.
+  Rationale: the user chose never-save over an offer-to-keep prompt, which keeps the guarantee absolute - the figures a what-if reports can always be trusted not to have moved the record. The cost would have been retyping a good experiment by hand, so `_whatif_set_command` computes the exact one-line `set` that turns the saved holdings into the hypothetical ones (a retirement spelled `0`, as `set` spells it). That removes the retyping without weakening the promise, and it is why `_whatif_apply` deliberately mirrors `_run_set`'s merge: a what-if is only worth trusting if it predicts what `set` would actually do.
+  Date/Author: 2026-09-06, agreed with the user.
+
+- Decision: `whatif` suppresses BOTH writes on the `set` path - `save_portfolio` and `_remember_rate` - and relabels the rate's provenance.
+  Rationale: `_remember_rate` is the one easy to miss. `--risk-free-rate` is *remembered* per currency by every other subcommand, so accepting the flag without care would leave a permanent rate change behind from a run whose whole promise was changing nothing. The flag is still accepted, because "what if the riskless return were 5%?" is a real question, but nothing is written - and the report says `--risk-free-rate, not remembered - this is a what-if` rather than `resolve_risk_free_rate`'s usual `remembered for USD`, since printing the latter would have the report claim a write this command exists specifically not to make. `_guard_rate_is_rememberable` exempts `whatif` for the same reason: with nothing to remember, the ambiguity that guard refuses cannot arise.
+  Date/Author: 2026-09-06.
+
+- Decision: a ticker typed at the `[s]et` prompt is validated through `_validate_set_targets`, the same function `set` uses, rather than being handed straight to the measurement.
+  Rationale: the by-name cross-currency refusal lives only at the CLI layer. `interactive._holdings_currency_gate` merely EXCLUDES a foreign holding with a one-line reason - deliberately, because it guards a hand-edited file and naming the holding while measuring the rest is the right behaviour there. But a ticker just typed is different: a mistyped `7203.T` in a dollar experiment deserves `set`'s "so it belongs to the JPY portfolio" sentence, not a quiet disappearance from the figures. This required giving `_validate_set_targets` a `pool_currency` parameter - see `Surprises & Discoveries` for the bug that omitting it caused.
+  Date/Author: 2026-09-06, during Milestone 5c.
+
+- Decision: under `--no-holdings-fetch`, adding a ticker the experiment has not already resolved is refused rather than ingested.
+  Rationale: with fetching disabled the session yields `--db-path` itself rather than a scratch file, and that path is documented as never written to. Ingesting a new ticker there would write rows into the shared `data/portfolio.duckdb` as a side effect of an experiment - the exact isolation rule `prepare_holdings` calls a correctness requirement. Refusing by name, and saying which flag to drop, is the only honest option.
+  Date/Author: 2026-09-06.
+
 ## Outcomes & Retrospective
 
 
@@ -152,7 +193,7 @@ Mirroring `prepare_benchmark` for data resolution paid off twice. It supplied a 
 
 **What remains.** One open item, deliberately: holdings are refetched whenever the session database lacks them, which for a live run is always. Roughly ten seconds for two holdings, scaling with the count. The fix is a persistent holdings cache with a staleness rule, and the reason it was not done is that "how stale may a monthly return be?" is its own design question rather than a detail of this one.
 
-Two smaller gaps worth naming. Nothing yet compares the held portfolio against the optimizer's suggested weights *quantitatively* - the report puts the two blocks side by side and leaves the comparison to the reader, which is the right first step but stops short of "here is what rebalancing would buy you". And `--date` is accepted by `portfolio-holdings` but a past date measures today's share counts against that date's prices, which is only meaningful if the holdings have not changed since; that is documented in the flag's help but not enforced, because enforcing it would require a position history this feature does not keep.
+Two smaller gaps worth naming. Nothing yet compares the held portfolio against the optimizer's suggested weights *quantitatively* - the report puts the two blocks side by side and leaves the comparison to the reader, which is the right first step but stops short of "here is what rebalancing would buy you". **Milestone 5 closes that from the other direction**: rather than compute an optimum, `uv run portfolio-holdings whatif` lets a person try a change and see the three figures move, with the signed delta computed for them. The optimizer-comparison half remains open. And `--date` is accepted by `portfolio-holdings` but a past date measures today's share counts against that date's prices, which is only meaningful if the holdings have not changed since; that is documented in the flag's help but not enforced, because enforcing it would require a position history this feature does not keep.
 
 **Lesson.** The plan's acceptance section asserted that `set 7203.T 100` against an existing USD portfolio would be refused, and writing the code made it obvious that this was backwards: it would make a second currency unreachable without a flag the user has not met yet. The plan was specific enough to be *falsifiable*, which is what let the error surface during implementation instead of after it - an argument for stating acceptance as concrete transcripts rather than as properties.
 
@@ -225,6 +266,21 @@ The shape of the whole change, so a reader can navigate it before reading the de
       |
       v
     src/optimizer/portfolio.py           <- changed: _estimate_mu_and_cov() extracted; stats_for_weights() added
+
+Milestone 5 adds the what-if loop on top, touching three of the same files and creating none:
+
+    memory/portfolio.json                <- READ ONLY: a what-if never writes it, nor memory/rates.json
+      |
+      v
+    src/flow/holdings_cli.py             <- changed: `whatif` + _run_whatif/_whatif_set, calling
+      |                                     neither save_portfolio nor _remember_rate
+      v
+    src/flow/interactive.py              <- changed: open_holdings_session() + measure_holdings() -
+      |                                     ONE throwaway database per session, so every variant
+      |                                     is measured over one returns window
+      v
+    src/flow/cli.py                      <- changed: print_user_portfolio(heading=...) and
+                                            format_holdings_delta()
 
 
 ## Milestones
@@ -489,6 +545,79 @@ Expect the report to end with the `Your portfolio (USD), ...` block beneath the 
 
 Expect no holdings block at all in the first, and in the second a single `n/a` line naming `--no-holdings-fetch` whenever the cached database lacks the held tickers.
 
+
+### Milestone 5 — the what-if loop
+
+
+Scope: a way to ask what a CHANGE would do, without making it. At the end of this milestone `uv run portfolio-holdings whatif` opens a loop in which hypothetical changes to the saved holdings are applied, measured and reported with the signed change in all three figures, and nothing whatsoever is written. This milestone was added after the first four shipped, in response to a live run: seeing the current figures immediately raises the question of which change would improve them, and answering that by hand is the hard part. It closes, from the other direction, the gap this plan's own `Outcomes & Retrospective` pre-registered.
+
+**Step 5a — one session, one window.** In `src/flow/interactive.py`, beside `prepare_holdings`:
+
+    class HoldingsSession(NamedTuple):
+        db_path: str
+        can_ingest: bool
+
+    @contextmanager
+    def open_holdings_session(tickers: list[str], rebalance_date: date, db_path: str,
+                              allow_fetch: bool = True)
+
+    def measure_holdings(positions: dict[str, float], currency: str, rebalance_date: date,
+                         session: HoldingsSession,
+                         risk_free_rate: float = settings.risk_free_rate,
+                         currencies: dict[str, str] | None = None) -> HoldingsStats
+
+`open_holdings_session` is `open_pipeline_session`'s sibling: a context manager that resolves every holding's prices and returns into ONE throwaway database and keeps it alive for the whole loop. That is a correctness requirement, not an optimization. `src/optimizer/portfolio.py`'s `_load_window_dates` derives the returns window from `SELECT DISTINCT rebalance_date FROM returns` over the whole table, so two variants resolved into two separate throwaway databases can legitimately come back measured over two different windows - and the difference between two Sharpe ratios computed over different months is partly just the difference between the months. A what-if's whole output is that subtraction. One database makes the shared window structural.
+
+`measure_holdings` is the what-if counterpart to `prepare_holdings`: it assumes the data is already resolved, fetches nothing, writes nothing, and ends in the same `_holdings_stats_excluding` so a holding excluded for thin history or the wrong currency is reported identically either way. Like `prepare_holdings` it never raises - losing a session mid-loop over one unmeasurable variant would throw away every fetch already paid for.
+
+With `allow_fetch=False` the session yields `db_path` itself and reports `can_ingest=False`. That is a different promise rather than a degraded one: `--no-holdings-fetch` means touch no network, `db_path` is documented as never written to, so a ticker the cache does not hold cannot join the experiment at all and the caller must refuse it by name.
+
+**Step 5b — the before/after report.** In `src/flow/cli.py`, `print_user_portfolio` gains a keyword-only `heading: str | None = None`. Its header hardcodes `from {path}`, which for a hypothetical block would be a plain falsehood - those holdings are not in that file and never will be. Keyword-only and defaulting to the current wording, so all twenty-odd existing direct callers and their tests are untouched. Then:
+
+    def format_holdings_delta(baseline: HoldingsStats, hypothetical: HoldingsStats) -> str
+
+Signed to four decimals, matching every other figure in the report. It returns a REASON rather than a delta in two cases, which is why it is a function and not three subtractions at the call site: either side may have no figures (subtracting from `None` is not a small bug but a misleading number), and the two may have been measured over different windows. `open_holdings_session` exists to make the second impossible, so reaching it means something upstream is wrong and saying so beats printing a plausible number that answers no question. Only the three portfolio-level figures are diffed: a holding's OWN volatility legitimately moves between blocks even when nothing about that holding changed, because `CovarianceShrinkage.ledoit_wolf` shrinks across whatever cross-section it sits in.
+
+**Step 5c — the loop.** In `src/flow/holdings_cli.py`, `"whatif"` joins `VALID_COMMANDS` and `_run_whatif` joins the dispatch dict. It proceeds in this order:
+
+1. Resolve which currency's portfolio to experiment on, via the existing `_rate_currency_for_report`; refuse by name, pointing at `--currency`, when the command names none.
+2. Open one session over the saved holdings' tickers.
+3. Measure and print the baseline through `print_user_portfolio` with its ordinary header.
+4. Loop on `[s]et shares / [r]emove / [u]ndo all / [f]inish`, snapshotting the positions before each edit so a rejected one reverts, and `continue`ing on unparseable input keeping what you had - `_run_edit_loop`'s discipline throughout, minus the persist step, which makes it strictly simpler than the loop it copies.
+5. After any edit that actually changed something, measure the variant and print it under `What if ({currency}) - not saved`, then the delta line.
+6. On `[f]inish`, print that nothing was saved and, when anything changed, the one-line `set` command that would apply it.
+
+A ticker typed at `[s]et` that the experiment has not already resolved goes through `_validate_set_targets`, the same function `set` uses, which gains two parameters for this: `db_path` (ingest into the session's database, so the ticker is measurable in the same breath) and `pool_currency` (the experiment's currency, so a yen ticker in a dollar experiment is refused rather than establishing JPY - see `Surprises & Discoveries`). Nothing is written: not `save_portfolio`, and not `_remember_rate`, whose omission is the subtler half.
+
+**Step 5d — the tests Milestone 2 specified and never wrote.** `grep -rn prepare_holdings tests/` found only monkeypatches and docstrings, so that function had never been directly exercised. Milestone 5a builds its sibling in the same module, so the four land now: never writes to the session database, reads the cache without fetching when it suffices, `allow_fetch=False` names the flag, and an ingest exception becomes an `unavailable_reason`.
+
+The invariants pinned for the loop itself, and why each is worth a test:
+
+- **Nothing is written at all** - asserted on `save_portfolio` and `save_risk_free_rate` spies rather than on the files, because a file comparison would also pass if the write happened and wrote identical bytes.
+- **Every variant shares one window**, and the delta is the exact arithmetic difference of the two blocks.
+- **A differing window withholds the delta** and says so, rather than subtracting across windows.
+- A cross-currency ticker is **refused by name with `set`'s wording** and does not enter the hypothetical - the test that caught the `pool_currency` bug.
+- A new ticker under `--no-holdings-fetch` is refused and `validate_and_ingest_tickers` is **never called**, the guard against writing to the shared cache.
+- `--risk-free-rate` reaches the figures, is **not** remembered, and is **not labelled** as remembered.
+- `[u]ndo all` returns to the saved holdings and then offers no `set` command, since nothing changed.
+
+Commands and acceptance - the loop is interactive, so these are driven by piping its answers:
+
+    cd /app/agentic_portfolio
+    uv run pytest tests/test_holdings.py tests/test_holdings_cli.py -q
+    uv run pytest tests/test_*.py -q
+
+    # against a scratch --path/--rates-path so the real memory/ is untouched
+    printf 's\nNVDA 100\nf\n' | uv run portfolio-holdings whatif
+    # expect: the baseline block, then "What if (USD) - not saved:", both over the SAME
+    #         "Returns window:" line, then "Change from your saved portfolio: ...", then
+    #         "Nothing was saved: ..." and "To keep it: uv run portfolio-holdings set NVDA 100"
+
+    printf 's\n7203.T 100\nf\n' | uv run portfolio-holdings whatif       # refused by name
+    printf 's\nNVDA 100\nf\n'   | uv run portfolio-holdings whatif --no-fetch  # refused, needs a fetch
+    printf 'f\n' | uv run portfolio-holdings --risk-free-rate 0.05 whatif  # "not remembered"
+
+Then confirm the promise by inspection, which is the acceptance that matters most: `md5sum` of `memory/portfolio.json` and `memory/rates.json`, and the size and mtime of `data/portfolio.duckdb`, must be identical either side of the whole session.
 
 ## Validation and Acceptance
 
@@ -758,3 +887,21 @@ In `pyproject.toml`, under `[project.scripts]`:
   figures use the same estimators and the same `--risk-free-rate` as the pool's and the benchmark's,
   so all three lines read on one scale" was true for a USD portfolio and quietly false for a JPY one,
   since the 2% default is a dollar rate. The claim now holds for both.
+- 2026-09-06, extended with Milestone 5 (the what-if loop): a completed plan was reopened rather
+  than given a `plans/15_*.md`, deliberately. `AGENTS.md` reserves a new numbered plan for "a major
+  step of the project" and `PLANS.md` requires each milestone to "incrementally implement the
+  overall goal of the execution plan" - and this work serves *this* plan's stated goal (report what
+  the held portfolio has done) rather than introducing a new one. It also closes, from the other
+  direction, a gap this plan's own `Outcomes & Retrospective` had pre-registered: "stops short of
+  'here is what rebalancing would buy you'". The user asked for it here for the same reason.
+
+  Three things about it are worth carrying forward. The one-throwaway-database design is a
+  correctness device, not a speed one: `_load_window_dates` reads the whole `returns` table, so
+  variants resolved separately can be measured over different windows and their Sharpe difference
+  would then be partly a difference of months. Two of the four bugs found during implementation
+  were the report claiming something untrue rather than computing something wrong - a yen ticker
+  silently accepted into a dollar experiment, and a rate labelled "remembered" by a command that
+  remembers nothing - which suggests the provenance discipline `plans/14` introduced deserves the
+  same suspicion applied to every label, not only to numbers. And this milestone finally wrote the
+  four `prepare_holdings` tests Milestone 2 specified in this very file and never delivered; a plan
+  listing tests is not evidence they exist, and `grep` is cheap.

@@ -17,6 +17,7 @@ and comparing them, which is only legitimate if a single-asset portfolio
 measured either way gives the same three numbers.
 """
 
+from contextlib import contextmanager
 from datetime import date
 
 import duckdb
@@ -29,6 +30,11 @@ from src.optimizer.holdings import (
     holdings_stats,
     stored_month_counts,
     weights_from_positions,
+)
+from src.flow.interactive import (
+    measure_holdings,
+    open_holdings_session,
+    prepare_holdings,
 )
 from src.optimizer.portfolio import compute_weights_and_stats
 
@@ -71,6 +77,14 @@ def _make_db(db_path: str, series: list[pd.Series], prices: dict[str, float]) ->
 
 
 AS_OF = date(2026, 1, 1)
+
+
+@contextmanager
+def _fake_scratch(path: str):
+    """Stand in for `build_scratch_snapshot`, yielding a fixture database
+    that already exists instead of creating and deleting a real one.
+    """
+    yield path
 
 
 # --- weights_from_positions -------------------------------------------------
@@ -313,3 +327,188 @@ def test_stored_month_counts_counts_each_tickers_own_months(tmp_path):
         "NEWCO": 8,
         "ABSENT": 0,
     }
+
+
+# --- open_holdings_session / measure_holdings -------------------------------
+
+
+def _no_fetch(monkeypatch):
+    """Fail the test if anything tries to reach Yahoo Finance."""
+
+    def fail(tickers, as_of, db_path):
+        raise AssertionError(f"fetched {tickers} when it should not have")
+
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fail)
+
+
+def test_a_session_measures_every_variant_over_one_window(tmp_path, monkeypatch):
+    """The correctness reason `open_holdings_session` exists. Two variants
+    measured against two separate throwaway databases can come back over two
+    different windows, because the window is derived from the whole `returns`
+    table - and then the change between their Sharpe ratios is partly the
+    change of window. One session makes that impossible.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(
+        db_path,
+        [_monthly_returns(60, "SPY"), _monthly_returns(60, "T", shift=1)],
+        {"SPY": 600.0, "T": 20.0},
+    )
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+        one = measure_holdings({"SPY": 100.0}, "USD", AS_OF, session, 0.02)
+        two = measure_holdings({"SPY": 100.0, "T": 500.0}, "USD", AS_OF, session, 0.02)
+
+    assert (one.window_start, one.window_end) == (two.window_start, two.window_end)
+    assert one.window_months == two.window_months
+
+
+def test_a_no_fetch_session_uses_the_given_database_and_forbids_ingesting(tmp_path, monkeypatch):
+    """`--no-holdings-fetch` means touch no network, and `--db-path` is
+    documented as never written to - so a session over it must announce that
+    a new ticker cannot be added rather than quietly ingesting into the
+    shared cache.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session(["SPY"], AS_OF, db_path, allow_fetch=False) as session:
+        assert session.db_path == db_path
+        assert session.can_ingest is False
+
+
+def test_measure_holdings_never_fetches(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+        stats = measure_holdings({"SPY": 100.0}, "USD", AS_OF, session, 0.02)
+
+    assert stats.sharpe is not None
+
+
+def test_measure_holdings_agrees_with_prepare_holdings_on_the_same_data(tmp_path, monkeypatch):
+    """A what-if variant and an ordinary report must measure a portfolio
+    identically, or the baseline block and the hypothetical block would not
+    be comparable even before anything changed.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(
+        db_path,
+        [_monthly_returns(60, "SPY"), _monthly_returns(60, "T", shift=1)],
+        {"SPY": 600.0, "T": 20.0},
+    )
+    _no_fetch(monkeypatch)
+    positions = {"SPY": 100.0, "T": 500.0}
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+        measured = measure_holdings(positions, "USD", AS_OF, session, 0.02)
+    direct = holdings_stats(positions, AS_OF, db_path, "USD", 0.02)
+
+    assert measured.annual_return == pytest.approx(direct.annual_return)
+    assert measured.annual_volatility == pytest.approx(direct.annual_volatility)
+    assert measured.sharpe == pytest.approx(direct.sharpe)
+
+
+def test_measure_holdings_excludes_a_cross_currency_holding(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(
+        db_path,
+        [_monthly_returns(60, "SPY"), _monthly_returns(60, "7203.T", shift=1)],
+        {"SPY": 600.0, "7203.T": 3000.0},
+    )
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+        stats = measure_holdings(
+            {"SPY": 100.0, "7203.T": 50.0}, "USD", AS_OF, session, 0.02, {"7203.T": "JPY"}
+        )
+
+    assert "priced in JPY" in stats.excluded["7203.T"]
+    assert "7203.T" not in stats.weights
+
+
+def test_measure_holdings_reports_an_empty_variant_rather_than_raising(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+        stats = measure_holdings({}, "USD", AS_OF, session, 0.02)
+
+    assert stats.annual_return is None
+    assert stats.unavailable_reason is not None
+
+
+# --- prepare_holdings (the tests Milestone 2 specified and never wrote) -----
+
+
+def test_prepare_holdings_never_writes_to_the_session_database(tmp_path, monkeypatch):
+    """The isolation rule `prepare_holdings`' docstring calls a correctness
+    requirement: the shared cache must not gain rows as a side effect of
+    printing a report, and the portfolio's returns window must not be
+    movable by a holdings fetch.
+    """
+    db_path = tmp_path / "session.duckdb"
+    _make_db(str(db_path), [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+
+    before_rows = duckdb.connect(str(db_path)).execute("SELECT count(*) FROM returns").fetchone()[0]
+    before_mtime = db_path.stat().st_mtime_ns
+
+    scratch = tmp_path / "scratch.duckdb"
+    _make_db(str(scratch), [_monthly_returns(60, "NEWCO")], {"NEWCO": 25.0})
+    monkeypatch.setattr(
+        "src.flow.interactive.build_scratch_snapshot",
+        lambda prefix="x": _fake_scratch(str(scratch)),
+    )
+    monkeypatch.setattr(
+        "src.flow.interactive.validate_and_ingest_tickers",
+        lambda tickers, as_of, path: (list(tickers), {}, {t: "USD" for t in tickers}),
+    )
+
+    prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, str(db_path), 0.02)
+
+    after_rows = duckdb.connect(str(db_path)).execute("SELECT count(*) FROM returns").fetchone()[0]
+    assert after_rows == before_rows
+    assert db_path.stat().st_mtime_ns == before_mtime
+
+
+def test_prepare_holdings_reads_the_cache_without_fetching_when_it_suffices(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    stats = prepare_holdings({"SPY": 100.0}, "USD", AS_OF, db_path, 0.02)
+
+    assert stats.sharpe is not None
+
+
+def test_prepare_holdings_with_fetching_disabled_names_the_flag(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _make_db(db_path, [_monthly_returns(8, "NEWCO")], {"NEWCO": 25.0})
+    _no_fetch(monkeypatch)
+
+    stats = prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, db_path, 0.02, allow_fetch=False)
+
+    assert stats.annual_return is None
+    assert "--no-holdings-fetch" in stats.unavailable_reason
+
+
+def test_prepare_holdings_turns_an_ingest_failure_into_a_reported_reason(tmp_path, monkeypatch):
+    """Never raises: losing a live session's fetched snapshot over one report
+    block would cost far more than the block is worth.
+    """
+    db_path = str(tmp_path / "session.duckdb")
+    _make_db(db_path, [], {})
+    monkeypatch.setattr(
+        "src.flow.interactive.validate_and_ingest_tickers",
+        lambda tickers, as_of, path: (_ for _ in ()).throw(RuntimeError("yfinance exploded")),
+    )
+
+    stats = prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, db_path, 0.02)
+
+    assert stats.annual_return is None
+    assert "yfinance exploded" in stats.unavailable_reason

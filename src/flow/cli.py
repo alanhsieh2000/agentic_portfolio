@@ -263,7 +263,11 @@ def format_share_count(shares: float) -> str:
 
 
 def print_user_portfolio(
-    holdings: HoldingsStats, path: str, risk_free_rate_origin: str | None = None
+    holdings: HoldingsStats,
+    path: str,
+    risk_free_rate_origin: str | None = None,
+    *,
+    heading: str | None = None,
 ) -> None:
     """Human-readable rendering of the user's OWN saved portfolio (see
     `src/flow/user_portfolio.py` and `src/optimizer/holdings.py`) - what is
@@ -274,6 +278,14 @@ def print_user_portfolio(
     describe stored state rather than anything the current command line
     said, and a reader who disagrees with them needs to know which file to
     edit.
+
+    `heading` replaces that header outright, and exists for the one caller
+    whose figures describe NO stored state: a what-if variant
+    (`src/flow/holdings_cli.py`'s `whatif`). Naming a file there would be a
+    plain falsehood - the hypothetical holdings are not in it and are never
+    going to be - so that caller passes its own header saying so. Keyword-
+    only and defaulting to the wording above, so every existing caller and
+    test is untouched.
 
     Every position is listed, including one excluded from the figures, since
     this block doubles as the record of what the user owns; an excluded
@@ -299,10 +311,11 @@ def print_user_portfolio(
     """
     currency = holdings.currency
     if not holdings.positions:
-        print(f"\nYour portfolio ({currency}): n/a - {holdings.unavailable_reason}")
+        label = heading or f"Your portfolio ({currency})"
+        print(f"\n{label}: n/a - {holdings.unavailable_reason}")
         return
 
-    print(f"\nYour portfolio ({currency}), from {path}:")
+    print(f"\n{heading or f'Your portfolio ({currency}), from {path}'}:")
     ordered = sorted(
         holdings.positions,
         key=lambda t: (-holdings.weights.get(t, -1.0), t),
@@ -351,6 +364,56 @@ def print_user_portfolio(
             if value is not None and holdings.total_value:
                 share = f" ({value / holdings.total_value:.1%} of total value)"
             print(f"  {ticker}: {holdings.excluded[ticker]}{share}")
+
+
+def format_holdings_delta(baseline: HoldingsStats, hypothetical: HoldingsStats) -> str:
+    """The one line a what-if exists to print: how the three portfolio-level
+    figures moved between the saved holdings and a hypothetical variant.
+
+    Signed to four decimals, matching every other figure in the report, so
+    `+0.1056` reads as "a tenth better" against the `0.1225` two lines above
+    it rather than needing conversion.
+
+    Returns a REASON instead of a delta when the two are not comparable,
+    which is the whole reason this is a function rather than three
+    subtractions at the call site. Two ways that happens. Either side may
+    have no figures at all - a variant whose every holding was excluded, for
+    instance - and subtracting from `None` is not a small bug but a
+    misleading number. And the two may have been measured over different
+    returns windows, in which case the difference between their Sharpe
+    ratios is partly just the difference between two spans of months.
+    `open_holdings_session` exists to make that second case impossible by
+    construction, so reaching it means something has gone wrong upstream;
+    saying so is more useful than printing a plausible number that is not
+    the answer to any question.
+
+    Only the three portfolio-level figures are diffed. A holding's OWN
+    volatility legitimately moves between the two blocks even when nothing
+    about that holding changed, because `CovarianceShrinkage.ledoit_wolf`
+    shrinks across whatever cross-section it sits in - so a per-holding
+    delta would report as change something that is an artefact of the
+    portfolio around it. See `plans/13_user_portfolio.md`'s Revision Notes.
+    """
+    if baseline.unavailable_reason is not None or hypothetical.unavailable_reason is not None:
+        return "Change from your saved portfolio: n/a - one of the two has no figures to compare."
+
+    if (baseline.window_start, baseline.window_end) != (
+        hypothetical.window_start,
+        hypothetical.window_end,
+    ):
+        return (
+            "Change from your saved portfolio: n/a - measured over different windows "
+            f"({baseline.window_start} to {baseline.window_end} against "
+            f"{hypothetical.window_start} to {hypothetical.window_end}), so the "
+            "difference would partly be the windows rather than the holdings."
+        )
+
+    return (
+        "Change from your saved portfolio: "
+        f"return {hypothetical.annual_return - baseline.annual_return:+.4f}  "
+        f"volatility {hypothetical.annual_volatility - baseline.annual_volatility:+.4f}  "
+        f"Sharpe {hypothetical.sharpe - baseline.sharpe:+.4f}"
+    )
 
 
 def print_pipeline_result(result: dict, risk_free_rate_origin: str | None = None) -> None:

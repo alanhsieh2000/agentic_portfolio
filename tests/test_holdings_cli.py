@@ -10,17 +10,20 @@ only through `prepare_holdings`, both monkeypatched on
 or the real `memory/portfolio.json`.
 """
 
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.config.settings import settings
 from src.flow.holdings_cli import _normalize_ticker, _parse_pairs, main
+from src.flow.interactive import HoldingsSession
 from src.flow.rate_memory import load_all_risk_free_rates, load_risk_free_rate
 from src.flow.user_portfolio import load_all_portfolios, load_portfolio
 from src.optimizer.holdings import HoldingsStats, unavailable_holdings
-from src.flow.cli import format_share_count, print_user_portfolio
+from src.flow.cli import format_holdings_delta, format_share_count, print_user_portfolio
 
 
 def _stub_ingest(monkeypatch, currencies: dict[str, str], invalid: dict[str, str] | None = None):
@@ -640,3 +643,346 @@ def test_the_rate_and_its_origin_print_even_when_there_are_no_figures(capsys):
 
     assert "Figures: n/a - fetching was disabled" in out
     assert "Risk-free rate used: 0.0050 (remembered for JPY)" in out
+
+
+# --- whatif: the never-saved explore loop ----------------------------------
+
+
+def _script(monkeypatch, *responses: str) -> None:
+    """Feed `responses` to successive `input()` calls. An unexpected prompt
+    raises `StopIteration`, which is how "did not prompt" gets asserted.
+    """
+    remaining = iter(responses)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(remaining))
+
+
+def _stub_session(monkeypatch, measured: list[dict] | None = None, can_ingest: bool = True):
+    """Replace the what-if session and its measurement with spies, so a CLI
+    test asserts on the loop's behaviour rather than on estimator arithmetic
+    (covered by tests/test_holdings.py). Returns the list of measured
+    position dicts, in order.
+    """
+    seen = measured if measured is not None else []
+
+    @contextmanager
+    def fake_session(tickers, rebalance_date, db_path, allow_fetch=True):
+        yield HoldingsSession(db_path="session.duckdb", can_ingest=can_ingest)
+
+    def fake_measure(positions, currency, rebalance_date, session, risk_free_rate=0.02, currencies=None):
+        seen.append(dict(positions))
+        return _stats(currency=currency, positions=dict(positions), risk_free_rate=risk_free_rate)
+
+    monkeypatch.setattr("src.flow.holdings_cli.open_holdings_session", fake_session)
+    monkeypatch.setattr("src.flow.holdings_cli.measure_holdings", fake_measure)
+    return seen
+
+
+def _no_writes(monkeypatch) -> tuple[MagicMock, MagicMock]:
+    """Spies on both writes a whatif must never make. Returned rather than
+    asserted here so each test can name which one it cares about.
+    """
+    save_positions = MagicMock()
+    save_rate = MagicMock(return_value=True)
+    monkeypatch.setattr("src.flow.holdings_cli.save_portfolio", save_positions)
+    monkeypatch.setattr("src.flow.holdings_cli.save_risk_free_rate", save_rate)
+    return save_positions, save_rate
+
+
+def test_whatif_saves_nothing_at_all(monkeypatch, tmp_path, capsys):
+    """The feature's whole promise. Asserted on the write functions rather
+    than on the file, because a file comparison would also pass if the write
+    happened but wrote identical bytes.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    before = path.read_bytes()
+
+    save_positions, save_rate = _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert save_positions.called is False
+    assert save_rate.called is False
+    assert path.read_bytes() == before
+    assert "Nothing was saved" in capsys.readouterr().out
+
+
+def test_whatif_reports_the_baseline_then_the_hypothetical(monkeypatch, tmp_path):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    measured = _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert measured == [{"SPY": 1000.0}, {"SPY": 1000.0, "NVDA": 100.0}]
+
+
+def test_whatif_labels_the_hypothetical_block_as_not_saved(monkeypatch, tmp_path, capsys):
+    """Naming the file in that header would be a plain falsehood - the
+    hypothetical holdings are not in it and never will be.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    out = capsys.readouterr().out
+    assert "What if (USD) - not saved:" in out
+    assert "Your portfolio (USD), from" in out
+
+
+def test_whatif_hands_over_the_set_command_that_would_apply_it(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert "To keep it: uv run portfolio-holdings set NVDA 100" in capsys.readouterr().out
+
+
+def test_whatif_offers_no_command_when_nothing_was_changed(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    out = capsys.readouterr().out
+    assert "Nothing was saved" in out
+    assert "To keep it:" not in out
+
+
+def test_whatif_spells_a_retirement_as_zero_in_the_set_command(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "T": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000", "T", "500"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "r", "T", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert "To keep it: uv run portfolio-holdings set T 0" in capsys.readouterr().out
+
+
+def test_whatif_undo_all_returns_to_the_saved_holdings(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    measured = _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "u", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert measured[-1] == {"SPY": 1000.0}
+    out = capsys.readouterr().out
+    assert "Back to your saved holdings." in out
+    assert "To keep it:" not in out
+
+
+def test_whatif_refuses_a_cross_currency_ticker_by_name(monkeypatch, tmp_path, capsys):
+    """`set`'s wording, because the point of a what-if is predicting what
+    `set` would do - and because a typo deserves naming, not quiet exclusion
+    from the figures.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_ingest(monkeypatch, {"7203.T": "JPY"})
+    measured = _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "7203.T 100", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert "Refused: 7203.T is priced in JPY" in capsys.readouterr().out
+    assert measured == [{"SPY": 1000.0}]
+
+
+def test_whatif_reports_an_unresolvable_ticker_and_carries_on(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_ingest(monkeypatch, {})
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NOTATICKER 5", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert "Ignored (not found): NOTATICKER." in capsys.readouterr().out
+
+
+def test_whatif_refuses_a_new_ticker_when_fetching_is_disabled(monkeypatch, tmp_path, capsys):
+    """`--db-path` is never written to, so a session over it cannot ingest -
+    refusing by name beats silently writing to the shared cache.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+
+    def _fail_if_called(tickers, as_of, db_path):
+        raise AssertionError("ingested into the shared cache under --no-fetch")
+
+    monkeypatch.setattr("src.flow.holdings_cli.validate_and_ingest_tickers", _fail_if_called)
+    _stub_session(monkeypatch, can_ingest=False)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, ["whatif", "--no-fetch"])
+
+    assert "would need a price fetch" in capsys.readouterr().out
+
+
+def test_whatif_keeps_what_you_had_on_an_unparseable_pair(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    measured = _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert "Ignoring that:" in capsys.readouterr().out
+    assert measured == [{"SPY": 1000.0}]
+
+
+def test_whatif_reprompts_on_an_unrecognized_choice(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "q", "f")
+    _run(monkeypatch, path, ["whatif"])
+
+    assert "Unrecognized choice 'q'." in capsys.readouterr().out
+
+
+def test_whatif_applies_the_risk_free_rate_without_remembering_it(monkeypatch, tmp_path):
+    """The write most likely to slip through: --risk-free-rate is remembered
+    by every other subcommand, and must not be here.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _save_positions, save_rate = _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "f")
+    _run(monkeypatch, path, ["whatif", "--risk-free-rate", "0.05"])
+
+    assert save_rate.called is False
+    assert not load_all_risk_free_rates(str(tmp_path / "rates.json"))
+
+
+def test_whatif_refuses_when_it_cannot_tell_which_portfolio_to_try(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "1321.T": "JPY"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    _run(monkeypatch, path, ["set", "1321.T", "50"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run(monkeypatch, path, ["whatif"])
+
+    assert excinfo.value.code == 2
+    assert "--currency" in capsys.readouterr().err
+
+
+# --- format_holdings_delta -------------------------------------------------
+
+
+def test_the_delta_is_the_signed_change_in_the_three_figures():
+    baseline = _stats(annual_return=0.1225, annual_volatility=0.1481, sharpe=0.5400)
+    hypothetical = _stats(annual_return=0.2281, annual_volatility=0.1904, sharpe=0.9744)
+
+    line = format_holdings_delta(baseline, hypothetical)
+
+    assert line == (
+        "Change from your saved portfolio: "
+        "return +0.1056  volatility +0.0423  Sharpe +0.4344"
+    )
+
+
+def test_a_worsening_change_is_signed_negative():
+    baseline = _stats(sharpe=0.9744)
+    hypothetical = _stats(sharpe=0.5400)
+
+    assert "Sharpe -0.4344" in format_holdings_delta(baseline, hypothetical)
+
+
+def test_the_delta_is_withheld_when_the_windows_differ():
+    """Subtracting two Sharpe ratios measured over different months would
+    report the change of window as a change of portfolio.
+    """
+    baseline = _stats()
+    hypothetical = _stats(window_start=date(2022, 10, 1), window_months=48)
+
+    line = format_holdings_delta(baseline, hypothetical)
+
+    assert "n/a - measured over different windows" in line
+    assert "2022-10-01" in line
+
+
+def test_the_delta_is_withheld_when_either_side_has_no_figures():
+    baseline = _stats()
+    hypothetical = unavailable_holdings("USD", {"NEWCO": 1.0}, 0.02, "too thin")
+
+    assert "no figures to compare" in format_holdings_delta(baseline, hypothetical)
+
+
+def test_whatif_does_not_claim_the_rate_was_remembered(monkeypatch, tmp_path, capsys):
+    """Every other subcommand phrases an overridden rate as "remembered for
+    USD". Printing that here would claim a write this command exists not to
+    make - the provenance line's whole job is to be true.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "f")
+    _run(monkeypatch, path, ["whatif", "--risk-free-rate", "0.05"])
+
+    out = capsys.readouterr().out
+    assert "not remembered - this is a what-if" in out
+    assert "remembered for USD" not in out

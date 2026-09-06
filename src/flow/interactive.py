@@ -18,6 +18,13 @@ candidate lists), tearing it down only when the `with` block exits -
 one such session, for callers (a future backtest runner, tests) that only
 need one shot and never edit anything.
 
+`open_holdings_session` and `measure_holdings` are the what-if pair: one
+throwaway database resolved once, then any number of hypothetical position
+sets measured against it over a single fixed returns window - which is what
+makes the change between two variants a number worth subtracting rather
+than an artefact of two different windows. See `open_holdings_session` for
+why that is a correctness rule.
+
 `prepare_holdings` is a fourth thing a session reports on, and the one
 piece here that is not about the candidate pool at all: the user's own
 saved holdings (`memory/portfolio.json`), measured with the same estimators
@@ -271,6 +278,121 @@ def prepare_benchmark(
             currency=None,
             monthly_returns=empty_benchmark_returns(ticker),
             unavailable_reason=f"could not prepare {ticker} as a benchmark: {e}",
+        )
+
+
+class HoldingsSession(NamedTuple):
+    """One open what-if session: where to measure variants, and whether new
+    tickers can still be resolved into it.
+
+    `db_path` is the database every variant is measured against.
+    `can_ingest` says whether a ticker the session has not seen yet may be
+    fetched into it - false when the caller disabled fetching, because then
+    `db_path` is the shared cache rather than a throwaway file and writing
+    to it would be exactly the side effect this whole feature promises not
+    to have.
+    """
+
+    db_path: str
+    can_ingest: bool
+
+
+@contextmanager
+def open_holdings_session(
+    tickers: list[str],
+    rebalance_date: date,
+    db_path: str,
+    allow_fetch: bool = True,
+):
+    """Yield a `HoldingsSession` whose database already holds `tickers`'
+    prices and monthly returns, kept alive for a whole interactive what-if
+    loop rather than rebuilt per measurement.
+
+    The sibling of `open_pipeline_session`, and for the same two reasons.
+
+    The first is correctness, and it is the reason this exists at all.
+    `src/optimizer/portfolio.py`'s `_load_window_dates` derives a
+    portfolio's returns window from `SELECT DISTINCT rebalance_date FROM
+    returns` over the WHOLE table, so two variants measured against two
+    separate throwaway databases can legitimately come back measured over
+    two different windows - and two Sharpe ratios computed over different
+    months cannot be subtracted from one another. A what-if's entire output
+    is that subtraction, so resolving every ticker into ONE database and
+    measuring every variant against it is what makes the reported change
+    honest rather than plausible-looking. `holdings_stats` reads the
+    database and nothing else, so once the session is open every variant is
+    a pure in-memory recomputation over a fixed window.
+
+    The second is that it makes the loop usable: the first measurement pays
+    one Yahoo Finance round trip for the whole portfolio and every edit
+    after it is instant. Compare `_resolve_holdings`, which fetches per
+    call - correct for a one-shot report, ruinous for a loop.
+
+    With `allow_fetch=False` the session yields `db_path` itself, read-only,
+    and reports `can_ingest=False`. That is not a degraded fetch path but a
+    different promise: `--no-holdings-fetch` means "touch no network", and
+    `db_path` is documented as never written to, so a ticker the cache does
+    not already hold cannot be added to the experiment at all. The caller
+    refuses such an add by name rather than silently ingesting into the
+    shared cache.
+    """
+    if not allow_fetch:
+        yield HoldingsSession(db_path=db_path, can_ingest=False)
+        return
+
+    with build_scratch_snapshot(prefix="holdings_whatif_") as scratch_db_path:
+        if tickers:
+            validate_and_ingest_tickers(sorted(tickers), rebalance_date, scratch_db_path)
+        yield HoldingsSession(db_path=scratch_db_path, can_ingest=True)
+
+
+def measure_holdings(
+    positions: dict[str, float],
+    currency: str,
+    rebalance_date: date,
+    session: HoldingsSession,
+    risk_free_rate: float = settings.risk_free_rate,
+    currencies: dict[str, str] | None = None,
+) -> HoldingsStats:
+    """Measure one variant against an open `session`, with no fetching and
+    no writes of any kind.
+
+    The what-if counterpart to `prepare_holdings`: that function resolves
+    its own data and is right for a one-shot report, while this one assumes
+    the data is already resolved and is right for a loop that measures many
+    variants over one window. Both end in `_holdings_stats_excluding`, so a
+    holding excluded for trading in the wrong currency or for having too
+    little history is reported the same way in either.
+
+    `currencies` is what the session learned about each ticker as it was
+    ingested; anything absent from it is looked up in the session's own
+    database, and anything absent from both is assumed to be `currency` -
+    the same assumption `_holdings_currency_gate` already makes.
+
+    Never raises, for the same reason `prepare_holdings` never does: losing
+    a session mid-loop over one unmeasurable variant would cost the person
+    every fetch the session has already paid for.
+    """
+    if not positions:
+        return holdings_stats({}, rebalance_date, session.db_path, currency, risk_free_rate)
+
+    try:
+        known = dict(currencies or {})
+        unknown = [ticker for ticker in positions if ticker not in known]
+        if unknown:
+            known.update(load_ticker_currencies(unknown, session.db_path))
+        return _holdings_stats_excluding(
+            positions,
+            currency,
+            rebalance_date,
+            session.db_path,
+            risk_free_rate,
+            _holdings_currency_gate(positions, currency, known),
+        )
+    except Exception as e:  # noqa: BLE001 - duckdb and pandas raise assorted types here
+        logger.warning("could not measure a %s what-if variant: %s", currency, e)
+        return unavailable_holdings(
+            currency, positions, risk_free_rate, f"could not measure this variant: {e}"
         )
 
 

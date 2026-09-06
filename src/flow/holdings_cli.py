@@ -1,9 +1,11 @@
 """CLI entry point for maintaining the user's OWN portfolio, per
-`plans/13_user_portfolio.md`: `uv run portfolio-holdings [show|set|remove]`.
+`plans/13_user_portfolio.md`:
+`uv run portfolio-holdings [show|set|remove|whatif]`.
 
     uv run portfolio-holdings set SPY 1000 T 500
     uv run portfolio-holdings remove T
     uv run portfolio-holdings show
+    uv run portfolio-holdings whatif
 
 This is the command that answers "what do I actually hold, and what has it
 done?" - as opposed to `uv run portfolio` (`src/flow/cli.py`), which
@@ -38,8 +40,21 @@ dollar rate to both. `--risk-free-rate` overrides it for the run and is
 remembered for that currency; it is refused when the command names no single
 currency to remember it against.
 
-Unlike `src/flow/cli.py` this command is entirely non-interactive: it never
-calls `input()`, so it is usable from a script or a one-line edit.
+`whatif` is the exception to all of the above, and the exception proves the
+rule: it applies hypothetical changes to a portfolio and reports what the
+figures would become, and it saves NOTHING - not the positions, and not a
+`--risk-free-rate`, which every other subcommand remembers. It is also the
+one interactive subcommand, prompting in a loop so several variations can be
+tried in a row against one fetch. Those two facts belong together: the
+reason the rest of this command is non-interactive is that each of its
+operations is a single edit better expressed as one scriptable line, whereas
+exploring is inherently a conversation - and it is safe to make it one
+precisely because nothing it does can outlive the session.
+
+So every subcommand that CHANGES the record is entirely non-interactive: it
+never calls `input()`, and is usable from a script or a one-line edit. That
+was previously true of the whole command; see
+`plans/13_user_portfolio.md`'s Milestone 5.
 """
 
 from __future__ import annotations
@@ -50,7 +65,7 @@ import sys
 
 from src.config.settings import settings
 from src.dataset.ticker_currency import DEFAULT_CURRENCY, partition_by_currency
-from src.flow.cli import parse_date, print_user_portfolio
+from src.flow.cli import format_holdings_delta, parse_date, print_user_portfolio
 from src.flow.rate_memory import (
     DEFAULT_RATES_PATH,
     load_risk_free_rate,
@@ -58,7 +73,12 @@ from src.flow.rate_memory import (
     save_risk_free_rate,
     validate_risk_free_rate,
 )
-from src.flow.interactive import in_typed_order, prepare_holdings
+from src.flow.interactive import (
+    in_typed_order,
+    measure_holdings,
+    open_holdings_session,
+    prepare_holdings,
+)
 from src.flow.live import build_scratch_snapshot
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.user_portfolio import (
@@ -68,7 +88,7 @@ from src.flow.user_portfolio import (
     save_portfolio,
 )
 
-VALID_COMMANDS = ("show", "set", "remove")
+VALID_COMMANDS = ("show", "set", "remove", "whatif")
 
 
 def _normalize_ticker(token: str) -> str:
@@ -237,7 +257,10 @@ def _run_show(args) -> None:
 
 
 def _validate_set_targets(
-    pairs: list[tuple[str, float]], args
+    pairs: list[tuple[str, float]],
+    args,
+    db_path: str | None = None,
+    pool_currency: str | None = None,
 ) -> tuple[str | None, list[str], dict[str, str], dict[str, str]]:
     """Resolve which currency's portfolio a `set` edits, and which of its
     tickers may join it: `(currency, accepted, invalid, refused)`.
@@ -251,15 +274,36 @@ def _validate_set_targets(
     somebody owns. The share counts are what is persisted; the fetched
     prices are only how the tickers were checked, and `prepare_holdings`
     fetches its own copy when it needs them.
+
+    `db_path` names an ALREADY-OPEN throwaway database to ingest into
+    instead of opening one that is discarded on return. `whatif` passes its
+    session's, so a ticker validated here is immediately measurable in the
+    same breath - which is the difference between one fetch per experiment
+    and one fetch per typed ticker. Still never `--db-path`: the caller owns
+    the file it passes, and `open_holdings_session` only hands over a scratch
+    one.
+
+    `pool_currency` is the currency the tickers must match, defaulting to
+    `--currency`. `set` leaves it alone, because for `set` the first typed
+    ticker is exactly what SHOULD establish the currency - that is how
+    `set 1321.T 50` creates a JPY portfolio. `whatif` must pass it: the
+    portfolio being experimented on already has a currency, so leaving it
+    `None` would let a typed yen ticker establish JPY and be accepted into a
+    dollar experiment rather than refused by name.
     """
     typed = [ticker for ticker, _ in pairs]
-    with build_scratch_snapshot(prefix="holdings_validate_") as scratch_db_path:
+    if db_path is not None:
         valid, invalid, currencies = validate_and_ingest_tickers(
-            typed, parse_date(args.date), scratch_db_path
+            typed, parse_date(args.date), db_path
         )
+    else:
+        with build_scratch_snapshot(prefix="holdings_validate_") as scratch_db_path:
+            valid, invalid, currencies = validate_and_ingest_tickers(
+                typed, parse_date(args.date), scratch_db_path
+            )
 
     accepted, refused, currency = partition_by_currency(
-        in_typed_order(valid, typed), args.currency, currencies
+        in_typed_order(valid, typed), pool_currency or args.currency, currencies
     )
     return currency, accepted, invalid, refused
 
@@ -318,6 +362,218 @@ def _run_set(args) -> None:
 
     _report(currency, args)
     _remember_rate(currency, args)
+
+
+WHATIF_PROMPT = "\nWhat if? [s]et shares / [r]emove / [u]ndo all / [f]inish: "
+
+NOT_SAVED = (
+    "Nothing was saved: that was a what-if, and your portfolio is unchanged."
+)
+
+
+def _whatif_apply(
+    positions: dict[str, float], pairs: list[tuple[str, float]], currency: str
+) -> dict[str, float]:
+    """`positions` with `pairs` applied, using `set`'s own semantics: a share
+    count replaces whatever was there, and `0` retires the holding.
+
+    Kept identical to `_run_set`'s merge on purpose. The value of a what-if
+    is that it predicts what `set` would do, and it can only promise that if
+    it applies changes the same way - which is also why `whatif` ends by
+    printing the `set` command that would make the experiment real.
+    """
+    applied = dict(positions)
+    for ticker, shares in pairs:
+        if shares > 0:
+            applied[ticker] = shares
+        else:
+            applied.pop(ticker, None)
+    return applied
+
+
+def _whatif_set_command(baseline: dict[str, float], hypothetical: dict[str, float]) -> str | None:
+    """The single `set` invocation that would turn `baseline` into
+    `hypothetical`, or `None` when they are the same.
+
+    Printed when the loop finishes because a what-if deliberately writes
+    nothing, and the person who just found an improvement should not have to
+    retype it from the report. A retired holding appears as `0`, which is how
+    `set` spells a removal.
+    """
+    changed = {
+        ticker: hypothetical.get(ticker, 0.0)
+        for ticker in sorted(set(baseline) | set(hypothetical))
+        if baseline.get(ticker, 0.0) != hypothetical.get(ticker, 0.0)
+    }
+    if not changed:
+        return None
+
+    pairs = " ".join(f"{ticker} {shares:g}" for ticker, shares in changed.items())
+    return f"uv run portfolio-holdings set {pairs}"
+
+
+def _run_whatif(args) -> None:
+    """`whatif`: try hypothetical changes to the saved holdings and see the
+    three figures move, without saving anything.
+
+    The one interactive subcommand, and the one that changes nothing - those
+    two facts are related. Every other subcommand is a single edit that is
+    better expressed as one scriptable line, whereas the point here is to try
+    five variations in a row and watch the numbers, which a flag-per-run
+    shape would make unbearable: each variation would re-pay the Yahoo
+    Finance round trip that `open_holdings_session` pays once.
+
+    Never writes. Not to `memory/portfolio.json`, and - the easier one to
+    miss - not to `memory/rates.json` either: `--risk-free-rate` works here
+    as a run-only override, useful for asking what a different riskless
+    return would do to the Sharpe ratio, but `_remember_rate` is
+    deliberately not called, because a command whose whole promise is
+    changing nothing must not leave a rate behind.
+
+    Imitates `src/flow/cli.py`'s `_run_edit_loop` throughout: snapshot the
+    positions before an edit so a rejected one reverts, `continue` on
+    unparseable input keeping what you had, and recompute-then-report. It is
+    strictly simpler than that loop in one respect - there is no persist step
+    to order correctly, because there is no persist step at all.
+    """
+    currency = _rate_currency_for_report(args)
+    if currency is None:
+        raise ValueError(
+            "whatif needs one currency's portfolio to experiment on, and this command names "
+            "none; add --currency (for example --currency JPY)"
+        )
+
+    baseline_positions = load_portfolio(args.path, currency)
+    resolved = _resolve_rate(currency, args)
+    # `resolve_risk_free_rate` phrases an overridden rate as "remembered for
+    # USD", which is true of every other subcommand and false of this one.
+    # Printing it here would have the report claim a write this command
+    # exists specifically not to make - the mirror image of the
+    # unprovenanced-rate bug `format_risk_free_rate` was added to prevent.
+    origin = (
+        "--risk-free-rate, not remembered - this is a what-if"
+        if resolved.from_override
+        else resolved.origin
+    )
+
+    with open_holdings_session(
+        list(baseline_positions),
+        parse_date(args.date),
+        args.db_path,
+        allow_fetch=not args.no_holdings_fetch,
+    ) as session:
+        known: dict[str, str] = {}
+        baseline = measure_holdings(
+            baseline_positions, currency, parse_date(args.date), session, resolved.rate, known
+        )
+        print_user_portfolio(baseline, args.path, risk_free_rate_origin=origin)
+
+        positions = dict(baseline_positions)
+        while True:
+            choice = input(WHATIF_PROMPT).strip().lower()
+
+            if choice in ("", "f", "finish"):
+                print(f"\n{NOT_SAVED}")
+                command = _whatif_set_command(baseline_positions, positions)
+                if command is not None:
+                    print(f"To keep it: {command}")
+                return
+
+            previous = dict(positions)
+            if choice in ("s", "set"):
+                positions = _whatif_set(positions, currency, session, known, args)
+            elif choice in ("r", "remove"):
+                raw = input("Ticker(s) to remove (space-separated): ").strip().upper()
+                tickers = [_normalize_ticker(t) for t in raw.split() if _normalize_ticker(t)]
+                absent = sorted(t for t in tickers if t not in positions)
+                if absent:
+                    print(f"Not held (ignored): {', '.join(absent)}.")
+                positions = {t: n for t, n in positions.items() if t not in tickers}
+            elif choice in ("u", "undo"):
+                positions = dict(baseline_positions)
+                print("Back to your saved holdings.")
+            else:
+                print(f"Unrecognized choice {choice!r}.")
+                continue
+
+            if positions == previous:
+                continue
+
+            hypothetical = measure_holdings(
+                positions, currency, parse_date(args.date), session, resolved.rate, known
+            )
+            print_user_portfolio(
+                hypothetical,
+                args.path,
+                risk_free_rate_origin=origin,
+                heading=f"What if ({currency}) - not saved",
+            )
+            print(format_holdings_delta(baseline, hypothetical))
+
+
+def _whatif_set(
+    positions: dict[str, float],
+    currency: str,
+    session,
+    known: dict[str, str],
+    args,
+) -> dict[str, float]:
+    """One `[s]et` step: read `TICKER SHARES` pairs, validate anything new,
+    and return the resulting hypothetical positions.
+
+    A ticker already in the experiment needs no validation - the session
+    resolved it - so only genuinely new ones cost a lookup, which is what
+    keeps a second edit to the same holding instant.
+
+    New tickers go through `_validate_set_targets`, the same function `set`
+    uses, so a cross-currency ticker is refused with the same sentence and
+    the same suggested command. Routing straight to the measurement instead
+    would have `interactive._holdings_currency_gate` merely EXCLUDE it with
+    a one-line reason, which is right for a hand-edited file but wrong for
+    something just typed: a typo deserves to be named, not quietly dropped
+    from the figures.
+    """
+    raw = input("Ticker and shares (e.g. NVDA 100, 0 to drop): ").strip().upper()
+    try:
+        pairs = _parse_pairs(raw.split())
+    except ValueError as e:
+        print(f"Ignoring that: {e}")
+        return positions
+    if not pairs:
+        return positions
+
+    new = [(t, n) for t, n in pairs if t not in positions and n > 0]
+    if new:
+        if not session.can_ingest:
+            print(
+                f"Refused: {', '.join(sorted(t for t, _ in new))} would need a price fetch, and "
+                "fetching is disabled with --no-holdings-fetch. Drop that flag to try a holding "
+                "you do not already own."
+            )
+            pairs = [(t, n) for t, n in pairs if (t, n) not in new]
+        else:
+            _resolved, accepted, invalid, refused = _validate_set_targets(
+                [(t, n) for t, n in new],
+                args,
+                db_path=session.db_path,
+                pool_currency=currency,
+            )
+            if invalid:
+                print(f"Ignored (not found): {', '.join(sorted(invalid))}.")
+            for ticker in sorted(refused):
+                print(
+                    f"Refused: {ticker} is priced in {refused[ticker]}, so it belongs to the "
+                    f"{refused[ticker]} portfolio, not the {currency} one."
+                )
+            known.update({t: currency for t in accepted})
+            keep = set(accepted) | {t for t, _ in pairs if t in positions} | {
+                t for t, n in pairs if n == 0
+            }
+            pairs = [(t, n) for t, n in pairs if t in keep]
+
+    if not pairs:
+        return positions
+    return _whatif_apply(positions, pairs, currency)
 
 
 def _resolve_remove_currency(tickers: list[str], args) -> str | None:
@@ -390,9 +646,12 @@ def _guard_rate_is_rememberable(args) -> None:
     complaint arrives before the cost.
 
     `set` is exempt: its typed tickers determine the currency, so there is
-    nothing to disambiguate and nothing yet to check.
+    nothing to disambiguate and nothing yet to check. `whatif` is exempt for
+    a different reason - it never remembers a rate at all, so the ambiguity
+    this guard exists to refuse cannot arise. It does its own refusal when
+    it cannot tell which portfolio to experiment on.
     """
-    if args.currency or args.command == "set":
+    if args.currency or args.command in ("set", "whatif"):
         return
 
     if args.command == "remove":
@@ -411,20 +670,24 @@ def main() -> None:
         description="Maintain the portfolio you actually hold, per currency, and report its "
                     "annualized return, volatility and Sharpe ratio.",
         epilog="Examples: portfolio-holdings set SPY 1000 T 500 | portfolio-holdings remove T | "
-               "portfolio-holdings --currency JPY set 1321.T 50 | portfolio-holdings show",
+               "portfolio-holdings --currency JPY set 1321.T 50 | portfolio-holdings show | "
+               "portfolio-holdings whatif (try changes without saving them)",
     )
     parser.add_argument(
         "command",
         nargs="?",
         default="show",
         choices=VALID_COMMANDS,
-        help="What to do. Defaults to 'show', so a bare invocation reports every saved portfolio.",
+        help="What to do. Defaults to 'show', so a bare invocation reports every saved portfolio. "
+             "'whatif' opens a loop for trying hypothetical changes and seeing the figures move, "
+             "and saves nothing at all.",
     )
     parser.add_argument(
         "args",
         nargs="*",
         help="For 'set', alternating TICKER SHARES pairs (SHARES of 0 retires a holding). "
-             "For 'remove', tickers. Ignored by 'show'.",
+             "For 'remove', tickers. Ignored by 'show' and 'whatif', which takes its changes "
+             "at its own prompt.",
     )
     parser.add_argument(
         "--path",
@@ -485,7 +748,12 @@ def main() -> None:
     if args.currency:
         args.currency = args.currency.strip().upper()
 
-    runners = {"show": _run_show, "set": _run_set, "remove": _run_remove}
+    runners = {
+        "show": _run_show,
+        "set": _run_set,
+        "remove": _run_remove,
+        "whatif": _run_whatif,
+    }
     try:
         if args.risk_free_rate is not None:
             # Checked here, before any Yahoo Finance round trip: `set` would
