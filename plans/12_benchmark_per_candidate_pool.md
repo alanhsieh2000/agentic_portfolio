@@ -64,7 +64,8 @@ A **candidate pool** is the list of tickers a person has assembled to build a po
 - [x] (2026-09-06 02:20Z) Fixed a pre-existing crash in `attach_nearest_price` (`src/dataset/fundamentals.py`) that an unresolvable single ticker reaches, with a regression test in `tests/test_dataset_upsert.py`. See Surprises & Discoveries.
 - [x] (2026-09-06 02:30Z) Verified end to end: five real CLI runs covering the USD default, the JPY prompt with a refusal, `[b]`, `--benchmark none`, `--no-benchmark-fetch`, and an unresolvable `--benchmark`. `data/portfolio.duckdb` byte-identical throughout (md5 checked before and after).
 - [x] (2026-09-06 02:35Z) Documented in `README.md`'s Live Mode section.
-- [x] (2026-09-06 02:40Z) Full suite: 359 passed, up from 290 before this plan.
+- [x] (2026-09-06 02:40Z) Full suite: 360 passed, up from 290 before this plan.
+- [x] (2026-09-06 03:05Z) Recorded the shrinkage asymmetry — the one thing the ddof fix does NOT make symmetric — in `src/optimizer/benchmark.py`'s module docstring, in `annualized_return_and_volatility`'s docstring, in this plan's Surprises & Discoveries and Decision Log, and as `tests/test_benchmark.py::test_the_benchmark_is_not_shrunk_against_a_pool`. The report deliberately stays silent about it.
 - [ ] Not done, deliberately out of scope: a `DEFAULT_BENCHMARKS` entry for any currency other than USD (the person is asked instead — see the Decision Log); a benchmark for `src/flow/backtest.py`'s 52-month backtest scoring, which reports a realized Sharpe ratio from a different computation entirely; and any currency conversion, which remains unimplemented across the whole project.
 
 
@@ -79,6 +80,20 @@ A **candidate pool** is the list of tickers a person has assembled to build a po
       series.std() * sqrt(12)             :                            vol 0.31562577516342744
 
   The first two agree to ~1e-10 (solver noise); the third is 0.8% high. `tests/test_benchmark.py::test_volatility_is_not_the_sample_standard_deviation` locks this in so a future "simplification" cannot quietly break comparability.
+
+- Observation: Fixing the ddof convention makes the two sides agree on the return estimator, the annualization, the ddof convention, the Sharpe definition and the risk-free rate — but NOT on Ledoit-Wolf shrinkage, and there is no way to make them agree on that. Shrinkage is defined relative to a cross-section of assets: it pulls each variance toward the average of them. A benchmark is one column, so scikit-learn shrinks it by exactly zero, while a pool's covariance genuinely is shrunk, and by considerably more than the 0.84% the ddof convention was worth.
+  Evidence: a four-asset pool (`AAPL`, `MSFT`, `JNJ`, `XOM`, 60 months to 2024-04-01) drew `delta=0.1763`, moving each holding's annual volatility away from its standalone value in BOTH directions:
+
+      ticker  standalone  inside the pool matrix
+      AAPL        0.3130  0.3058  (-2.3%)
+      MSFT        0.2061  0.2187  (+6.1%)
+      JNJ         0.1614  0.1852  (+14.8%)
+      XOM         0.3535  0.3402  (-3.7%)
+
+  and moving that pool's GMV portfolio from `vol=0.1474  Sharpe=0.9378` unshrunk to `vol=0.1527  Sharpe=1.0505` shrunk. So the portfolio side of the comparison is moved several percent by an estimator choice that leaves the benchmark side untouched. See the Decision Log for why the answer is nonetheless to leave the benchmark unshrunk, and for the one caveat that follows.
+
+- Observation: pypfopt is itself internally inconsistent about `ddof`, which is a good reason never to infer a convention and always to read the code path in use. `CovarianceShrinkage.__init__` computes `self.S = self.X.cov().values`, which is pandas' `ddof=1`. The default `ledoit_wolf()` path ignores `self.S` entirely and calls scikit-learn on the raw returns (`ddof=0`); `_ledoit_wolf_single_factor` explicitly converts `np.cov` to `ddof=0` with a `* (t - 1) / t` factor; but `_ledoit_wolf_constant_correlation` uses `self.S` as-is, at `ddof=1`.
+  Evidence: read `CovarianceShrinkage` in `.venv/lib/python3.12/site-packages/pypfopt/risk_models.py`. Three shrinkage targets, two ddof conventions between them.
 
 - Observation: Writing the benchmark's rows into the session's own database is not merely untidy, it can move the very window the benchmark is supposed to be measured over. `src/optimizer/portfolio.py`'s `_load_window_dates` derives the portfolio's returns window from `SELECT DISTINCT rebalance_date FROM returns WHERE rebalance_date <= ? ORDER BY rebalance_date DESC LIMIT ?` — from the whole table, with no restriction to the candidate tickers. Benchmark months present in that table are therefore candidates for the portfolio's own window.
   Evidence: read the SQL in `_load_window_dates`; there is no `ticker` predicate. It happens to be harmless today because every writer grids over `compute_rebalance_dates`, so the same date span always produces the same month anchors — but that is a coincidence of the current writers, not a guarantee. Hence the decision that the benchmark always gets its own database.
@@ -121,6 +136,11 @@ A **candidate pool** is the list of tickers a person has assembled to build a po
   Rationale: That delegation was tried and does work exactly (weight comes back `{ticker: 1.0}` and the three figures are the benchmark's own, agreeing to ~1e-10). It was rejected because it invokes a quadratic-programming solver to discover that the only available asset gets all the weight — solver noise, solver failure modes and solver runtime for no benefit. The equality is instead captured as a test, which gives the same guarantee without the machinery.
   Date/Author: 2026-09-06.
 
+- Decision: The benchmark's volatility is its OWN standalone annualized volatility, deliberately not shrunk against the pool's covariance matrix, even though that leaves the two sides of the comparison on different shrinkage regimes. Do not "fix" this by adding the benchmark as an extra column of the pool's returns matrix.
+  Rationale: Shrinkage is a function of the cross-section it is applied to, so folding the benchmark into the pool's matrix would make its reported volatility depend on which tickers happen to be in the pool — measured at up to +14.8% for one holding of a four-asset pool (see Surprises & Discoveries). The same benchmark over the same months would then print differently from one run to the next, and could not be compared across pools at all. A reference point that moves when a candidate is added is not a reference point. The signature of `benchmark_stats_for_window` enforces this structurally by taking only a `BenchmarkSource` and a window, never the pool, and `tests/test_benchmark.py::test_the_benchmark_is_not_shrunk_against_a_pool` fails if the implementation ever starts shrinking against one.
+  The caveat this leaves, worth knowing when reading a close call: shrinkage moves the PORTFOLIO's reported volatility and Sharpe ratio by several percent in a direction that depends on its own correlation structure, while leaving the benchmark's untouched, so a Sharpe gap of a couple of hundredths — such as the live USD run's 0.6675 against 0.6921 — sits inside the noise of that choice and is not decisive. A gap like the JPY run's 0.6132 against 1.5486 plainly is. This is recorded in `src/optimizer/benchmark.py`'s module docstring rather than printed on every run, since a caveat that always appears becomes noise rather than information.
+  Date/Author: 2026-09-06, raised by the user on reviewing the ddof finding.
+
 - Decision: `DEFAULT_BENCHMARKS` contains `USD -> SPY` and nothing else. Any other currency is ASKED for, once, and the answer is remembered.
   Rationale: `SPY` is the uncontested stand-in for the US market, so defaulting it costs nobody anything. There is no comparably obvious single answer elsewhere — a yen pool might reasonably be measured against TOPIX (`1306.T`) or the Nikkei 225 (`1321.T`), and those genuinely differ: over the same 60 months this project measured them at 20.09% return / 11.68% volatility and 21.59% / 17.70% respectively, a Sharpe ratio of 1.55 against 1.11. Picking one in code would quietly measure somebody's portfolio against an index they never chose, which is precisely the kind of invisible wrong answer `plans/11` was written to eliminate for currencies. Asking is cheap because the pool-editing loop is already interactive, and the answer is remembered so it is asked at most once per pool.
   Date/Author: 2026-09-06, confirmed with the user.
@@ -157,7 +177,7 @@ A **candidate pool** is the list of tickers a person has assembled to build a po
 ## Outcomes & Retrospective
 
 
-Delivered in full. Every candidate pool now has a benchmark, the report prints its annual return, annual volatility and Sharpe ratio over the portfolio's exact window on the line below the portfolio's own figures, and the numbers are comparable by construction rather than by hope. The test suite went from 290 to 359 passing. Five real end-to-end runs exercised the USD default, the JPY prompt including a refusal and a re-ask, `[b]` mid-session, `--benchmark none`, `--no-benchmark-fetch`, and an unresolvable ticker; `data/portfolio.duckdb` was byte-identical (md5) before and after all of them, and still contains zero `SPY` rows.
+Delivered in full. Every candidate pool now has a benchmark, the report prints its annual return, annual volatility and Sharpe ratio over the portfolio's exact window on the line below the portfolio's own figures, and the numbers are comparable by construction rather than by hope. The test suite went from 290 to 360 passing. Five real end-to-end runs exercised the USD default, the JPY prompt including a refusal and a re-ask, `[b]` mid-session, `--benchmark none`, `--no-benchmark-fetch`, and an unresolvable ticker; `data/portfolio.duckdb` was byte-identical (md5) before and after all of them, and still contains zero `SPY` rows.
 
 Two things went better than expected. First, treating a benchmark as a one-asset portfolio turned out to be exactly true rather than merely close, which converted "are these numbers comparable?" from an argument into an assertion — `test_a_one_asset_portfolio_equals_its_own_benchmark` is the most valuable test in this plan. Second, refusing to touch `_run_user_provided_confirm_loop` cost nothing and saved churn across seventeen call sites; the benchmark genuinely is a separate concern from editing a ticker list, and the code reads better for saying so.
 
@@ -285,7 +305,7 @@ Establish the baseline first, so you can tell what you changed:
 After Milestone 1:
 
     $ uv run pytest tests/test_benchmark.py tests/test_optimizer.py -q
-    49 passed in 5.32s
+    50 passed in 5.32s
 
 Then confirm the equality claim against real data, which needs `data/portfolio.duckdb` to have been built (if it has not, skip this and rely on `tests/test_benchmark.py`, which needs no such thing):
 
@@ -332,7 +352,7 @@ The `attach_nearest_price` fix from Surprises & Discoveries brings one more:
 Then the whole suite:
 
     $ uv run pytest tests/test_*.py -q
-    359 passed in 98.90s (0:01:38)
+    360 passed in 98.90s (0:01:38)
 
 
 ## Validation and Acceptance

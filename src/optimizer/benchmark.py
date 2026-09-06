@@ -24,6 +24,38 @@ only difference from the obvious `series.std() * sqrt(12)` is the denominator
 look better or worse than the portfolio for no reason but a convention
 mismatch. `tests/test_benchmark.py` pins both facts.
 
+One asymmetry between the two sides is deliberate and must NOT be "fixed".
+They share the return estimator, the annualization, the ddof convention, the
+Sharpe definition and the risk-free rate - but they do not share Ledoit-Wolf
+shrinkage, and cannot. Shrinkage is defined relative to a cross-section of
+assets: it pulls each variance toward the average of them. A benchmark is one
+column, so scikit-learn shrinks it by exactly zero (it reports `delta=0.0`),
+while a pool's covariance genuinely is shrunk - measured here, a four-asset
+pool drew `delta=0.176`, which moved one holding's annual volatility from
+0.1614 standalone to 0.1852 inside the matrix, +14.8%.
+
+Folding the benchmark into the pool's returns matrix so both sides got the
+same shrinkage would be worse, not better: the benchmark's reported
+volatility would then depend on which tickers happen to be in the pool, so
+the same benchmark over the same months would print differently from one run
+to the next and could not be compared across pools at all. A reference point
+that moves when you add a candidate is not a reference point. Hence
+`benchmark_stats_for_window` deliberately takes only a `BenchmarkSource` and
+a window, never the pool - and
+`tests/test_benchmark.py::test_the_benchmark_is_not_shrunk_against_a_pool`
+fails if that ever changes.
+
+The residual consequence is worth knowing when reading a close call.
+Shrinkage moves the PORTFOLIO's reported volatility and Sharpe ratio by
+several percent - on that same four-asset pool, its GMV volatility went
+0.1474 unshrunk to 0.1527 shrunk and its Sharpe ratio 0.9378 to 1.0505 - in a
+direction that depends on the pool's own correlation structure, while leaving
+the benchmark's figures untouched. So a Sharpe gap of a couple of hundredths
+between portfolio and benchmark sits inside the noise of that estimator
+choice and should not be read as decisive; a gap like 0.61 against 1.55
+plainly does not. The report deliberately does not print this caveat on every
+run, which would make it noise rather than information.
+
 Nothing here fetches anything. `load_benchmark_returns` reads a `returns`
 table READ-ONLY and reports a missing file, table or ticker as an empty
 series, so a benchmark can be read straight out of the shared
@@ -206,6 +238,12 @@ def annualized_return_and_volatility(monthly_returns: pd.Series) -> tuple[float,
 
     Pure: no I/O, no logging, no shared state. `frequency=12` annualizes from
     the monthly cadence `src/dataset/returns.py` produces.
+
+    Takes ONE series and never a pool, deliberately: Ledoit-Wolf shrinkage on
+    a single column is inert, so the volatility reported here is the
+    benchmark's own and does not vary with whatever else a portfolio happens
+    to hold. See this module's docstring for why that independence is the
+    point rather than an oversight.
     """
     frame = monthly_returns.to_frame()
     mu = expected_returns.mean_historical_return(frame, returns_data=True, frequency=12)

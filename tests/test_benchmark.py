@@ -295,3 +295,46 @@ def test_load_benchmark_returns_leaves_the_database_untouched(tmp_path):
     load_benchmark_returns("SPY", date(2024, 4, 1), str(db_path))
 
     assert db_path.stat().st_mtime_ns == before
+
+
+def test_the_benchmark_is_not_shrunk_against_a_pool():
+    """The benchmark's volatility is its own, not a function of whatever a
+    portfolio happens to hold.
+
+    Ledoit-Wolf shrinkage pulls each variance toward the average of the
+    matrix it is applied to, so the SAME series reports a different
+    volatility standalone than it does as one column among several - here the
+    difference is several percent. This test pins which of the two the report
+    uses: the standalone one. Folding the benchmark into the pool's matrix so
+    that both sides were shrunk alike would make the benchmark's printed
+    figures change when a candidate is added, which is exactly what a
+    reference point must not do (see the module docstring).
+    """
+    bench = _monthly_returns(60, "SPY")
+    # Independent series with spread-out variances. Scalar multiples of one
+    # series will NOT do: perfectly correlated columns drive the shrinkage
+    # constant to nearly zero, and the fixture would prove nothing.
+    rng = np.random.default_rng(7)
+    pool_with_benchmark = pd.DataFrame(
+        {
+            "SPY": bench,
+            "A": rng.normal(0.01, 0.09, 60),
+            "B": rng.normal(0.005, 0.01, 60),
+            "C": rng.normal(0.02, 0.05, 60),
+        },
+        index=bench.index,
+    )
+
+    standalone = annualized_return_and_volatility(bench)[1]
+    in_matrix = float(
+        np.sqrt(
+            risk_models.CovarianceShrinkage(pool_with_benchmark, returns_data=True, frequency=12)
+            .ledoit_wolf()
+            .to_numpy()[0, 0]
+        )
+    )
+    stats = benchmark_stats_for_window(_source(bench), date(2020, 1, 1), date(2024, 12, 1), 0.02)
+
+    assert in_matrix != pytest.approx(standalone, rel=1e-3), "fixture must actually provoke shrinkage"
+    assert stats.annual_volatility == pytest.approx(standalone, rel=1e-12)
+    assert stats.annual_volatility != pytest.approx(in_matrix, rel=1e-3)
