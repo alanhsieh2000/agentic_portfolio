@@ -89,6 +89,11 @@ from src.flow.rate_memory import (
     validate_risk_free_rate,
 )
 from src.dataset.holdings_cache import DEFAULT_HOLDINGS_CACHE_PATH, refresh_holdings_cache
+from src.optimizer.holdings import (
+    DEFAULT_LOOKBACK_MONTHS,
+    HoldingsStats,
+    validate_lookback_months,
+)
 from src.flow.interactive import (
     in_typed_order,
     measure_holdings,
@@ -396,7 +401,9 @@ def _run_set(args) -> None:
     _remember_rate(currency, args)
 
 
-WHATIF_PROMPT = "\nWhat if? [s]et shares (any ticker) / [r]emove / [u]ndo all / [f]inish: "
+WHATIF_PROMPT = (
+    "\nWhat if? [s]et shares (any ticker) / [r]emove / [w]indow / [u]ndo all / [f]inish: "
+)
 
 NOT_SAVED = (
     "Nothing was saved: that was a what-if, and your portfolio is unchanged."
@@ -444,10 +451,47 @@ def _whatif_set_command(baseline: dict[str, float], hypothetical: dict[str, floa
     return f"uv run portfolio-holdings set {pairs}"
 
 
+def _whatif_window(current: int) -> int:
+    """Read a new returns-window length, or keep `current` when the answer is
+    unusable.
+
+    The `continue`-on-unparseable-input discipline `_run_edit_loop`
+    established: a bad answer costs the person one line, not the window they
+    already had. `validate_lookback_months` supplies the message, so the
+    bounds are explained once, where they are enforced.
+    """
+    raw = input(f"Months of returns to measure over (24-60, currently {current}): ").strip()
+    if not raw:
+        return current
+
+    try:
+        months: object = int(raw)
+    except ValueError:
+        # Hand the raw text to the validator rather than letting `int`'s own
+        # "invalid literal for int() with base 10" reach the person. One
+        # message covers a non-number and an out-of-range number, and it is
+        # the message that explains the bounds.
+        months = raw
+
+    try:
+        return validate_lookback_months(months, "the window")
+    except ValueError as e:
+        print(f"Keeping {current} months: {e}")
+        return current
+
+
 def _run_whatif(args) -> None:
     """`whatif`: try hypothetical changes to the saved holdings - including
-    adding a ticker you do not own - and see the three figures move, without
-    saving anything.
+    adding a ticker you do not own, and including the length of the returns
+    window itself - and see the three figures move, without saving anything.
+
+    The window is a change worth trying because it can dominate the answer.
+    A holding that fell hard early in the 60-month window and has been
+    stable since reads as poor over 60 months and quite differently over 36;
+    both are true statements about different spans of months, and 2 to 5
+    years are all defensible choices. `[w]indow` is how you see more than
+    one, and the report names the length that was asked for so a chosen
+    window is never mistaken for all the data there was.
 
     The one interactive subcommand, and the one that changes nothing - those
     two facts are related. Every other subcommand is a single edit that is
@@ -498,10 +542,22 @@ def _run_whatif(args) -> None:
         force_refresh=args.refresh_holdings,
     ) as session:
         known: dict[str, str] = {}
-        baseline = measure_holdings(
-            baseline_positions, currency, parse_date(args.date), session, resolved.rate, known
+        window = DEFAULT_LOOKBACK_MONTHS
+
+        def measure(these: dict[str, float]) -> HoldingsStats:
+            return measure_holdings(
+                these, currency, parse_date(args.date), session, resolved.rate, known, window
+            )
+
+        def window_note() -> str | None:
+            # Named only when somebody chose it, so the default run's report
+            # is byte-identical to what it printed before this existed.
+            return None if window == DEFAULT_LOOKBACK_MONTHS else f"{window} requested"
+
+        baseline = measure(baseline_positions)
+        print_user_portfolio(
+            baseline, args.path, risk_free_rate_origin=origin, window_origin=window_note()
         )
-        print_user_portfolio(baseline, args.path, risk_free_rate_origin=origin)
 
         positions = dict(baseline_positions)
         while True:
@@ -524,6 +580,19 @@ def _run_whatif(args) -> None:
                 if absent:
                     print(f"Not held (ignored): {', '.join(absent)}.")
                 positions = {t: n for t, n in positions.items() if t not in tickers}
+            elif choice in ("w", "window"):
+                chosen = _whatif_window(window)
+                if chosen == window:
+                    continue
+                window = chosen
+                # The baseline is re-measured at the new length, not left
+                # where it was. `format_holdings_delta` withholds a delta
+                # across differing windows - correctly, since the difference
+                # would then be partly the months rather than the holdings -
+                # so a window change has to move both sides or every
+                # subsequent comparison would come back as an apology.
+                baseline = measure(baseline_positions)
+                print(f"Measuring over {window} month(s) of returns.")
             elif choice in ("u", "undo"):
                 positions = dict(baseline_positions)
                 print("Back to your saved holdings.")
@@ -531,17 +600,31 @@ def _run_whatif(args) -> None:
                 print(f"Unrecognized choice {choice!r}.")
                 continue
 
-            if positions == previous:
+            if positions == previous and choice not in ("w", "window"):
                 continue
 
-            hypothetical = measure_holdings(
-                positions, currency, parse_date(args.date), session, resolved.rate, known
-            )
+            if positions == baseline_positions:
+                # These ARE the saved holdings - either nothing was changed
+                # yet (a window-only edit) or `[u]ndo all` put them back. So
+                # reprint the baseline as the baseline. Labelling it "What if
+                # - not saved" would be a false label on the person's real
+                # portfolio, and the delta beneath it would be a row of
+                # zeroes dressed up as a finding.
+                print_user_portfolio(
+                    baseline,
+                    args.path,
+                    risk_free_rate_origin=origin,
+                    window_origin=window_note(),
+                )
+                continue
+
+            hypothetical = measure(positions)
             print_user_portfolio(
                 hypothetical,
                 args.path,
                 risk_free_rate_origin=origin,
                 heading=f"What if ({currency}) - not saved",
+                window_origin=window_note(),
             )
             print(format_holdings_delta(baseline, hypothetical))
 

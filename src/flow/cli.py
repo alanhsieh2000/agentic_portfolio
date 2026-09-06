@@ -269,6 +269,7 @@ def print_user_portfolio(
     risk_free_rate_origin: str | None = None,
     *,
     heading: str | None = None,
+    window_origin: str | None = None,
 ) -> None:
     """Human-readable rendering of the user's OWN saved portfolio (see
     `src/flow/user_portfolio.py` and `src/optimizer/holdings.py`) - what is
@@ -296,6 +297,16 @@ def print_user_portfolio(
     window or against a different rate are different numbers, and a figure
     whose derivation is not stated beside it invites being compared with one
     derived differently.
+
+    `window_origin` names the window that was ASKED for, when somebody asked
+    - `uv run portfolio-holdings whatif`'s `[w]indow`. The month count beside
+    it stays derived from the data actually used, so the two together
+    distinguish "36 months because I chose 36" from "36 months because that
+    is all there was", and make a request that could not be honoured visible
+    rather than silent: 48 months of data against a 60-month request prints
+    both numbers. Shortening a window until the figures improve is
+    cherry-picking, and the defence is that the window is stated on the same
+    line as the figures it produced, every time.
 
     `Total value` carries the date of the prices behind it. Those prices can
     come from a cache that is only refreshed monthly (see
@@ -349,8 +360,9 @@ def print_user_portfolio(
         # provenance from exactly them would be backwards.
         print(format_risk_free_rate(holdings.risk_free_rate, risk_free_rate_origin))
     else:
+        requested = f", {window_origin}" if window_origin else ""
         print(f"Returns window: {holdings.window_start} to {holdings.window_end} "
-              f"({holdings.window_months} month(s) of monthly returns)")
+              f"({holdings.window_months} month(s) of monthly returns{requested})")
         # Same section, same wording and same position relative to the
         # portfolio-level line as `print_weights_and_allocation` gives an
         # optimized pool - so the two blocks of one report can be read
@@ -392,10 +404,13 @@ def format_holdings_delta(baseline: HoldingsStats, hypothetical: HoldingsStats) 
     misleading number. And the two may have been measured over different
     returns windows, in which case the difference between their Sharpe
     ratios is partly just the difference between two spans of months.
-    `open_holdings_session` exists to make that second case impossible by
-    construction, so reaching it means something has gone wrong upstream;
-    saying so is more useful than printing a plausible number that is not
-    the answer to any question.
+    `open_holdings_session` exists to make that second case impossible for
+    a change of HOLDINGS, since every variant is measured against one
+    database. It is reachable, legitimately, when somebody changes the
+    window itself - which is why `whatif`'s `[w]indow` re-measures the
+    baseline at the new length rather than leaving the two sides on
+    different spans. Either way, saying so beats printing a plausible number
+    that is not the answer to any question.
 
     Only the three portfolio-level figures are diffed. A holding's OWN
     volatility legitimately moves between the two blocks even when nothing

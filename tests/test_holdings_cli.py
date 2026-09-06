@@ -19,6 +19,7 @@ import pytest
 
 from src.config.settings import settings
 from src.flow.holdings_cli import (
+    NOT_SAVED,
     WHATIF_PROMPT,
     _normalize_ticker,
     _parse_pairs,
@@ -680,21 +681,44 @@ def _script(monkeypatch, *responses: str) -> None:
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(remaining))
 
 
-def _stub_session(monkeypatch, measured: list[dict] | None = None, can_ingest: bool = True):
+def _stub_session(
+    monkeypatch,
+    measured: list[dict] | None = None,
+    can_ingest: bool = True,
+    windows: list[int] | None = None,
+):
     """Replace the what-if session and its measurement with spies, so a CLI
     test asserts on the loop's behaviour rather than on estimator arithmetic
     (covered by tests/test_holdings.py). Returns the list of measured
-    position dicts, in order.
+    position dicts, in order; pass `windows` to also capture the
+    `lookback_months` each measurement used.
     """
     seen = measured if measured is not None else []
+    seen_windows = windows if windows is not None else []
 
     @contextmanager
     def fake_session(tickers, rebalance_date, db_path, allow_fetch=True, **kwargs):
         yield HoldingsSession(db_path="session.duckdb", can_ingest=can_ingest)
 
-    def fake_measure(positions, currency, rebalance_date, session, risk_free_rate=0.02, currencies=None):
+    def fake_measure(
+        positions,
+        currency,
+        rebalance_date,
+        session,
+        risk_free_rate=0.02,
+        currencies=None,
+        lookback_months=60,
+    ):
         seen.append(dict(positions))
-        return _stats(currency=currency, positions=dict(positions), risk_free_rate=risk_free_rate)
+        seen_windows.append(lookback_months)
+        # The window shows through to the report, so a test can assert on the
+        # printed line as well as on what was measured.
+        return _stats(
+            currency=currency,
+            positions=dict(positions),
+            risk_free_rate=risk_free_rate,
+            window_months=lookback_months,
+        )
 
     monkeypatch.setattr("src.flow.holdings_cli.open_holdings_session", fake_session)
     monkeypatch.setattr("src.flow.holdings_cli.measure_holdings", fake_measure)
@@ -818,14 +842,17 @@ def test_whatif_undo_all_returns_to_the_saved_holdings(monkeypatch, tmp_path, ca
     _run(monkeypatch, path, ["set", "SPY", "1000"])
 
     _no_writes(monkeypatch)
-    measured = _stub_session(monkeypatch)
+    _stub_session(monkeypatch)
     _script(monkeypatch, "s", "NVDA 100", "u", "f")
     _run(monkeypatch, path, ["whatif"])
 
-    assert measured[-1] == {"SPY": 1000.0}
     out = capsys.readouterr().out
     assert "Back to your saved holdings." in out
     assert "To keep it:" not in out
+    # Reprinted as the baseline, not as a "what if" with zero deltas: after
+    # an undo these are the real holdings again, so the label must say so.
+    assert out.rstrip().endswith(NOT_SAVED)
+    assert out.count("What if (USD) - not saved:") == 1  # only the NVDA variant
 
 
 def test_whatif_refuses_a_cross_currency_ticker_by_name(monkeypatch, tmp_path, capsys):
@@ -1047,3 +1074,156 @@ def test_the_set_sub_prompt_says_the_ticker_need_not_be_held(monkeypatch, tmp_pa
 
     assert any("held or not" in p for p in prompts)
     assert any("any ticker" in p for p in prompts)
+
+
+# --- whatif's [w]indow verb ------------------------------------------------
+
+
+def _whatif_setup(monkeypatch, tmp_path, windows=None, measured=None):
+    """A saved one-holding USD portfolio plus the whatif stubs, since every
+    window test needs the same three lines first.
+    """
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch, measured=measured, windows=windows)
+    return path
+
+
+def test_the_whatif_prompt_offers_the_window(monkeypatch, tmp_path):
+    assert "[w]indow" in WHATIF_PROMPT
+
+
+def test_choosing_a_window_measures_over_it(monkeypatch, tmp_path):
+    windows: list[int] = []
+    path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
+    _script(monkeypatch, "w", "36", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+
+    # Baseline at the default, then the baseline re-measured at 36.
+    assert windows == [60, 36]
+
+
+def test_a_window_change_re_measures_the_baseline_so_the_delta_still_prints(
+    monkeypatch, tmp_path, capsys
+):
+    """`format_holdings_delta` withholds a delta across differing windows -
+    correctly, since the difference would then be partly the months rather
+    than the holdings. So a window change has to move BOTH sides, or every
+    later comparison comes back as an apology. This asserts on the symptom a
+    naive implementation would show.
+    """
+    path = _whatif_setup(monkeypatch, tmp_path)
+    _script(monkeypatch, "w", "36", "s", "NVDA 100", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+    out = capsys.readouterr().out
+
+    assert "measured over different windows" not in out
+    assert "Change from your saved portfolio: return " in out
+
+
+def test_the_report_names_the_window_that_was_asked_for(monkeypatch, tmp_path, capsys):
+    path = _whatif_setup(monkeypatch, tmp_path)
+    _script(monkeypatch, "w", "36", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+
+    assert "36 month(s) of monthly returns, 36 requested" in capsys.readouterr().out
+
+
+def test_the_default_window_is_not_annotated(monkeypatch, tmp_path, capsys):
+    """A run that chose nothing should read exactly as it did before the
+    window became selectable - the annotation is for a choice, not decoration.
+    """
+    path = _whatif_setup(monkeypatch, tmp_path)
+    _script(monkeypatch, "f")
+
+    _run(monkeypatch, path, ["whatif"])
+    out = capsys.readouterr().out
+
+    assert "60 month(s) of monthly returns)" in out
+    assert "requested" not in out
+
+
+def test_a_window_outside_the_range_is_refused_and_the_previous_one_kept(
+    monkeypatch, tmp_path, capsys
+):
+    windows: list[int] = []
+    path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
+    _script(monkeypatch, "w", "12", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+    out = capsys.readouterr().out
+
+    assert "Keeping 60 months" in out
+    assert "between 24 and 60" in out
+    assert windows == [60]  # never re-measured
+
+
+def test_a_non_numeric_window_keeps_the_previous_one(monkeypatch, tmp_path, capsys):
+    windows: list[int] = []
+    path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
+    _script(monkeypatch, "w", "abc", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+    out = capsys.readouterr().out
+
+    assert "Keeping 60 months" in out
+    # The validator's wording, not `int`'s "invalid literal for int() with
+    # base 10", which says nothing about what a window may be.
+    assert "whole number of months" in out
+    assert "invalid literal" not in out
+    assert windows == [60]
+
+
+def test_a_blank_window_answer_keeps_the_previous_one(monkeypatch, tmp_path):
+    windows: list[int] = []
+    path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
+    _script(monkeypatch, "w", "", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+
+    assert windows == [60]
+
+
+def test_re_choosing_the_same_window_does_not_re_measure(monkeypatch, tmp_path):
+    windows: list[int] = []
+    path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
+    _script(monkeypatch, "w", "60", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+
+    assert windows == [60]
+
+
+def test_a_window_change_and_a_holding_change_compose(monkeypatch, tmp_path):
+    """The actual use case: measure a different portfolio over a different
+    window, in one session.
+    """
+    windows: list[int] = []
+    measured: list[dict] = []
+    path = _whatif_setup(monkeypatch, tmp_path, windows=windows, measured=measured)
+    _script(monkeypatch, "w", "36", "s", "NVDA 100", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+
+    assert windows == [60, 36, 36]
+    assert measured[-1] == {"SPY": 1000.0, "NVDA": 100.0}
+
+
+def test_the_window_survives_an_undo_all(monkeypatch, tmp_path):
+    """`[u]ndo all` is about holdings, not the window - it says "back to your
+    saved holdings", and silently resetting the window too would be a
+    different promise.
+    """
+    windows: list[int] = []
+    path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
+    _script(monkeypatch, "w", "36", "s", "NVDA 100", "u", "f")
+
+    _run(monkeypatch, path, ["whatif"])
+
+    assert windows[-1] == 36

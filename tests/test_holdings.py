@@ -26,9 +26,11 @@ import pytest
 
 from src.optimizer.benchmark import benchmark_stats_for_window, BenchmarkSource
 from src.optimizer.holdings import (
+    DEFAULT_LOOKBACK_MONTHS,
     HOLDINGS_MIN_MONTHS,
     holdings_stats,
     stored_month_counts,
+    validate_lookback_months,
     weights_from_positions,
 )
 from src.flow.interactive import (
@@ -651,3 +653,134 @@ def test_a_what_if_session_opens_on_the_cache_and_refreshes_only_what_is_stale(
         stats = measure_holdings({"SPY": 100.0}, "USD", date(2026, 9, 25), session, 0.02)
 
     assert stats.sharpe is not None
+
+
+# --- the selectable returns window -----------------------------------------
+
+
+def test_a_shorter_window_measures_over_only_those_months(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "fixture.duckdb")
+    # Starts 2021-02 so all 60 months land on or before AS_OF (2026-01-01);
+    # a later start would be truncated and the 60-month case would not be
+    # exercising a full window at all.
+    _make_db(db_path, [_monthly_returns(60, "SPY", start="2021-02-01")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as s:
+        short = measure_holdings({"SPY": 100.0}, "USD", AS_OF, s, 0.02, None, 36)
+
+    assert short.window_months == 36
+    assert (short.window_start, short.window_end) == (date(2023, 2, 1), date(2026, 1, 1))
+
+
+def test_a_shorter_window_actually_changes_the_figures(tmp_path, monkeypatch):
+    """The whole point. A window that reached the estimator but changed
+    nothing would mean the parameter is inert - which is exactly the failure
+    a threading bug produces, and it would look like success.
+
+    The fixture's returns oscillate on a 2-month and a 5-month cycle, so a
+    36-month slice genuinely differs from the 60-month one.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(
+        db_path,
+        [
+            _monthly_returns(60, "SPY", start="2021-02-01"),
+            _monthly_returns(60, "T", start="2021-02-01", shift=1),
+        ],
+        {"SPY": 600.0, "T": 20.0},
+    )
+    _no_fetch(monkeypatch)
+    positions = {"SPY": 100.0, "T": 500.0}
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as s:
+        full = measure_holdings(positions, "USD", AS_OF, s, 0.02, None, 60)
+        short = measure_holdings(positions, "USD", AS_OF, s, 0.02, None, 36)
+
+    assert full.window_months == 60 and short.window_months == 36
+    assert short.annual_volatility != pytest.approx(full.annual_volatility)
+
+
+def test_a_window_shorter_than_the_data_still_reports_what_it_used(tmp_path, monkeypatch):
+    """A request larger than the table degrades to what exists, and the
+    reported count is the real one - which is why the report names the
+    REQUEST separately.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    _make_db(db_path, [_monthly_returns(40, "SPY", start="2022-09-01")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as s:
+        stats = measure_holdings({"SPY": 100.0}, "USD", AS_OF, s, 0.02, None, 60)
+
+    assert stats.window_months == 40
+
+
+def test_at_the_shortest_window_a_holding_missing_one_month_is_excluded(tmp_path, monkeypatch):
+    """The documented consequence of keeping `min_months` at 24: when the
+    window is 24 too, a holding needs EVERY month, so a single missing one
+    drops it. `plans/05_optimizer_and_allocation.md`'s "use whatever months
+    a ticker actually has" tolerance has no room to operate at the floor.
+    The exclusion message explains itself, which is why this is documented
+    rather than fixed.
+    """
+    db_path = str(tmp_path / "fixture.duckdb")
+    full = _monthly_returns(60, "SPY", start="2021-10-01")
+    # 23 of the last 24 months: starts one month late.
+    partial = _monthly_returns(23, "LATE", start="2024-11-01")
+    _make_db(db_path, [full, partial], {"SPY": 600.0, "LATE": 50.0})
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as s:
+        stats = measure_holdings({"SPY": 100.0, "LATE": 10.0}, "USD", AS_OF, s, 0.02, None, 24)
+
+    assert stats.window_months == 24
+    assert "under 24" in stats.excluded["LATE"]
+    assert "LATE" not in stats.weights
+
+
+# --- validate_lookback_months ----------------------------------------------
+
+
+def test_the_default_and_the_ceiling_are_the_same_sixty():
+    assert validate_lookback_months(DEFAULT_LOOKBACK_MONTHS, "x") == 60
+    assert validate_lookback_months(HOLDINGS_MIN_MONTHS, "x") == 24
+
+
+def test_a_window_below_the_minimum_history_bar_is_refused():
+    """Below 24 every holding falls under `min_months` and the report comes
+    back with no figures at all, complaining about a number the person never
+    typed. Refused at the door instead.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        validate_lookback_months(23, "[w]indow")
+
+    assert "between 24 and 60" in str(excinfo.value)
+
+
+def test_a_window_beyond_what_an_ingest_fetches_is_refused():
+    with pytest.raises(ValueError) as excinfo:
+        validate_lookback_months(61, "[w]indow")
+
+    assert "65 months of prices" in str(excinfo.value)
+
+
+def test_a_zero_or_negative_window_is_refused_before_duckdb_sees_it():
+    """`_load_window_dates` passes the value straight to SQL `LIMIT`, and
+    DuckDB raises a BinderException on a negative - which the report layer's
+    blanket handler would surface as an unhelpful "could not measure".
+    """
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="between 24 and 60"):
+            validate_lookback_months(bad, "[w]indow")
+
+
+def test_a_non_integer_window_is_refused_naming_its_source():
+    for bad in (36.5, "abc", None):
+        with pytest.raises(ValueError, match="whole number of months"):
+            validate_lookback_months(bad, "[w]indow")
+
+
+def test_a_boolean_window_is_refused_even_though_bool_is_an_int():
+    with pytest.raises(ValueError, match="whole number of months"):
+        validate_lookback_months(True, "[w]indow")

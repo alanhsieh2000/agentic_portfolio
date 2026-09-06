@@ -67,6 +67,70 @@ reports against it - and so a reader who wonders why a holding was left out
 does not have to trace it through a default argument.
 """
 
+DEFAULT_LOOKBACK_MONTHS = 60
+"""Months of monthly returns the figures are estimated over by default.
+
+The same 60 `load_returns_matrix` defaults to, named here for the same
+reason `HOLDINGS_MIN_MONTHS` is: it is now a value a person can choose
+inside `uv run portfolio-holdings whatif`, and a number somebody can change
+should not be a bare literal buried in a signature.
+
+It is also the CEILING on what can be asked for, which is a fact about the
+data rather than a policy: `src/dataset/ticker_ingestion.py` fetches
+`LOOKBACK_MONTHS = 65` months of prices, which is these 60 monthly returns
+plus a buffer month so the earliest of them has a preceding price to compute
+from. Asking for more cannot be honoured, so it is refused rather than
+silently truncated.
+
+The 60 itself is `plans/05_optimizer_and_allocation.md`'s recorded choice -
+a deliberate, documented deviation from the 180 months the reproduced paper
+uses, taken as a middle ground between estimator noise and how far back
+price history has to reach. That decision is unchanged: this is still the
+default everywhere, and only an explicitly-requested what-if can differ.
+"""
+
+
+def validate_lookback_months(months: object, source: str) -> int:
+    """`months` as an int, refusing anything that is not a usable returns
+    window and naming `source` (a prompt or a flag) in the message.
+
+    Modelled on `src/flow/rate_memory.py`'s `validate_risk_free_rate`: takes
+    `object` rather than `int` so a value from anywhere gets the same
+    scrutiny, names its source in every message, and returns the coerced
+    value.
+
+    Both bounds are existing facts rather than new numbers. The floor is
+    `HOLDINGS_MIN_MONTHS`, the minimum history a holding needs before it is
+    measured at all - below it `apply_min_history_rule` would drop EVERY
+    holding, because a column cannot have more non-null months than the
+    window has rows, and the report would come back with no figures and a
+    complaint about a `min_months` the person never typed. The ceiling is
+    `DEFAULT_LOOKBACK_MONTHS`, which is all the data an ingest produces.
+
+    Booleans are rejected ahead of the numeric check because
+    `isinstance(True, int)` is true in Python, so `True` would otherwise
+    become a one-month window.
+
+    Refusing rather than clamping also keeps a zero or negative value away
+    from `_load_window_dates`, whose `LIMIT ?` raises a raw DuckDB
+    `BinderException` on a negative - which the report layer's blanket
+    handler would surface as an unhelpful "could not measure this variant"
+    line.
+    """
+    if isinstance(months, bool) or not isinstance(months, int):
+        raise ValueError(f"{source} must be a whole number of months, got {months!r}")
+
+    if not HOLDINGS_MIN_MONTHS <= months <= DEFAULT_LOOKBACK_MONTHS:
+        raise ValueError(
+            f"{source} must be between {HOLDINGS_MIN_MONTHS} and {DEFAULT_LOOKBACK_MONTHS} "
+            f"months, got {months}; under {HOLDINGS_MIN_MONTHS} every holding would fall below "
+            f"the minimum history a figure needs, and over {DEFAULT_LOOKBACK_MONTHS} there is no "
+            "data - an ingest fetches 65 months of prices, which is 60 monthly returns plus a "
+            "buffer"
+        )
+    return months
+
+
 NO_HOLDINGS_REASON = (
     "no holdings are saved for {currency}; add some with: "
     "uv run portfolio-holdings set TICKER SHARES"
@@ -263,7 +327,7 @@ def holdings_stats(
     db_path: str,
     currency: str,
     risk_free_rate: float = settings.risk_free_rate,
-    lookback_months: int = 60,
+    lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
     min_months: int = HOLDINGS_MIN_MONTHS,
 ) -> HoldingsStats:
     """Measure `positions` as of `as_of` against the prices and monthly

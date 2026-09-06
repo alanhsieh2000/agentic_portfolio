@@ -66,6 +66,10 @@ Define the terms used throughout, in plain language:
 - [x] (2026-09-06 08:18Z) Milestone 6c — wiring: `_resolve_holdings` and `open_holdings_session` resolve through the cache instead of a throwaway database, `_validate_set_targets` gained `refresh_cache` so a re-tried what-if ticker costs nothing, and both CLIs gained `--holdings-cache-path` and `--refresh-holdings`. `--no-holdings-fetch` now reaches the cache, since reading a local file is not a network call.
 - [x] (2026-09-06 08:52Z) Item 5f — made Milestone 5's new-ticker capability discoverable: `whatif` has always accepted a ticker the user does not own, but nothing the program printed said so, and the repository owner reasonably read the loop as editing existing holdings only. Six user-facing strings reworded in `src/flow/holdings_cli.py`; no logic, no behaviour change, two tests pinning the prompts. Full suite: 569 passed.
 - [x] (2026-09-06 08:26Z) Milestone 6d — documentation: this plan's living sections, a `README.md` bullet, and the superseded `Decision Log` entry marked as such. Full suite: 567 passed.
+- [x] (2026-09-06 09:40Z) Milestone 7a — the window as a validated value: `DEFAULT_LOOKBACK_MONTHS` and `validate_lookback_months` in `src/optimizer/holdings.py`, refusing anything outside 24-60 by name, and `holdings_stats`' bare `60` default replaced by the constant.
+- [x] (2026-09-06 09:46Z) Milestone 7b — threading: `lookback_months` on `interactive.measure_holdings` and `_holdings_stats_excluding` and their `holdings_stats` call sites. `prepare_holdings` deliberately untouched, which keeps `show`, `set`, `remove` and every `uv run portfolio` block on the fixed 60 - and keeps the tested pool/benchmark/holdings one-scale guarantee true.
+- [x] (2026-09-06 09:55Z) Milestone 7c — the loop: `[w]indow` in `WHATIF_PROMPT` and `_whatif_window` in `src/flow/holdings_cli.py`, with the window as loop state and a re-measure of the baseline on change. Also stopped labelling an unchanged portfolio "What if - not saved", which a window-only edit made newly visible.
+- [x] (2026-09-06 10:02Z) Milestone 7d — saying the window was chosen: `window_origin` on `print_user_portfolio`, so `Returns window: ... (36 month(s) of monthly returns, 36 requested)` separates a chosen window from all the data there was. 21 new tests; full suite 590 passed.
 
 
 ## Surprises & Discoveries
@@ -117,6 +121,15 @@ Define the terms used throughout, in plain language:
 - Observation: a capability can be fully implemented, tested, live-verified AND specifically optimized for, and still be invisible - at which point the person who cannot see it correctly concludes it is missing. `whatif` accepted an unheld ticker from the day Milestone 5 landed; `test_whatif_reports_the_baseline_then_the_hypothetical` pinned it; the live run that produced this plan's headline finding (adding NVDA lowers the Sharpe ratio) WAS a new-ticker experiment; and Milestone 6's `refresh_cache=True` exists for no other purpose than making a re-tried unheld candidate free. The repository owner nonetheless reported the scope as limited to existing holdings, and was right about every word the program prints.
   Evidence: the tell was that the ONLY in-program sentence describing the capability lived inside a refusal - `"Drop that flag to try a holding you do not already own"`, reachable only by somebody who had already tried it and passed `--no-holdings-fetch`. The loop said `[s]et shares`, the `args` help said `Ignored by ... 'whatif'`, and both `_run_whatif`'s docstring and this plan's own Milestone 5 Scope sentence said "changes to the saved holdings", which reads as editing what is there. The affirmative statement existed only in `README.md` and this plan - neither of which a person sees at a prompt.
   Lesson: this project audits the provenance of NUMBERS rigorously - `plans/14`'s rate-origin line, Milestone 6's `(priced ...)` note, the refusal to print a figure without saying where it came from. It had no equivalent habit for AFFORDANCES. A feature's discoverability deserves the same suspicion as a figure's provenance, and "it is in the README" is the affordance equivalent of a bare `0.0200`.
+
+- Observation: the feature was two signatures away the whole time. `lookback_months` already existed as a parameter on `load_returns_matrix_unfiltered`, `load_returns_matrix` AND `holdings_stats`, threaded correctly all the way down - and `grep -rn lookback_months src tests` showed nothing in `src/flow` or `tests` had ever passed it. Every occurrence was a default or an internal pass-through, so the window had been configurable at the estimator for as long as the estimator existed, with no way to reach it.
+  Evidence: the break was `interactive._holdings_stats_excluding`, which simply stopped at `risk_free_rate` when calling `holdings_stats`. Two parameters and two call sites later, `[w]indow` worked.
+
+- Observation: the PFF case the repository owner described is real, and the effect is larger than "different" - it changes the sign. Over 60 months PFF returns -1.05% at 11.08% volatility for a Sharpe of -0.2752; over 36 months, which excludes the 2022 rate shock, it returns +3.67% at 8.02% for a Sharpe of +0.2079. Both are true statements about different spans of months, which is exactly why the window has to be printed on the same line as the figures rather than assumed.
+  Evidence: a live run on 2026-09-06 against a 1,000-share PFF portfolio printed `Returns window: 2021-10-01 to 2026-09-01 (60 month(s) of monthly returns)` then `Returns window: 2023-10-02 to 2026-09-01 (36 month(s) of monthly returns, 36 requested)`.
+
+- Observation: adding the window verb exposed a false label that had been there since Milestone 5. A window-only change leaves the holdings untouched, so the loop printed the person's REAL portfolio under the heading `What if (USD) - not saved` with a row of zero deltas beneath it. The same thing had always happened after `[u]ndo all`, unnoticed, because nobody had a reason to do it. Fixed by reprinting the baseline AS the baseline whenever the hypothetical holdings equal the saved ones.
+  Evidence: `test_choosing_a_window_measures_over_it` first failed with `[60, 36, 36] == [60, 36]` - that third measurement being the pointless re-measure of an unchanged portfolio which the false heading was about to sit on top of.
 
 ## Decision Log
 
@@ -226,6 +239,26 @@ Define the terms used throughout, in plain language:
 
 - Decision: connecting `whatif` to `memory/candidates.json` was considered and deliberately NOT taken here.
   Rationale: it was the one reading of "expand the scope to add new tickers" that is genuinely unbuilt - a `[c]andidates` option listing the curated candidate pool for the run's currency, so a person could try one without typing a ticker, connecting the two halves of this project. The repository owner chose the wording fix instead when the three options were put side by side. Recorded because it is a real and reachable follow-up, and because whoever picks it up should know it was seen rather than missed: `load_all_pools` and `load_candidate_pool` in `src/flow/candidate_memory.py` already provide everything the listing would need.
+  Date/Author: 2026-09-06.
+
+- Decision: the selectable returns window lives INSIDE the `whatif` loop only, and nowhere else.
+  Rationale: chosen by the repository owner, and it is the option that avoids a documented, tested guarantee rather than merely being the smallest. `uv run portfolio` prints the pool's figures, the benchmark's and the holdings' and promises all three describe the same months; `benchmark_stats_for_window` is deliberately anchored to the POOL's window, `README.md` asserts that a one-holding portfolio reports exactly its own benchmark's numbers, and `tests/test_interactive_flow.py` pins `benchmark.window_months == stats.returns_window_months`. A holdings-only window there would silently falsify all three. The whatif loop has no such coupling - it measures through `measure_holdings`, not `prepare_holdings` - which is why the change cost two parameters instead of a re-anchoring of the whole pipeline.
+  Date/Author: 2026-09-06, agreed with the repository owner.
+
+- Decision: 24 to 60 months, refusing anything outside by name.
+  Rationale: chosen by the repository owner from three offered ranges, and both bounds are existing facts rather than new numbers. The floor is `HOLDINGS_MIN_MONTHS`, the minimum history a holding needs before it is measured at all: below it `apply_min_history_rule` drops EVERY holding, since a column cannot hold more non-null months than the window has rows, and the report would come back with no figures and a complaint about a `min_months` nobody typed. The ceiling is what the data can support - an ingest fetches 65 months of prices, which is 60 monthly returns plus a buffer month - so a larger request cannot be honoured and is refused rather than silently truncated. Refusing also keeps a zero or negative value away from `_load_window_dates`, whose `LIMIT ?` raises a raw DuckDB `BinderException` that the report layer's blanket handler would surface as an unhelpful "could not measure this variant".
+  Date/Author: 2026-09-06, agreed with the repository owner.
+
+- Decision: `min_months` stays at `HOLDINGS_MIN_MONTHS` regardless of the window, with the consequence documented rather than engineered around.
+  Rationale: at a 24-month window the bar equals the window, so a holding needs EVERY month in it - a single missing one leaves it at 23 and it is excluded, and not even a gap is required: one leading null from a recent listing, which `apply_min_history_rule` is designed to tolerate, trips the count branch instead. That narrows `plans/05_optimizer_and_allocation.md`'s "use whatever months a ticker actually has, between 24 and 60" tolerance to nothing at the floor. Scaling the bar down with the window was considered and rejected: 24 is shared by the optimizer, the benchmark and the holdings report, and `plans/13`'s own Surprises section records that `apply_min_history_rule` is unsafe at `min_months=0`, so moving it is not a local change. The existing per-holding exclusion message already explains itself - "23 month(s) of monthly returns in the window, under 24" - so this needs a test and this entry, not new machinery.
+  Date/Author: 2026-09-06.
+
+- Decision: a window change re-measures the BASELINE as well as the variant.
+  Rationale: `format_holdings_delta` withholds a delta when the two sides' windows differ, deliberately, because the difference would then be partly the months rather than the holdings. Leaving the baseline where it was would therefore turn every subsequent comparison into an apology. Re-measuring both keeps the delta meaningful: one window on both sides, different holdings. It also made that guard's docstring wrong - it said reaching the branch "means something has gone wrong upstream", which stops being true once a person can legitimately change the window - so the sentence was corrected while the guard itself stayed exactly as it was.
+  Date/Author: 2026-09-06.
+
+- Decision: the report names the window that was REQUESTED, beside the count it actually used.
+  Rationale: the `Returns window:` line has always been derived from the data, which is right and unchanged. But derived alone cannot distinguish "36 months because I chose 36" from "36 months because that is all there was", and once the length is a choice that distinction is the whole point. Naming the request also makes an unhonoured one visible: 48 months of data against a 60-month request prints both numbers instead of quietly reporting 48. And it is the honest answer to this feature's obvious hazard - shortening a window until the figures improve is cherry-picking, and the defence is that the window is stated on the same line as the figures it produced, every time. Same shape as `risk_free_rate_origin`, for the same reason.
   Date/Author: 2026-09-06.
 
 ## Outcomes & Retrospective
@@ -347,6 +380,22 @@ Milestone 6 replaces the throwaway database under all of it with a persistent on
       v
     src/flow/cli.py                      <- changed: latest_price_date(), the "(priced ...)" note,
     src/flow/holdings_cli.py                and --holdings-cache-path / --refresh-holdings on both
+
+Milestone 7 makes the window itself a choice, in the what-if loop alone:
+
+    src/optimizer/holdings.py            <- changed: DEFAULT_LOOKBACK_MONTHS and
+      |                                     validate_lookback_months (24-60, refused outside)
+      v
+    src/flow/interactive.py              <- changed: lookback_months on measure_holdings and
+      |                                     _holdings_stats_excluding. NOT on prepare_holdings,
+      |                                     which is what keeps show/set/remove and every
+      |                                     `uv run portfolio` block on the fixed 60
+      v
+    src/flow/holdings_cli.py             <- changed: [w]indow in WHATIF_PROMPT + _whatif_window,
+      |                                     the window as loop state, baseline re-measured on change
+      v
+    src/flow/cli.py                      <- changed: print_user_portfolio(window_origin=...), so
+                                            "36 requested" sits beside the derived month count
 
 
 ## Milestones
@@ -741,6 +790,69 @@ Commands and acceptance - the first of these fetches, the rest should not:
 
 Expect `Total value: ... (priced YYYY-MM-DD)` on every one of them, and `data/portfolio.duckdb`'s size and mtime unchanged throughout - the isolation rule is the acceptance that matters most, since the cache becoming persistent is exactly the change that could have broken it.
 
+### Milestone 7 — the selectable window
+
+
+Scope: let a person vary the LENGTH of the returns window, not only the holdings. At the end of this milestone `uv run portfolio-holdings whatif` has a `[w]indow` verb that re-measures over any length from 24 to 60 months, and the report names the length that was asked for. Added because for some holdings the window dominates the answer: `PFF` fell hard in roughly the first 12 months of the current 60-month window (the 2022 rate shock hitting preferred stock) and has been broadly stable since, so it reads as a losing position over 60 months and a modestly winning one over 36. Both are true statements about different spans of months, and 2 to 5 years are all defensible choices, so the person needs to see more than one.
+
+**Step 7a — the window as a validated value.** In `src/optimizer/holdings.py`, beside `HOLDINGS_MIN_MONTHS`:
+
+    DEFAULT_LOOKBACK_MONTHS = 60
+
+    def validate_lookback_months(months: object, source: str) -> int
+
+Modelled on `src/flow/rate_memory.py`'s `validate_risk_free_rate`: takes `object` so a value from anywhere gets the same scrutiny, names `source` in every message, raises `ValueError`, returns the coerced value. Refuses anything outside `HOLDINGS_MIN_MONTHS .. DEFAULT_LOOKBACK_MONTHS`, and rejects a `bool` ahead of the numeric check since `isinstance(True, int)` is true in Python and would otherwise mean a one-month window. `holdings_stats`' bare `lookback_months: int = 60` becomes the constant while we are there - its neighbour `min_months` already used a named one, and the asymmetry is what made the 60 hard to find.
+
+**Step 7b — threading.** `lookback_months` on `interactive.measure_holdings` and `interactive._holdings_stats_excluding`, passed to their `holdings_stats` calls. That is the entire chain: below `src/flow`, `load_returns_matrix_unfiltered`, `load_returns_matrix` and `holdings_stats` all had the parameter already and had simply never been given a value. `prepare_holdings` is deliberately NOT given one - see the `Decision Log` on why a holdings-only window in `uv run portfolio` would falsify a tested guarantee.
+
+**Step 7c — the loop.** `[w]indow` joins `WHATIF_PROMPT`, and `_whatif_window(current)` reads a length, keeping what you had on an unusable answer. It proceeds in this order:
+
+1. Read the answer; a blank one keeps the current window.
+2. Parse to `int`; on failure hand the RAW TEXT to `validate_lookback_months` rather than letting `int`'s own "invalid literal for int() with base 10" reach the person - one message then covers a non-number and an out-of-range number, and it is the message that explains the bounds.
+3. If the length did not change, `continue` without re-measuring.
+4. Otherwise re-measure the BASELINE at the new length, because `format_holdings_delta` withholds a delta across differing windows and leaving the baseline behind would turn every later comparison into an apology.
+5. Report. If the hypothetical holdings equal the saved ones - which a window-only change guarantees - reprint the baseline AS the baseline rather than heading the person's real portfolio `What if - not saved` above a row of zero deltas.
+
+**Step 7d — saying the window was chosen.** `print_user_portfolio` gains a keyword-only `window_origin`, mirroring `risk_free_rate_origin`, appended to the existing line:
+
+    Returns window: 2023-10-02 to 2026-09-01 (36 month(s) of monthly returns, 36 requested)
+
+The count stays derived from the data and the request is named beside it, so a chosen window is never mistaken for all the data there was, and a request that could not be honoured shows both numbers instead of quietly reporting the smaller one. Nothing is annotated at the default, so an ordinary run reads exactly as it did before.
+
+The invariants pinned, and why each is worth a test:
+
+- **A shorter window actually changes the figures.** A parameter that reached the estimator and moved nothing would look like success while being inert, which is precisely what a threading bug produces.
+- **The window is derived, the request is named** - including when fewer months exist than were asked for.
+- **At a 24-month window a holding missing one month is excluded and named**, the documented consequence of keeping the bar at 24.
+- **23, 61, 0, -1, `36.5`, `"abc"` and `True` are all refused by name**, and a zero or negative one never reaches DuckDB's `LIMIT`.
+- **A window change re-measures the baseline**, so the next delta prints figures rather than the "measured over different windows" apology - the symptom a naive implementation shows.
+- **An unusable answer keeps the previous window** and says so, in the validator's words rather than `int`'s.
+- **An unchanged portfolio is not labelled a what-if**, after a window change or an `[u]ndo all`.
+- **The prompt advertises `[w]indow`**, per item 5f's lesson about invisible capability.
+
+Commands and acceptance - the loop is interactive, so drive it with `printf`:
+
+    cd /app/agentic_portfolio
+    uv run pytest tests/test_holdings.py tests/test_holdings_cli.py -q
+    uv run pytest tests/test_*.py -q
+
+    # against a scratch --path/--rates-path/--holdings-cache-path holding PFF
+    printf 'w\n36\nf\n' | uv run portfolio-holdings whatif
+    # expect the baseline over 60 months, then the same holdings over 36 with
+    # "36 month(s) of monthly returns, 36 requested" - and the figures to MOVE:
+    #   60 months: Annual return: -0.0105  Annual volatility: 0.1108  Sharpe: -0.2752
+    #   36 months: Annual return:  0.0367  Annual volatility: 0.0802  Sharpe:  0.2079
+
+    printf 'w\n24\nf\n'  | uv run portfolio-holdings whatif   # the tight end of the range
+    printf 'w\n12\nf\n'  | uv run portfolio-holdings whatif   # refused, naming 24-60
+    printf 'w\n61\nf\n'  | uv run portfolio-holdings whatif   # refused, naming the 65-month ingest
+    printf 'w\nabc\nf\n' | uv run portfolio-holdings whatif   # keeps 60, in the validator's words
+
+    # the actual use case: a shorter window AND a change, delta still printing
+    printf 'w\n36\ns\nSPY 200\nf\n' | uv run portfolio-holdings whatif
+
+If the PFF figures do NOT move between 60 and 36 months, the window is not reaching the estimator and the feature is inert. And `memory/portfolio.json`, `memory/rates.json` and `data/portfolio.duckdb` must all be unchanged, since a what-if still writes nothing.
+
 ## Validation and Acceptance
 
 
@@ -1065,3 +1177,23 @@ In `pyproject.toml`, under `[project.scripts]`:
   this project is rigorous about never printing a number without its provenance, and had no
   equivalent habit for whether a feature announces itself. A capability documented only in the
   README is, from the prompt, indistinguishable from one that does not exist.
+- 2026-09-06, extended with Milestone 7 (a selectable returns window inside `whatif`): the window
+  length can now be varied from 24 to 60 months in the what-if loop, because for a holding like
+  `PFF` the choice dominates the answer - 60 months gives a Sharpe of -0.2752 and 36 months, which
+  excludes the 2022 rate shock, gives +0.2079.
+
+  This does NOT supersede `plans/05_optimizer_and_allocation.md`'s 60-month/24-month decision. The
+  default is unchanged, the optimizer and the candidate pool are untouched, `prepare_holdings` was
+  deliberately left alone so `show`, `set`, `remove` and every `uv run portfolio` block still
+  measure over the fixed 60, and only an explicitly-requested exploration inside `whatif` can
+  differ. What it does narrow is that plan's second decision - "use whatever months a ticker
+  actually has, between 24 and 60" - at the very bottom of the range, where a 24-month window
+  leaves the 24-month bar no room to tolerate anything; recorded in the `Decision Log` above.
+
+  Two things worth carrying forward. The parameter had existed on `load_returns_matrix` and
+  `holdings_stats` since those functions were written and had never once been passed by anything in
+  `src/flow` or `tests`, so a feature that looked like new capability was two signatures of
+  threading. And it exposed a false label that predated it: a window-only change leaves the
+  holdings untouched, so the loop printed the person's real portfolio under `What if - not saved`
+  with zero deltas beneath - which had also always happened after `[u]ndo all`, unnoticed because
+  nobody had a reason to do it.

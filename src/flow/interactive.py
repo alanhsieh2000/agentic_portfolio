@@ -75,6 +75,7 @@ from src.optimizer.benchmark import (
     load_benchmark_returns,
 )
 from src.optimizer.holdings import (
+    DEFAULT_LOOKBACK_MONTHS,
     HOLDINGS_MIN_MONTHS,
     HoldingsStats,
     holdings_stats,
@@ -365,6 +366,7 @@ def measure_holdings(
     session: HoldingsSession,
     risk_free_rate: float = settings.risk_free_rate,
     currencies: dict[str, str] | None = None,
+    lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
 ) -> HoldingsStats:
     """Measure one variant against an open `session`, with no fetching and
     no writes of any kind.
@@ -376,6 +378,16 @@ def measure_holdings(
     holding excluded for trading in the wrong currency or for having too
     little history is reported the same way in either.
 
+    `lookback_months` is how many months of returns to estimate over, and
+    `whatif` is the only caller that varies it - see
+    `src/optimizer/holdings.py`'s `DEFAULT_LOOKBACK_MONTHS`. Deliberately
+    NOT added to `prepare_holdings`: that is the path `show`, `set`,
+    `remove` and `uv run portfolio`'s holdings block take, and the pipeline
+    report promises its pool's figures, its benchmark's and its holdings'
+    all describe the same months. Letting the holdings block alone move
+    would falsify a claim `README.md` makes and
+    `tests/test_interactive_flow.py` pins.
+
     `currencies` is what the session learned about each ticker as it was
     ingested; anything absent from it is looked up in the session's own
     database, and anything absent from both is assumed to be `currency` -
@@ -386,7 +398,9 @@ def measure_holdings(
     every fetch the session has already paid for.
     """
     if not positions:
-        return holdings_stats({}, rebalance_date, session.db_path, currency, risk_free_rate)
+        return holdings_stats(
+            {}, rebalance_date, session.db_path, currency, risk_free_rate, lookback_months
+        )
 
     try:
         known = dict(currencies or {})
@@ -400,6 +414,7 @@ def measure_holdings(
             session.db_path,
             risk_free_rate,
             _holdings_currency_gate(positions, currency, known),
+            lookback_months,
         )
     except Exception as e:  # noqa: BLE001 - duckdb and pandas raise assorted types here
         logger.warning("could not measure a %s what-if variant: %s", currency, e)
@@ -445,6 +460,7 @@ def _holdings_stats_excluding(
     db_path: str,
     risk_free_rate: float,
     excluded: dict[str, str],
+    lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
 ) -> HoldingsStats:
     """`holdings_stats` over the holdings NOT in `excluded`, with those
     exclusions merged back into the result and `positions` restored to the
@@ -468,7 +484,9 @@ def _holdings_stats_excluding(
             excluded=excluded,
         )
 
-    stats = holdings_stats(measurable, rebalance_date, db_path, currency, risk_free_rate)
+    stats = holdings_stats(
+        measurable, rebalance_date, db_path, currency, risk_free_rate, lookback_months
+    )
     return stats._replace(positions=positions, excluded={**excluded, **stats.excluded})
 
 
