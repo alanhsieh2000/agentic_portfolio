@@ -38,6 +38,14 @@ def _stub_ingest(monkeypatch, currencies: dict[str, str], invalid: dict[str, str
         return valid, {**missing, **invalid}, {t: currencies[t] for t in valid}
 
     monkeypatch.setattr("src.flow.holdings_cli.validate_and_ingest_tickers", fake)
+    # Also on the cache module's own reference. Since the holdings cache
+    # landed, `whatif`'s add path goes through `refresh_holdings_cache`,
+    # which holds its own import - so patching only `holdings_cli`'s left
+    # the real function running, reaching Yahoo Finance from the suite and
+    # creating a DuckDB file in the repository root. Worse than failing: a
+    # test asserting that `7203.T` is refused as JPY passed anyway, because
+    # the live lookup agreed with the stub it had bypassed.
+    monkeypatch.setattr("src.dataset.holdings_cache.validate_and_ingest_tickers", fake)
 
 
 def _stub_report(monkeypatch) -> list[tuple[str, dict]]:
@@ -47,7 +55,7 @@ def _stub_report(monkeypatch) -> list[tuple[str, dict]]:
     """
     seen: list[tuple[str, dict]] = []
 
-    def fake(positions, currency, rebalance_date, db_path, risk_free_rate=0.02, allow_fetch=True):
+    def fake(positions, currency, rebalance_date, db_path, risk_free_rate=0.02, **kwargs):
         seen.append((currency, dict(positions), risk_free_rate))
         return unavailable_holdings(currency, dict(positions), risk_free_rate, "stubbed")
 
@@ -58,17 +66,27 @@ def _stub_report(monkeypatch) -> list[tuple[str, dict]]:
 def _run(monkeypatch, path, argv: list[str], rates_path=None) -> None:
     """Drive `main()` with both memory files pointed inside `tmp_path`.
 
-    `--rates-path` is not optional politeness: an argparse default is bound
-    at parse time, so monkeypatching `DEFAULT_RATES_PATH` would not take
-    effect. Without the flag these tests would READ and, for any run passing
-    `--risk-free-rate`, WRITE the developer's real `memory/rates.json` -
-    green on a clean checkout, failing on a machine that has ever remembered
-    a rate, and invisible in `git status` because `memory/` is gitignored.
+    `--rates-path` and `--holdings-cache-path` are not optional politeness:
+    an argparse default is bound at parse time, so monkeypatching
+    `DEFAULT_RATES_PATH` or `DEFAULT_HOLDINGS_CACHE_PATH` would not take
+    effect. Without the flags these tests would READ and, for any run
+    passing `--risk-free-rate`, WRITE the developer's real
+    `memory/rates.json` - green on a clean checkout, failing on a machine
+    that has ever remembered a rate, and invisible in `git status` because
+    `memory/` is gitignored. `data/holdings.duckdb` is the same hazard with
+    a worse failure mode: a test that fetched into it would reach Yahoo
+    Finance from the suite.
     """
     rates_path = rates_path or Path(path).with_name("rates.json")
+    cache_path = Path(path).with_name("holdings.duckdb")
     monkeypatch.setattr(
         "sys.argv",
-        ["portfolio-holdings", *argv, "--path", str(path), "--rates-path", str(rates_path)],
+        [
+            "portfolio-holdings", *argv,
+            "--path", str(path),
+            "--rates-path", str(rates_path),
+            "--holdings-cache-path", str(cache_path),
+        ],
     )
     main()
 
@@ -303,6 +321,7 @@ def _stats(**overrides) -> HoldingsStats:
         window_start=date(2021, 10, 1),
         window_end=date(2026, 9, 1),
         window_months=60,
+        priced_as_of=date(2026, 9, 4),
         excluded={},
         unavailable_reason=None,
     )
@@ -665,7 +684,7 @@ def _stub_session(monkeypatch, measured: list[dict] | None = None, can_ingest: b
     seen = measured if measured is not None else []
 
     @contextmanager
-    def fake_session(tickers, rebalance_date, db_path, allow_fetch=True):
+    def fake_session(tickers, rebalance_date, db_path, allow_fetch=True, **kwargs):
         yield HoldingsSession(db_path="session.duckdb", can_ingest=can_ingest)
 
     def fake_measure(positions, currency, rebalance_date, session, risk_free_rate=0.02, currencies=None):

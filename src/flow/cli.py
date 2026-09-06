@@ -62,6 +62,7 @@ from datetime import date
 
 from src.config.settings import settings
 from src.dataset.ticker_currency import DEFAULT_CURRENCY, group_by_currency
+from src.dataset.holdings_cache import DEFAULT_HOLDINGS_CACHE_PATH
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.candidate_memory import (
     DEFAULT_CANDIDATES_PATH,
@@ -296,6 +297,14 @@ def print_user_portfolio(
     whose derivation is not stated beside it invites being compared with one
     derived differently.
 
+    `Total value` carries the date of the prices behind it. Those prices can
+    come from a cache that is only refreshed monthly (see
+    `src/dataset/holdings_cache.py`), so the total can legitimately be weeks
+    old - and the one thing worse than a stale money figure is a stale money
+    figure that looks current. The date is derived from the price rows
+    actually used, not from when the cache was written, so it cannot claim
+    a freshness the data does not have.
+
     The per-holding `Expected return / volatility (annualized)` section is
     the same section, in the same wording and the same position relative to
     the portfolio-level line, that `print_weights_and_allocation` prints for
@@ -329,7 +338,8 @@ def print_user_portfolio(
               f"{value_text}  {weight_text}")
 
     if holdings.total_value is not None:
-        print(f"Total value: {format_money(holdings.total_value, currency)}")
+        priced = f" (priced {holdings.priced_as_of})" if holdings.priced_as_of else ""
+        print(f"Total value: {format_money(holdings.total_value, currency)}{priced}")
 
     if holdings.unavailable_reason is not None:
         print(f"Figures: n/a - {holdings.unavailable_reason}")
@@ -1138,6 +1148,21 @@ def main() -> None:
              "one portfolio per currency, and the one matching this run's currency is reported.",
     )
     parser.add_argument(
+        "--holdings-cache-path",
+        default=DEFAULT_HOLDINGS_CACHE_PATH,
+        help="Which file the holdings' prices and monthly returns are cached in, so the holdings "
+             "block costs no network on a repeated run. Shared with 'uv run portfolio-holdings'. "
+             "Never the same file as --db-path: holdings rows must not land in the database the "
+             "candidate pool is measured against.",
+    )
+    parser.add_argument(
+        "--refresh-holdings",
+        action="store_true",
+        help="Refetch the holdings' prices now rather than reusing the cache, which is otherwise "
+             "good for the rest of the calendar month. The report states the date it priced the "
+             "holdings at, and this is how you move it.",
+    )
+    parser.add_argument(
         "--no-holdings",
         action="store_true",
         help="Leave the holdings block out of the report entirely - the counterpart of "
@@ -1147,9 +1172,10 @@ def main() -> None:
     parser.add_argument(
         "--no-holdings-fetch",
         action="store_true",
-        help="Measure the holdings only from returns this session's database already holds, "
-             "never by fetching. Keeps a backtest-window run entirely offline, at the cost of "
-             "reporting the holdings as unmeasurable when the cache does not contain them.",
+        help="Measure the holdings only from data already on disk - this session's database or "
+             "the holdings cache - never by fetching. Keeps a backtest-window run entirely "
+             "offline, at the cost of reporting the holdings as unmeasurable when neither "
+             "contains them.",
     )
     args = parser.parse_args()
 
@@ -1265,6 +1291,8 @@ def main() -> None:
                     session_db_path,
                     risk_free_rate=args.risk_free_rate,
                     allow_fetch=not args.no_holdings_fetch,
+                    cache_path=args.holdings_cache_path,
+                    force_refresh=args.refresh_holdings,
                 ),
                 args.holdings_path,
                 risk_free_rate_origin=resolved_rate.origin,

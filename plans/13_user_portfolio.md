@@ -61,7 +61,10 @@ Define the terms used throughout, in plain language:
 - [x] (2026-09-06 07:22Z) Milestone 5c — the loop: `whatif` in `VALID_COMMANDS` and `_run_whatif`/`_whatif_set`/`_whatif_apply`/`_whatif_set_command` in `src/flow/holdings_cli.py`, prompting `[s]et shares / [r]emove / [u]ndo all / [f]inish`, reusing `_validate_set_targets` (which gained `db_path` and `pool_currency`) so a cross-currency ticker is refused by name exactly as `set` refuses it, calling neither `save_portfolio` nor `_remember_rate`, and closing with the `set` command that would apply the experiment. 21 new tests in `tests/test_holdings_cli.py`.
 - [x] (2026-09-06 07:26Z) Milestone 5d — closed Milestone 2's test gap: the four `prepare_holdings` tests this plan specified had never been written (`grep -rn prepare_holdings tests/` found only monkeypatches and docstrings). They land now, beside six new `open_holdings_session`/`measure_holdings` tests, in `tests/test_holdings.py`.
 - [x] (2026-09-06 07:34Z) Milestone 5e — documentation: the `holdings_cli` module docstring's non-interactive claim narrowed to the subcommands that change the record, a `README.md` bullet, and this plan's living sections. Full suite: 544 passed.
-- [ ] Optional follow-up, deliberately not done: a persistent holdings cache. Every `uv run portfolio` run currently refetches the holdings' 65 months of prices when the session database does not already hold them (a live `user_provided` run always). See the `Decision Log` entry on data resolution for why a dedicated `data/holdings.duckdb` was rejected for now, and `Surprises & Discoveries` for the measured cost.
+- [x] (2026-09-06 08:02Z) Milestone 6a — the cache: `src/dataset/holdings_cache.py` and `tests/test_holdings_cache.py` (16 tests). A ticker is stale when the cache lacks the monthly return for the most recent rebalance date on or before the report's date - derived from the data, so there is no `fetched_at` to drift out of agreement with the rows it describes. `--refresh-holdings` forces it.
+- [x] (2026-09-06 08:09Z) Milestone 6b — the honest price date: `HoldingsStats.priced_as_of`, `latest_price_date` in `src/optimizer/portfolio.py`, and `Total value: ... (priced YYYY-MM-DD)` in `print_user_portfolio`. The monthly rule keeps the returns current but lets the prices behind `Total value` age, so the report states how current they are rather than leaving a reader to assume.
+- [x] (2026-09-06 08:18Z) Milestone 6c — wiring: `_resolve_holdings` and `open_holdings_session` resolve through the cache instead of a throwaway database, `_validate_set_targets` gained `refresh_cache` so a re-tried what-if ticker costs nothing, and both CLIs gained `--holdings-cache-path` and `--refresh-holdings`. `--no-holdings-fetch` now reaches the cache, since reading a local file is not a network call.
+- [x] (2026-09-06 08:26Z) Milestone 6d — documentation: this plan's living sections, a `README.md` bullet, and the superseded `Decision Log` entry marked as such. Full suite: 567 passed.
 
 
 ## Surprises & Discoveries
@@ -95,6 +98,21 @@ Define the terms used throughout, in plain language:
 - Observation: plan 13's own Milestone 2 specified four `prepare_holdings` tests that were never written - `grep -rn prepare_holdings tests/` found only monkeypatches and docstring mentions, so the function was exclusively stubbed and never directly exercised. Milestone 5a builds its sibling in the same module, which made this the moment to close the gap rather than widen it.
   Evidence: `grep -rn "prepare_holdings" tests/` before Milestone 5d returned seven hits, every one a `monkeypatch.setattr` or a docstring.
 
+- Observation: the cache's saving is the whole network cost, and interpreter startup is what remains. A three-holding portfolio's report went from 9 seconds cold to 4 warm, and a forced refresh back to 8 - so roughly 5 seconds of Yahoo Finance disappears and the residual 4 is `uv run` starting Python and importing pandas/PyPortfolioOpt. The saving therefore scales with the number of holdings (as the original note predicted) while the floor does not.
+  Evidence: live runs on 2026-09-06 against a three-holding USD portfolio - `wall: 9s` cold, `wall: 4s` warm, `wall: 8s` with `--refresh-holdings`.
+
+- Observation: the what-if loop's add path bypassed the cache entirely at first, so re-trying a candidate refetched it every time - 7 seconds each, for data already on disk. `_validate_set_targets` called `validate_and_ingest_tickers` unconditionally because it was written when its database was always a throwaway. Fixed with a `refresh_cache` flag that routes it through the cache's staleness rule instead. Caught by timing a repeat, not by a test.
+  Evidence: re-trying `NVDA 100` took `wall: 7s` before and `wall: 4s` after; a genuinely new `TSM 300` still takes 7s, which is the fetch actually being needed.
+
+- Observation: THREE separate tests reached the real network after the cache landed, all for one reason: the fetch a holdings report makes moved from `src/flow/interactive.py`'s and `src/flow/holdings_cli.py`'s references to `src/dataset/holdings_cache.py`'s, and every existing stub was pinned to the old ones. The worst of them was not a failure at all - `test_whatif_refuses_a_cross_currency_ticker_by_name` kept passing, because the live lookup of `7203.T` agreed with the stub it had bypassed, and it left a `session.duckdb` in the repository root as the only visible trace. The rule "patch the importing module's own symbol" was followed correctly in all three; what changed was which module does the importing. Introducing a new layer between a caller and a seam invalidates every stub aimed at that seam, and a passing suite is not evidence otherwise - `git status` and a check for stray files are.
+  Evidence: `data/holdings.duckdb` contained a single ticker, `NEWCO`, fetched by a test fixture; `session.duckdb` appeared untracked in the repository root with the four tables `_init_empty_price_and_returns_tables` creates. Both are now impossible: `_stub_ingest` and `_no_fetch` each patch both modules.
+
+- Observation: adding the cache silently moved a monkeypatch target and let a real network call escape into the test suite. `tests/test_holdings.py` patched `src.flow.interactive.validate_and_ingest_tickers`, but the fetch a holdings report makes now goes through `src.dataset.holdings_cache`'s own reference - so the stub stopped intercepting and the real function ran, reporting yfinance's genuine "no non-null close/adj_close values" message for a fixture ticker. This is precisely the failure mode the project's patch-the-importing-module rule exists to prevent, arriving from the other direction: the rule was followed, and the importing module changed underneath it.
+  Evidence: `test_prepare_holdings_turns_an_ingest_failure_into_a_reported_reason` failed asserting `"yfinance exploded" in stats.unavailable_reason` and got yfinance's own wording instead. `_no_fetch` now patches both modules, and the new tests patch `src.dataset.holdings_cache`'s symbol.
+
+- Observation: the monthly staleness rule needs the month-boundary case handled or the cache is permanently stale for a day or two every month. `latest_expected_rebalance_date(date(2026, 11, 1))` must be October's first business day, not November's, because 2026-11-01 is a Sunday and November's return cannot exist yet. Getting it wrong would make every run that weekend see a "stale" cache and refetch.
+  Evidence: pinned by `test_a_report_before_its_months_first_business_day_expects_the_previous_month`, and by `test_the_expected_month_uses_the_same_grid_the_returns_table_was_written_on`, which asserts the cache's idea of the monthly grid is `compute_rebalance_dates`' own - two different definitions would make a cache that can never look fresh.
+
 ## Decision Log
 
 
@@ -114,9 +132,10 @@ Define the terms used throughout, in plain language:
   Rationale: refusing to print anything because one recently-listed holding lacks two years of history would withhold a correct answer about 98% of a portfolio over 2% of it. Naming the exclusion and its value share tells the reader precisely how much of the portfolio the figures do not cover, which is strictly more information than a refusal. This mirrors how `plans/12`'s benchmark reports a one-line `n/a` with a reason rather than interrupting a run. Agreed with the user.
   Date/Author: 2026-09-06, agreed with the user.
 
-- Decision: holdings prices and returns are resolved the way `plans/12`'s benchmark already resolves its history — read the run's own database first, and only fetch from Yahoo Finance into a **throwaway scratch database** when that database holds too little. `--no-holdings-fetch` restricts it to what is already cached.
+- Decision (SUPERSEDED 2026-09-06 by Milestone 6, which built the rejected alternative): holdings prices and returns are resolved the way `plans/12`'s benchmark already resolves its history — read the run's own database first, and only fetch from Yahoo Finance into a **throwaway scratch database** when that database holds too little. `--no-holdings-fetch` restricts it to what is already cached.
   Rationale: two alternatives were considered and rejected. Fetching unconditionally on every invocation would add several seconds of network to every single `uv run portfolio` run for no gain when the data is already cached. Keeping a dedicated persistent cache (`data/holdings.duckdb`) would be faster on repeat runs but requires inventing a staleness policy — "how old may the newest monthly return be before we refetch?" — which is a whole design question of its own and not one this feature needs to answer. Mirroring the benchmark reuses a policy already written, tested and documented, and it keeps the number of caches in this project at one. Agreed with the user.
-  Date/Author: 2026-09-06, agreed with the user.
+  Superseding note: Milestone 6 built `data/holdings.duckdb` after all, at the user's request, and answered the staleness question this entry deferred - a ticker is stale when the cache lacks the monthly return for the report month's rebalance date. What this entry got right is that the question was real and had to be answered before the cache could exist; what it did not anticipate is that the answer would be derived from the DATA rather than from a clock, which is why it needs no timestamp table and cannot drift. The two rules that motivated the throwaway database are untouched: the cache is neither `data/portfolio.duckdb` nor any session database, so holdings rows still cannot move the window a candidate pool is measured over.
+  Date/Author: 2026-09-06, agreed with the user; superseded 2026-09-06 by Milestone 6.
 
 - Decision: the holdings block prints ONCE per pipeline run, immediately after `print_pipeline_result` and before the interactive candidate-edit loop; it is not reprinted after each edit.
   Rationale: `print_weights_and_allocation` reprints the pool's currency, window and benchmark after every edit because those are what an edit changes. An edit to the candidate pool changes nothing about what the user owns. Reprinting three unchanged numbers after every keystroke would be noise, and it would also imply a relationship between the edit and the holdings that does not exist.
@@ -180,6 +199,22 @@ Define the terms used throughout, in plain language:
   Rationale: with fetching disabled the session yields `--db-path` itself rather than a scratch file, and that path is documented as never written to. Ingesting a new ticker there would write rows into the shared `data/portfolio.duckdb` as a side effect of an experiment - the exact isolation rule `prepare_holdings` calls a correctness requirement. Refusing by name, and saying which flag to drop, is the only honest option.
   Date/Author: 2026-09-06.
 
+- Decision: a held ticker's cached data is stale when the cache lacks the monthly return for the most recent rebalance date on or before the report's date - in plainer words, the cache is good for the rest of the calendar month.
+  Rationale: chosen by the user from three offered policies, and it is the question the original deferral hinged on. Two things make it work better than the clock-based alternatives it beat. It is derived from the DATA: "does the cache hold the latest month's return?" is answered by looking for the row, so there is no `fetched_at` timestamp that can disagree with the rows it claims to describe, and no metadata table to keep in step. And it reuses `compute_rebalance_dates` - the same function that decided where those rows go - so the cache's idea of the monthly grid cannot drift from the writer's, which would produce a cache that never looks fresh and refetches forever.
+  Date/Author: 2026-09-06, agreed with the user.
+
+- Decision: the report states the date of the prices behind `Total value`, and `--refresh-holdings` forces a refetch.
+  Rationale: this is the mitigation for the one real cost of the monthly rule, which I flagged when offering it and the user chose anyway. Monthly returns change monthly, but prices change daily, and the latest price is what turns share counts into `Total value` and into weights - so a cache refreshed on the 3rd and read on the 25th reports a total three weeks out of date. The 60-month annualized figures barely notice; a money figure does. Rather than override the user's choice or quietly hope, the cost is made visible: `Total value: $850,722.00 USD (priced 2026-09-04)`, with the date read off the price rows actually used rather than off a refresh timestamp, so it cannot claim a freshness the data lacks. `--refresh-holdings` is how a person who wants today's total says so. This is the same discipline `plans/14` established for the risk-free rate - never print a figure without saying where it came from.
+  Date/Author: 2026-09-06.
+
+- Decision: only the tickers a report actually asks about are ever refreshed.
+  Rationale: the obvious alternative - refresh the whole cache when any of it is stale - turns the file into a liability rather than an asset. What-if tickers are cached too (the user's choice, and correct: a price cache holds facts, and re-trying a candidate should be free), so the file slowly accumulates tickers nobody owns. Refreshing wholesale would mean every monthly refresh refetching everything ever tried. Per-ticker refresh keeps the cost proportional to the report, and the leftover rows are harmless: every query filters by ticker, and the one that does not (`_load_window_dates`) reads only distinct rebalance dates, which are the same monthly grid for every ticker.
+  Date/Author: 2026-09-06.
+
+- Decision: `--no-holdings-fetch` now reads the holdings cache, where before it read only the session database.
+  Rationale: a deliberate widening of a documented flag, on the grounds that its help text described the letter and its name describes the intent. "Never by fetching" is about the network; a local DuckDB file is not the network. Before this, an offline run with a fully populated cache reported the holdings as unmeasurable, which is not what anybody asking for offline behaviour wants. The flag's help now says "from data already on disk - this session's database or the holdings cache - never by fetching", and the unavailable message names both places it looked.
+  Date/Author: 2026-09-06.
+
 ## Outcomes & Retrospective
 
 
@@ -191,7 +226,7 @@ The measured shape of the change: three new modules (`src/flow/user_portfolio.py
 
 Mirroring `prepare_benchmark` for data resolution paid off twice. It supplied a fetch policy already reasoned about, and it supplied the isolation rule - fetch into a throwaway database, never the session's - which was verified by hand: `data/portfolio.duckdb`'s size and mtime were byte-identical before and after a full `portfolio-holdings` session.
 
-**What remains.** One open item, deliberately: holdings are refetched whenever the session database lacks them, which for a live run is always. Roughly ten seconds for two holdings, scaling with the count. The fix is a persistent holdings cache with a staleness rule, and the reason it was not done is that "how stale may a monthly return be?" is its own design question rather than a detail of this one.
+**What remains.** One open item, deliberately: holdings are refetched whenever the session database lacks them, which for a live run is always. Roughly ten seconds for two holdings, scaling with the count. The fix is a persistent holdings cache with a staleness rule, and the reason it was not done is that "how stale may a monthly return be?" is its own design question rather than a detail of this one. **Closed 2026-09-06 by Milestone 6**, which answered that question (stale when the cache lacks the report month's return) and measured the result: 9 seconds cold, 4 warm, with the residual being interpreter startup rather than network.
 
 Two smaller gaps worth naming. Nothing yet compares the held portfolio against the optimizer's suggested weights *quantitatively* - the report puts the two blocks side by side and leaves the comparison to the reader, which is the right first step but stops short of "here is what rebalancing would buy you". **Milestone 5 closes that from the other direction**: rather than compute an optimum, `uv run portfolio-holdings whatif` lets a person try a change and see the three figures move, with the signed delta computed for them. The optimizer-comparison half remains open. And `--date` is accepted by `portfolio-holdings` but a past date measures today's share counts against that date's prices, which is only meaningful if the holdings have not changed since; that is documented in the flag's help but not enforced, because enforcing it would require a position history this feature does not keep.
 
@@ -281,6 +316,24 @@ Milestone 5 adds the what-if loop on top, touching three of the same files and c
       v
     src/flow/cli.py                      <- changed: print_user_portfolio(heading=...) and
                                             format_holdings_delta()
+
+Milestone 6 replaces the throwaway database under all of it with a persistent one:
+
+    data/holdings.duckdb                 <- new: the holdings' prices and monthly returns,
+      ^                                     refreshed per ticker when its latest month is missing.
+      |                                     NEVER data/portfolio.duckdb and never a session db.
+      |
+    src/dataset/holdings_cache.py        <- new: the staleness rule and the per-ticker refresh
+      ^
+      |
+    src/flow/interactive.py              <- changed: _resolve_holdings and open_holdings_session
+      |                                     resolve through the cache, not build_scratch_snapshot
+      v
+    src/optimizer/holdings.py            <- changed: HoldingsStats.priced_as_of, so a total that
+      |                                     came from a month-old cache says so
+      v
+    src/flow/cli.py                      <- changed: latest_price_date(), the "(priced ...)" note,
+    src/flow/holdings_cli.py                and --holdings-cache-path / --refresh-holdings on both
 
 
 ## Milestones
@@ -619,6 +672,62 @@ Commands and acceptance - the loop is interactive, so these are driven by piping
 
 Then confirm the promise by inspection, which is the acceptance that matters most: `md5sum` of `memory/portfolio.json` and `memory/rates.json`, and the size and mtime of `data/portfolio.duckdb`, must be identical either side of the whole session.
 
+### Milestone 6 — the persistent holdings cache
+
+
+Scope: stop refetching. At the end of this milestone the holdings' prices and monthly returns live in `data/holdings.duckdb` and a repeated report costs no network at all. This was the one open `Progress` item this plan shipped with, deliberately deferred because it needs a staleness policy - "how old may the cached data be before we refetch?" - which is a design question rather than a detail. Milestone 6 answers it.
+
+**Step 6a — the cache and its staleness rule.** A new `src/dataset/holdings_cache.py`:
+
+    DEFAULT_HOLDINGS_CACHE_PATH = "data/holdings.duckdb"
+
+    def latest_expected_rebalance_date(as_of: date) -> date
+    def cached_month_ends(tickers: list[str], cache_path: str) -> dict[str, date | None]
+    def stale_tickers(tickers: list[str], as_of: date, cache_path: str,
+                      force: bool = False) -> list[str]
+    def refresh_holdings_cache(tickers: list[str], as_of: date, cache_path: str,
+                               force: bool = False
+                               ) -> tuple[list[str], dict[str, str], dict[str, str]]
+
+A ticker is stale when the cache does not hold the monthly return for the most recent rebalance date on or before the report's date - so the cache is good for the rest of the calendar month. Two properties make that rule work rather than merely sound plausible. It is derived from the DATA, so "is this fresh?" is answered by looking for the row, and there is no `fetched_at` timestamp that can disagree with the rows it claims to describe. And it reuses `src/dataset/membership.py`'s `compute_rebalance_dates` - the same function that decided where those rows go - so the cache's monthly grid cannot drift from the writer's, which would give a cache that never looks fresh and refetches forever.
+
+`refresh_holdings_cache` returns `validate_and_ingest_tickers`' exact triple, reporting a ticker that needed nothing as valid with the currency the cache recorded for it. That is what lets `_resolve_holdings` treat a cache hit and a cold fetch identically rather than growing two branches. Only the tickers a report asks about are ever refreshed: what-if tickers are cached too, so the file slowly accumulates things nobody owns, and a wholesale refresh would mean refetching everything ever tried. Leftover rows are harmless - every query filters by ticker, and the one that does not (`_load_window_dates`) reads only distinct rebalance dates, the same monthly grid for every ticker.
+
+This is the project's second cache and deliberately not its first. `data/portfolio.duckdb` holds the S&P 500 universe candidate pools are measured against; it must not gain rows as a side effect of reporting what somebody owns, and `_load_window_dates` reads its whole `returns` table, so holdings rows landing there could move the very window a pool's figures are computed over. A separate file makes both impossible - the same reasoning the throwaway database was built on, with the throwing-away removed.
+
+**Step 6b — the honest price date.** The cost of the monthly rule, stated rather than hidden. `HoldingsStats` gains `priced_as_of`, `src/optimizer/portfolio.py` gains `latest_price_date`, and `print_user_portfolio` prints `Total value: $850,722.00 USD (priced 2026-09-04)`. Monthly returns change monthly, but prices change daily and are what turn share counts into a total and into weights - so a cache refreshed on the 3rd and read on the 25th reports a total three weeks old. The date is read off the price rows actually used, never off a refresh timestamp, so it cannot claim a freshness the data lacks. `--refresh-holdings` moves it.
+
+**Step 6c — wiring.** `_resolve_holdings` and `open_holdings_session` resolve through the cache instead of `build_scratch_snapshot`. The order is unchanged at the front: the session database is still consulted first, because that read is free and a backtest-window run against the S&P cache must not start depending on a holdings cache it never needed. `_validate_set_targets` gains `refresh_cache`, so a what-if re-trying a candidate goes through the staleness rule rather than refetching - see `Surprises & Discoveries` for the 7-second-per-retry bug that omitting it caused. Both CLIs gain `--holdings-cache-path` and `--refresh-holdings`.
+
+`--no-holdings-fetch` is deliberately widened to read the cache. Its help text described the letter ("this session's database") while its name describes the intent ("touch no network"), and a local DuckDB file is not the network - so an offline run with a populated cache now works instead of reporting the holdings unmeasurable. The help text and the unavailable message both name both places.
+
+The invariants pinned, and why each is worth a test:
+
+- **A ticker cached this month is not refetched** - the whole point of the file, and the thing a subtly wrong rule breaks silently.
+- **A new month makes it stale**, and **a report before its month's first business day expects the previous month** - 2026-11-01 is a Sunday, so November's return cannot exist yet, and getting this wrong refetches on every run for a day or two each month.
+- **The cache's monthly grid is `compute_rebalance_dates`' own** - two definitions would give a permanently-stale cache.
+- **Only stale tickers are fetched**, and **a stale ticker nobody asks about is never touched**.
+- **A null monthly return does not count as coverage** - `src/dataset/returns.py` writes a full month-by-ticker cross product, so a row can exist holding nothing usable.
+- **Holdings rows never reach the session database** - the isolation rule, re-pinned now that the destination is persistent.
+- **An offline run reads the cache**, and names both places it looked when neither has enough.
+- **The report states its price date.**
+
+Commands and acceptance - the first of these fetches, the rest should not:
+
+    cd /app/agentic_portfolio
+    uv run pytest tests/test_holdings_cache.py tests/test_holdings.py -q
+    uv run pytest tests/test_*.py -q
+
+    # against a scratch --path/--rates-path/--holdings-cache-path
+    uv run portfolio-holdings show                    # cold: fetches
+    uv run portfolio-holdings show                    # warm: no network
+    uv run portfolio-holdings --refresh-holdings show # fetches again on demand
+    uv run portfolio-holdings --no-fetch show         # works off the cache
+    printf 's\nNVDA 100\nf\n' | uv run portfolio-holdings whatif   # fetches NVDA once
+    printf 's\nNVDA 100\nf\n' | uv run portfolio-holdings whatif   # then never again
+
+Expect `Total value: ... (priced YYYY-MM-DD)` on every one of them, and `data/portfolio.duckdb`'s size and mtime unchanged throughout - the isolation rule is the acceptance that matters most, since the cache becoming persistent is exactly the change that could have broken it.
+
 ## Validation and Acceptance
 
 
@@ -905,3 +1014,26 @@ In `pyproject.toml`, under `[project.scripts]`:
   same suspicion applied to every label, not only to numbers. And this milestone finally wrote the
   four `prepare_holdings` tests Milestone 2 specified in this very file and never delivered; a plan
   listing tests is not evidence they exist, and `grep` is cheap.
+- 2026-09-06, extended with Milestone 6 (the persistent holdings cache): the last open `Progress`
+  item on this plan, built at the user's request. It required superseding this plan's own Decision
+  Log entry that had rejected `data/holdings.duckdb` - marked as such above rather than rewritten,
+  since that entry was right that the staleness question had to be answered first and only wrong
+  that it could not be answered here.
+
+  The answer the user chose - stale when the cache lacks the report month's return - is the one I
+  had flagged as risking a stale `Total value`, since prices move daily while monthly returns do
+  not. They chose it anyway, so rather than override the choice or hope nobody noticed, the cost is
+  now visible: `Total value` carries the date of the prices behind it, read off the rows actually
+  used. That is the same discipline `plans/14` established for the risk-free rate, and it turns a
+  silent staleness into a stated one. `--refresh-holdings` is the escape hatch.
+
+  Every bug found was caused by the cache moving something out from under existing code rather than
+  by the cache itself. The what-if loop's add path kept refetching because it was written when its
+  database was always a throwaway. And three tests began reaching the real network because the
+  fetch moved behind a new module and their stubs were pinned to the old callers - one of which
+  kept PASSING, because the live lookup happened to agree with the stub it had bypassed, leaving a
+  stray DuckDB file in the repository root as the only sign. Both are recorded in
+  `Surprises & Discoveries`. The lesson worth carrying: making a throwaway thing persistent changes
+  every assumption anybody made about it being throwaway, those assumptions are not all in the file
+  being changed, and a green suite does not prove they were found - checking for files nobody meant
+  to create does.

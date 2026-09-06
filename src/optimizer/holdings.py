@@ -49,6 +49,7 @@ from src.optimizer.portfolio import (
     apply_min_history_rule,
     load_latest_prices,
     load_returns_long,
+    latest_price_date,
     load_returns_matrix_unfiltered,
     stats_for_weights,
 )
@@ -90,6 +91,13 @@ class HoldingsStats(NamedTuple):
     portfolio whose value can be priced but whose history is too short to
     measure should still tell the user what it is worth.
 
+    `priced_as_of` is the date of the newest price behind `market_values`,
+    `total_value` and the weights. It is reported because those prices may
+    come from a cache that is deliberately only refreshed monthly (see
+    `src/dataset/holdings_cache.py`), so a total can legitimately be weeks
+    old - and a money figure whose age is not stated is a money figure a
+    reader will assume is current.
+
     `expected_returns` and `volatility` are the annualized per-HOLDING
     estimates the three portfolio-level figures were computed from, named to
     match `src/optimizer/portfolio.py`'s `PortfolioStats` fields so the
@@ -115,6 +123,7 @@ class HoldingsStats(NamedTuple):
     window_start: date | None
     window_end: date | None
     window_months: int | None
+    priced_as_of: date | None
     excluded: dict[str, str]
     unavailable_reason: str | None
 
@@ -152,6 +161,7 @@ def unavailable_holdings(
         window_start=None,
         window_end=None,
         window_months=None,
+        priced_as_of=None,
         excluded=excluded or {},
         unavailable_reason=reason,
     )
@@ -330,6 +340,7 @@ def holdings_stats(
         window_start=matrix.index.min().date(),
         window_end=matrix.index.max().date(),
         window_months=len(matrix.index),
+        priced_as_of=latest_price_date(measured, as_of, db_path),
         excluded=excluded,
         unavailable_reason=None,
     )

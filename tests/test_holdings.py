@@ -333,12 +333,21 @@ def test_stored_month_counts_counts_each_tickers_own_months(tmp_path):
 
 
 def _no_fetch(monkeypatch):
-    """Fail the test if anything tries to reach Yahoo Finance."""
+    """Fail the test if anything tries to reach Yahoo Finance.
+
+    Patched on BOTH importing modules. `src/flow/interactive.py` still holds
+    its own reference, but since the holdings cache landed the fetch a
+    holdings report makes goes through `src/dataset/holdings_cache.py`'s
+    reference instead - and patching only the old one let a real network
+    call escape into the suite, which is exactly why this project's rule is
+    to patch the importing module's own symbol rather than the definition.
+    """
 
     def fail(tickers, as_of, db_path):
         raise AssertionError(f"fetched {tickers} when it should not have")
 
     monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fail)
+    monkeypatch.setattr("src.dataset.holdings_cache.validate_and_ingest_tickers", fail)
 
 
 def test_a_session_measures_every_variant_over_one_window(tmp_path, monkeypatch):
@@ -356,7 +365,7 @@ def test_a_session_measures_every_variant_over_one_window(tmp_path, monkeypatch)
     )
     _no_fetch(monkeypatch)
 
-    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as session:
         one = measure_holdings({"SPY": 100.0}, "USD", AS_OF, session, 0.02)
         two = measure_holdings({"SPY": 100.0, "T": 500.0}, "USD", AS_OF, session, 0.02)
 
@@ -374,7 +383,7 @@ def test_a_no_fetch_session_uses_the_given_database_and_forbids_ingesting(tmp_pa
     _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
     _no_fetch(monkeypatch)
 
-    with open_holdings_session(["SPY"], AS_OF, db_path, allow_fetch=False) as session:
+    with open_holdings_session(["SPY"], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as session:
         assert session.db_path == db_path
         assert session.can_ingest is False
 
@@ -384,7 +393,7 @@ def test_measure_holdings_never_fetches(tmp_path, monkeypatch):
     _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
     _no_fetch(monkeypatch)
 
-    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as session:
         stats = measure_holdings({"SPY": 100.0}, "USD", AS_OF, session, 0.02)
 
     assert stats.sharpe is not None
@@ -404,7 +413,7 @@ def test_measure_holdings_agrees_with_prepare_holdings_on_the_same_data(tmp_path
     _no_fetch(monkeypatch)
     positions = {"SPY": 100.0, "T": 500.0}
 
-    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as session:
         measured = measure_holdings(positions, "USD", AS_OF, session, 0.02)
     direct = holdings_stats(positions, AS_OF, db_path, "USD", 0.02)
 
@@ -422,7 +431,7 @@ def test_measure_holdings_excludes_a_cross_currency_holding(tmp_path, monkeypatc
     )
     _no_fetch(monkeypatch)
 
-    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as session:
         stats = measure_holdings(
             {"SPY": 100.0, "7203.T": 50.0}, "USD", AS_OF, session, 0.02, {"7203.T": "JPY"}
         )
@@ -436,7 +445,7 @@ def test_measure_holdings_reports_an_empty_variant_rather_than_raising(tmp_path,
     _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
     _no_fetch(monkeypatch)
 
-    with open_holdings_session([], AS_OF, db_path, allow_fetch=False) as session:
+    with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as session:
         stats = measure_holdings({}, "USD", AS_OF, session, 0.02)
 
     assert stats.annual_return is None
@@ -465,11 +474,11 @@ def test_prepare_holdings_never_writes_to_the_session_database(tmp_path, monkeyp
         lambda prefix="x": _fake_scratch(str(scratch)),
     )
     monkeypatch.setattr(
-        "src.flow.interactive.validate_and_ingest_tickers",
+        "src.dataset.holdings_cache.validate_and_ingest_tickers",
         lambda tickers, as_of, path: (list(tickers), {}, {t: "USD" for t in tickers}),
     )
 
-    prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, str(db_path), 0.02)
+    prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, str(db_path), 0.02, cache_path=str(scratch))
 
     after_rows = duckdb.connect(str(db_path)).execute("SELECT count(*) FROM returns").fetchone()[0]
     assert after_rows == before_rows
@@ -481,7 +490,7 @@ def test_prepare_holdings_reads_the_cache_without_fetching_when_it_suffices(tmp_
     _make_db(db_path, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
     _no_fetch(monkeypatch)
 
-    stats = prepare_holdings({"SPY": 100.0}, "USD", AS_OF, db_path, 0.02)
+    stats = prepare_holdings({"SPY": 100.0}, "USD", AS_OF, db_path, 0.02, cache_path=db_path)
 
     assert stats.sharpe is not None
 
@@ -491,7 +500,9 @@ def test_prepare_holdings_with_fetching_disabled_names_the_flag(tmp_path, monkey
     _make_db(db_path, [_monthly_returns(8, "NEWCO")], {"NEWCO": 25.0})
     _no_fetch(monkeypatch)
 
-    stats = prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, db_path, 0.02, allow_fetch=False)
+    stats = prepare_holdings(
+        {"NEWCO": 40.0}, "USD", AS_OF, db_path, 0.02, allow_fetch=False, cache_path=db_path
+    )
 
     assert stats.annual_return is None
     assert "--no-holdings-fetch" in stats.unavailable_reason
@@ -504,11 +515,139 @@ def test_prepare_holdings_turns_an_ingest_failure_into_a_reported_reason(tmp_pat
     db_path = str(tmp_path / "session.duckdb")
     _make_db(db_path, [], {})
     monkeypatch.setattr(
-        "src.flow.interactive.validate_and_ingest_tickers",
+        "src.dataset.holdings_cache.validate_and_ingest_tickers",
         lambda tickers, as_of, path: (_ for _ in ()).throw(RuntimeError("yfinance exploded")),
     )
 
-    stats = prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, db_path, 0.02)
+    stats = prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, db_path, 0.02, cache_path=db_path)
 
     assert stats.annual_return is None
     assert "yfinance exploded" in stats.unavailable_reason
+
+
+# --- the holdings cache, through prepare_holdings ---------------------------
+
+
+def test_prepare_holdings_reuses_a_fresh_cache_without_fetching(tmp_path, monkeypatch):
+    """The point of the cache, seen from the report: a second run in the same
+    month costs no network at all.
+    """
+    session = str(tmp_path / "session.duckdb")
+    _make_db(session, [], {})
+    cache = str(tmp_path / "holdings.duckdb")
+    _make_db(cache, [_monthly_returns(60, "SPY", start="2021-10-01")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    stats = prepare_holdings(
+        {"SPY": 100.0}, "USD", date(2026, 9, 25), session, 0.02, cache_path=cache
+    )
+
+    assert stats.sharpe is not None
+
+
+def test_prepare_holdings_prefers_the_session_database_over_the_cache(tmp_path, monkeypatch):
+    """The session database is consulted first because that read is free and
+    already correct - a backtest-window run against the S&P cache must not
+    start depending on a holdings cache it never needed.
+    """
+    session = str(tmp_path / "session.duckdb")
+    _make_db(session, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+    missing_cache = tmp_path / "holdings.duckdb"
+    _no_fetch(monkeypatch)
+
+    stats = prepare_holdings(
+        {"SPY": 100.0}, "USD", AS_OF, session, 0.02, cache_path=str(missing_cache)
+    )
+
+    assert stats.sharpe is not None
+    assert not missing_cache.exists()
+
+
+def test_prepare_holdings_never_writes_to_the_shared_price_cache(tmp_path, monkeypatch):
+    """The isolation rule survives the cache becoming persistent: holdings
+    rows land in their OWN file, so they can never move the returns window a
+    candidate pool is measured over.
+    """
+    session = tmp_path / "session.duckdb"
+    _make_db(str(session), [_monthly_returns(60, "AAPL")], {"AAPL": 200.0})
+    before_mtime = session.stat().st_mtime_ns
+    cache = str(tmp_path / "holdings.duckdb")
+
+    monkeypatch.setattr(
+        "src.dataset.holdings_cache.validate_and_ingest_tickers",
+        lambda tickers, as_of, path: (list(tickers), {}, {t: "USD" for t in tickers}),
+    )
+
+    prepare_holdings({"NEWCO": 40.0}, "USD", AS_OF, str(session), 0.02, cache_path=cache)
+
+    assert session.stat().st_mtime_ns == before_mtime
+
+
+def test_prepare_holdings_offline_still_reads_the_cache(tmp_path, monkeypatch):
+    """`--no-holdings-fetch` means touch no network, and reading a local file
+    is not a network call - so an offline run gets whatever the cache holds
+    rather than nothing at all.
+    """
+    session = str(tmp_path / "session.duckdb")
+    _make_db(session, [], {})
+    cache = str(tmp_path / "holdings.duckdb")
+    _make_db(cache, [_monthly_returns(60, "SPY", start="2021-10-01")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    stats = prepare_holdings(
+        {"SPY": 100.0}, "USD", date(2026, 9, 25), session, 0.02,
+        allow_fetch=False, cache_path=cache,
+    )
+
+    assert stats.sharpe is not None
+
+
+def test_prepare_holdings_offline_with_an_empty_cache_names_both_places(tmp_path, monkeypatch):
+    session = str(tmp_path / "session.duckdb")
+    _make_db(session, [], {})
+    cache = str(tmp_path / "holdings.duckdb")
+    _make_db(cache, [], {})
+    _no_fetch(monkeypatch)
+
+    stats = prepare_holdings(
+        {"SPY": 100.0}, "USD", AS_OF, session, 0.02, allow_fetch=False, cache_path=cache
+    )
+
+    assert stats.annual_return is None
+    assert "holdings cache" in stats.unavailable_reason
+    assert "--no-holdings-fetch" in stats.unavailable_reason
+
+
+def test_the_report_states_the_date_it_priced_the_holdings_at(tmp_path, monkeypatch):
+    """The mitigation for the monthly rule. Prices change daily but the cache
+    is only refreshed monthly, so a total can be weeks old - and a money
+    figure whose age is not stated is one a reader assumes is current.
+    """
+    session = str(tmp_path / "session.duckdb")
+    _make_db(session, [_monthly_returns(60, "SPY")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    stats = prepare_holdings({"SPY": 100.0}, "USD", AS_OF, session, 0.02, cache_path=session)
+
+    # `_make_db` writes its one price row at 2019-12-02.
+    assert stats.priced_as_of == date(2019, 12, 2)
+
+
+def test_a_what_if_session_opens_on_the_cache_and_refreshes_only_what_is_stale(
+    tmp_path, monkeypatch
+):
+    """Since the cache landed, the first measurement of a what-if session
+    usually costs nothing - which is what makes the loop worth opening.
+    """
+    cache = str(tmp_path / "holdings.duckdb")
+    _make_db(cache, [_monthly_returns(60, "SPY", start="2021-10-01")], {"SPY": 600.0})
+    _no_fetch(monkeypatch)
+
+    with open_holdings_session(
+        ["SPY"], date(2026, 9, 25), "unused.duckdb", cache_path=cache
+    ) as session:
+        assert session.db_path == cache
+        assert session.can_ingest is True
+        stats = measure_holdings({"SPY": 100.0}, "USD", date(2026, 9, 25), session, 0.02)
+
+    assert stats.sharpe is not None

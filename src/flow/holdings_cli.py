@@ -51,6 +51,13 @@ operations is a single edit better expressed as one scriptable line, whereas
 exploring is inherently a conversation - and it is safe to make it one
 precisely because nothing it does can outlive the session.
 
+The prices and monthly returns behind all of it are cached in
+`data/holdings.duckdb` (see `src/dataset/holdings_cache.py`), refreshed for
+a ticker when the cache lacks its latest month - so a repeated report costs
+no network, and `--refresh-holdings` forces one sooner. Because that rule
+keeps the returns current while letting the prices age, `Total value` is
+printed with the date it was priced at.
+
 So every subcommand that CHANGES the record is entirely non-interactive: it
 never calls `input()`, and is usable from a script or a one-line edit. That
 was previously true of the whole command; see
@@ -73,6 +80,7 @@ from src.flow.rate_memory import (
     save_risk_free_rate,
     validate_risk_free_rate,
 )
+from src.dataset.holdings_cache import DEFAULT_HOLDINGS_CACHE_PATH, refresh_holdings_cache
 from src.flow.interactive import (
     in_typed_order,
     measure_holdings,
@@ -177,6 +185,8 @@ def _report(currency: str, args) -> None:
             args.db_path,
             risk_free_rate=resolved.rate,
             allow_fetch=not args.no_holdings_fetch,
+            cache_path=args.holdings_cache_path,
+            force_refresh=args.refresh_holdings,
         ),
         args.path,
         risk_free_rate_origin=resolved.origin,
@@ -261,6 +271,7 @@ def _validate_set_targets(
     args,
     db_path: str | None = None,
     pool_currency: str | None = None,
+    refresh_cache: bool = False,
 ) -> tuple[str | None, list[str], dict[str, str], dict[str, str]]:
     """Resolve which currency's portfolio a `set` edits, and which of its
     tickers may join it: `(currency, accepted, invalid, refused)`.
@@ -283,6 +294,11 @@ def _validate_set_targets(
     the file it passes, and `open_holdings_session` only hands over a scratch
     one.
 
+    `refresh_cache` says that `db_path` is the persistent holdings cache
+    rather than a throwaway file, so a ticker it already holds this month
+    needs no request at all. `whatif` passes it, which is why re-trying a
+    candidate is free after the first time.
+
     `pool_currency` is the currency the tickers must match, defaulting to
     `--currency`. `set` leaves it alone, because for `set` the first typed
     ticker is exactly what SHOULD establish the currency - that is how
@@ -292,7 +308,15 @@ def _validate_set_targets(
     dollar experiment rather than refused by name.
     """
     typed = [ticker for ticker, _ in pairs]
-    if db_path is not None:
+    if db_path is not None and refresh_cache:
+        # `db_path` is the holdings cache, so go through its staleness rule
+        # rather than fetching unconditionally: a ticker tried in an earlier
+        # what-if is already there and costs nothing to try again, which is
+        # most of what an explore loop does.
+        valid, invalid, currencies = refresh_holdings_cache(
+            typed, parse_date(args.date), db_path
+        )
+    elif db_path is not None:
         valid, invalid, currencies = validate_and_ingest_tickers(
             typed, parse_date(args.date), db_path
         )
@@ -461,6 +485,8 @@ def _run_whatif(args) -> None:
         parse_date(args.date),
         args.db_path,
         allow_fetch=not args.no_holdings_fetch,
+        cache_path=args.holdings_cache_path,
+        force_refresh=args.refresh_holdings,
     ) as session:
         known: dict[str, str] = {}
         baseline = measure_holdings(
@@ -557,6 +583,7 @@ def _whatif_set(
                 args,
                 db_path=session.db_path,
                 pool_currency=currency,
+                refresh_cache=True,
             )
             if invalid:
                 print(f"Ignored (not found): {', '.join(sorted(invalid))}.")
@@ -725,6 +752,22 @@ def main() -> None:
              "configured RISK_FREE_RATE, else 2%%. Every report says which of those it used.",
     )
     parser.add_argument(
+        "--holdings-cache-path",
+        default=DEFAULT_HOLDINGS_CACHE_PATH,
+        help="Which file the holdings' prices and monthly returns are cached in, so a repeated "
+             "report costs no network. Refreshed for a ticker when it does not hold that "
+             "ticker's latest month, which means once a month; --refresh-holdings forces it. "
+             "Never the same file as --db-path.",
+    )
+    parser.add_argument(
+        "--refresh-holdings",
+        action="store_true",
+        help="Refetch every holding's prices now rather than reusing the cache. The cache is "
+             "otherwise good for the rest of the calendar month, so the monthly returns are "
+             "always current but the prices behind 'Total value' can be weeks old - the report "
+             "states the date it priced them at, and this flag is how you move it.",
+    )
+    parser.add_argument(
         "--rates-path",
         default=DEFAULT_RATES_PATH,
         help="Which file the per-currency risk-free rates are remembered in. One file holds "
@@ -739,9 +782,9 @@ def main() -> None:
         "--no-holdings-fetch",
         "--no-fetch",
         action="store_true",
-        help="Report the holdings only from returns --db-path already holds, never by fetching. "
-             "Keeps the command entirely offline, at the cost of reporting a holding as "
-             "unmeasurable when the cache does not contain it.",
+        help="Report the holdings only from data already on disk - what --db-path holds, or the "
+             "holdings cache - never by fetching. Keeps the command entirely offline, at the "
+             "cost of reporting a holding as unmeasurable when neither contains it.",
     )
     args = parser.parse_args()
 

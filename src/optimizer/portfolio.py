@@ -607,6 +607,43 @@ def _load_prices_up_to(tickers: list[str], as_of: date, db_path: str) -> pd.Data
     return df
 
 
+def latest_price_date(tickers: list[str], as_of: date, db_path: str) -> date | None:
+    """The date of the most recent price row `db_path` holds for `tickers` at
+    or before `as_of`, or `None` when it holds none.
+
+    Exists so a report can state how current the prices behind its money
+    figures actually are. `load_latest_prices` returns the prices but not
+    their date, which was fine while every holdings report fetched fresh
+    data moments before printing. Once those prices can come from a
+    persistent cache (see `src/dataset/holdings_cache.py`) the date stops
+    being obvious and starts being the difference between a `Total value`
+    the reader can trust and one they cannot.
+
+    Read-only, and a missing file or table reports `None` rather than
+    raising - the same discipline `load_returns_long(read_only=True)`
+    follows, and what keeps asking about a cache from creating one.
+    """
+    if not tickers:
+        return None
+
+    placeholders = ", ".join(["?"] * len(tickers))
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+    except duckdb.IOException:
+        return None
+    try:
+        row = con.execute(
+            f"SELECT max(date) FROM prices WHERE ticker IN ({placeholders}) AND date <= ?",
+            [*tickers, pd.Timestamp(as_of).date()],
+        ).fetchone()
+    except duckdb.CatalogException:
+        return None
+    finally:
+        con.close()
+
+    return row[0] if row and row[0] is not None else None
+
+
 def load_latest_prices(tickers: list[str], as_of: date, db_path: str = settings.db_path) -> pd.Series:
     """Most recent `adj_close` on or before `as_of` for each of `tickers`,
     read from the `prices` table (not `returns`) - `allocate_shares` needs

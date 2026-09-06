@@ -60,6 +60,11 @@ from src.dataset.ticker_currency import (
     load_ticker_currencies,
     partition_by_currency,
 )
+from src.dataset.holdings_cache import (
+    DEFAULT_HOLDINGS_CACHE_PATH,
+    refresh_holdings_cache,
+    stale_tickers,
+)
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.live import build_live_snapshot, build_scratch_snapshot
 from src.optimizer.benchmark import (
@@ -303,6 +308,8 @@ def open_holdings_session(
     rebalance_date: date,
     db_path: str,
     allow_fetch: bool = True,
+    cache_path: str = DEFAULT_HOLDINGS_CACHE_PATH,
+    force_refresh: bool = False,
 ):
     """Yield a `HoldingsSession` whose database already holds `tickers`'
     prices and monthly returns, kept alive for a whole interactive what-if
@@ -328,22 +335,27 @@ def open_holdings_session(
     after it is instant. Compare `_resolve_holdings`, which fetches per
     call - correct for a one-shot report, ruinous for a loop.
 
-    With `allow_fetch=False` the session yields `db_path` itself, read-only,
-    and reports `can_ingest=False`. That is not a degraded fetch path but a
-    different promise: `--no-holdings-fetch` means "touch no network", and
-    `db_path` is documented as never written to, so a ticker the cache does
-    not already hold cannot be added to the experiment at all. The caller
-    refuses such an add by name rather than silently ingesting into the
-    shared cache.
+    Since Milestone 6 of `plans/13_user_portfolio.md` the database is the
+    PERSISTENT holdings cache rather than a file deleted on exit, so the
+    first measurement of a session usually costs nothing either - the cache
+    is refreshed only for the tickers whose latest month it is missing. What
+    it is NOT, in either version, is `db_path`: see the cache module's
+    docstring for why holdings rows must never land in the database a
+    candidate pool is being measured against.
+
+    With `allow_fetch=False` the session still yields the cache but reports
+    `can_ingest=False`. `--no-holdings-fetch` means "touch no network", so
+    reading what the cache already holds is fine while adding a ticker it
+    does not hold is not - the caller refuses such an add by name rather
+    than reaching for the network behind the flag's back.
     """
     if not allow_fetch:
-        yield HoldingsSession(db_path=db_path, can_ingest=False)
+        yield HoldingsSession(db_path=cache_path, can_ingest=False)
         return
 
-    with build_scratch_snapshot(prefix="holdings_whatif_") as scratch_db_path:
-        if tickers:
-            validate_and_ingest_tickers(sorted(tickers), rebalance_date, scratch_db_path)
-        yield HoldingsSession(db_path=scratch_db_path, can_ingest=True)
+    if tickers:
+        refresh_holdings_cache(sorted(tickers), rebalance_date, cache_path, force=force_refresh)
+    yield HoldingsSession(db_path=cache_path, can_ingest=True)
 
 
 def measure_holdings(
@@ -467,6 +479,8 @@ def _resolve_holdings(
     db_path: str,
     risk_free_rate: float,
     allow_fetch: bool,
+    cache_path: str = DEFAULT_HOLDINGS_CACHE_PATH,
+    force_refresh: bool = False,
 ) -> HoldingsStats:
     """`prepare_holdings`'s body, split out so every failure mode it can
     raise is caught in one place by its caller.
@@ -484,6 +498,19 @@ def _resolve_holdings(
     quietly measure the holdings that happen to also be candidates and
     exclude every other one for thin history - reporting a number for a
     slice of the portfolio chosen by an unrelated coincidence.
+
+    Failing that, the persistent holdings cache
+    (`src/dataset/holdings_cache.py`) is consulted, and only the tickers it
+    cannot answer for are fetched - into the cache, so the next run pays
+    nothing. That file is neither `db_path` nor the shared
+    `data/portfolio.duckdb`, which is what preserves the isolation rule the
+    throwaway database was originally built for: see the cache module's
+    docstring.
+
+    `allow_fetch=False` still reaches the cache. The flag means "touch no
+    network", and reading a local file is not a network call - so an offline
+    run gets whatever the cache holds, with its price date stated, rather
+    than nothing at all.
     """
     tickers = sorted(positions)
     counts = stored_month_counts(tickers, rebalance_date, db_path)
@@ -494,30 +521,38 @@ def _resolve_holdings(
             _holdings_currency_gate(positions, currency, currencies),
         )
 
-    if not allow_fetch:
-        short = sorted(t for t in tickers if counts[t] < HOLDINGS_MIN_MONTHS)
-        return unavailable_holdings(
-            currency,
-            positions,
-            risk_free_rate,
-            f"{', '.join(short)} ha{'s' if len(short) == 1 else 've'} under "
-            f"{HOLDINGS_MIN_MONTHS} month(s) of returns in this session's database and "
-            "fetching more was disabled with --no-holdings-fetch",
+    excluded: dict[str, str] = {}
+    if allow_fetch:
+        valid, invalid, currencies = refresh_holdings_cache(
+            tickers, rebalance_date, cache_path, force=force_refresh
         )
-
-    with build_scratch_snapshot(prefix="holdings_snapshot_") as scratch_db_path:
-        valid, invalid, currencies = validate_and_ingest_tickers(
-            tickers, rebalance_date, scratch_db_path
-        )
-        excluded = {ticker: reason for ticker, reason in invalid.items()}
+        excluded.update(invalid)
         excluded.update(
             _holdings_currency_gate(
                 {t: positions[t] for t in valid if t in positions}, currency, currencies
             )
         )
-        return _holdings_stats_excluding(
-            positions, currency, rebalance_date, scratch_db_path, risk_free_rate, excluded
+    else:
+        cache_counts = stored_month_counts(tickers, rebalance_date, cache_path)
+        short = sorted(t for t in tickers if cache_counts[t] < HOLDINGS_MIN_MONTHS)
+        if short:
+            return unavailable_holdings(
+                currency,
+                positions,
+                risk_free_rate,
+                f"{', '.join(short)} ha{'s' if len(short) == 1 else 've'} under "
+                f"{HOLDINGS_MIN_MONTHS} month(s) of returns in this session's database or the "
+                "holdings cache, and fetching more was disabled with --no-holdings-fetch",
+            )
+        excluded.update(
+            _holdings_currency_gate(
+                positions, currency, load_ticker_currencies(tickers, cache_path)
+            )
         )
+
+    return _holdings_stats_excluding(
+        positions, currency, rebalance_date, cache_path, risk_free_rate, excluded
+    )
 
 
 def prepare_holdings(
@@ -527,15 +562,20 @@ def prepare_holdings(
     db_path: str,
     risk_free_rate: float = settings.risk_free_rate,
     allow_fetch: bool = True,
+    cache_path: str = DEFAULT_HOLDINGS_CACHE_PATH,
+    force_refresh: bool = False,
 ) -> HoldingsStats:
     """Measure the user's own saved portfolio (`positions`, as read from
     `memory/portfolio.json` by `src/flow/user_portfolio.py`), resolving the
     prices and monthly returns it needs first.
 
-    The prices and returns are fetched into a throwaway database of their
-    OWN (`build_scratch_snapshot`), never into `db_path`, and this is a
+    The prices and returns are fetched into the persistent holdings cache
+    (`src/dataset/holdings_cache.py`), never into `db_path`, and this is a
     correctness requirement rather than tidiness - the same rule
-    `prepare_benchmark` obeys, for the same two reasons. The shared
+    `prepare_benchmark` obeys, for the same two reasons. Until Milestone 6
+    of `plans/13_user_portfolio.md` the destination was a throwaway database
+    deleted moments later; making it persistent changed where the rows live
+    but not the rule that keeps them out of `db_path`. The shared
     `data/portfolio.duckdb` cache holds the S&P 500 universe and must not
     gain rows as a side effect of printing a report. And
     `src/optimizer/portfolio.py`'s `_load_window_dates` derives a
@@ -566,7 +606,8 @@ def prepare_holdings(
 
     try:
         return _resolve_holdings(
-            positions, currency, rebalance_date, db_path, risk_free_rate, allow_fetch
+            positions, currency, rebalance_date, db_path, risk_free_rate, allow_fetch,
+            cache_path, force_refresh,
         )
     except Exception as e:  # noqa: BLE001 - yfinance and duckdb raise assorted types here
         logger.warning("could not measure the saved %s portfolio: %s", currency, e)
