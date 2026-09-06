@@ -18,7 +18,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.config.settings import settings
-from src.flow.holdings_cli import _normalize_ticker, _parse_pairs, main
+from src.flow.holdings_cli import (
+    WHATIF_PROMPT,
+    _normalize_ticker,
+    _parse_pairs,
+    main,
+)
 from src.flow.interactive import HoldingsSession
 from src.flow.rate_memory import load_all_risk_free_rates, load_risk_free_rate
 from src.flow.user_portfolio import load_all_portfolios, load_portfolio
@@ -1005,3 +1010,40 @@ def test_whatif_does_not_claim_the_rate_was_remembered(monkeypatch, tmp_path, ca
     out = capsys.readouterr().out
     assert "not remembered - this is a what-if" in out
     assert "remembered for USD" not in out
+
+
+def test_the_whatif_loop_prompt_says_a_ticker_need_not_be_one_you_own():
+    """The capability existed from Milestone 5 and was invisible: the loop
+    said "[s]et shares", which reads as adjusting a quantity on something
+    you already have, and the only in-program sentence admitting otherwise
+    was inside the --no-holdings-fetch refusal - visible only to somebody
+    who had already tried it AND passed the flag that blocks it. The
+    repository owner reasonably concluded the feature was missing.
+
+    Pinned on the prompt strings rather than on prose, because the next
+    person to tidy them for length would re-introduce exactly that
+    confusion.
+    """
+    assert "any ticker" in WHATIF_PROMPT
+
+
+def test_the_set_sub_prompt_says_the_ticker_need_not_be_held(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    prompts: list[str] = []
+    remaining = iter(["s", "SPY 900", "f"])
+
+    def record(prompt=""):
+        prompts.append(prompt)
+        return next(remaining)
+
+    monkeypatch.setattr("builtins.input", record)
+    _run(monkeypatch, path, ["whatif"])
+
+    assert any("held or not" in p for p in prompts)
+    assert any("any ticker" in p for p in prompts)

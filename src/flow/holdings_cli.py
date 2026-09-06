@@ -43,7 +43,15 @@ currency to remember it against.
 `whatif` is the exception to all of the above, and the exception proves the
 rule: it applies hypothetical changes to a portfolio and reports what the
 figures would become, and it saves NOTHING - not the positions, and not a
-`--risk-free-rate`, which every other subcommand remembers. It is also the
+`--risk-free-rate`, which every other subcommand remembers.
+
+A hypothetical change is NOT limited to what you already hold. Naming a
+ticker you do not own is the question the loop mainly earns its keep on -
+"what would adding this do?" is precisely what cannot be answered by eye,
+since a holding that raises expected return often raises volatility more
+and lowers the Sharpe ratio. Such a ticker is validated and priced exactly
+as `set` would validate and price it, so the experiment predicts what
+actually recording it would produce. It is also the
 one interactive subcommand, prompting in a loop so several variations can be
 tried in a row against one fetch. Those two facts belong together: the
 reason the rest of this command is non-interactive is that each of its
@@ -388,7 +396,7 @@ def _run_set(args) -> None:
     _remember_rate(currency, args)
 
 
-WHATIF_PROMPT = "\nWhat if? [s]et shares / [r]emove / [u]ndo all / [f]inish: "
+WHATIF_PROMPT = "\nWhat if? [s]et shares (any ticker) / [r]emove / [u]ndo all / [f]inish: "
 
 NOT_SAVED = (
     "Nothing was saved: that was a what-if, and your portfolio is unchanged."
@@ -437,8 +445,9 @@ def _whatif_set_command(baseline: dict[str, float], hypothetical: dict[str, floa
 
 
 def _run_whatif(args) -> None:
-    """`whatif`: try hypothetical changes to the saved holdings and see the
-    three figures move, without saving anything.
+    """`whatif`: try hypothetical changes to the saved holdings - including
+    adding a ticker you do not own - and see the three figures move, without
+    saving anything.
 
     The one interactive subcommand, and the one that changes nothing - those
     two facts are related. Every other subcommand is a single edit that is
@@ -559,7 +568,7 @@ def _whatif_set(
     something just typed: a typo deserves to be named, not quietly dropped
     from the figures.
     """
-    raw = input("Ticker and shares (e.g. NVDA 100, 0 to drop): ").strip().upper()
+    raw = input("Ticker and shares, held or not (e.g. NVDA 100, 0 to drop): ").strip().upper()
     try:
         pairs = _parse_pairs(raw.split())
     except ValueError as e:
@@ -698,7 +707,8 @@ def main() -> None:
                     "annualized return, volatility and Sharpe ratio.",
         epilog="Examples: portfolio-holdings set SPY 1000 T 500 | portfolio-holdings remove T | "
                "portfolio-holdings --currency JPY set 1321.T 50 | portfolio-holdings show | "
-               "portfolio-holdings whatif (try changes without saving them)",
+               "portfolio-holdings whatif (try changes, including tickers you do not own, "
+               "without saving them)",
     )
     parser.add_argument(
         "command",
@@ -706,8 +716,8 @@ def main() -> None:
         default="show",
         choices=VALID_COMMANDS,
         help="What to do. Defaults to 'show', so a bare invocation reports every saved portfolio. "
-             "'whatif' opens a loop for trying hypothetical changes and seeing the figures move, "
-             "and saves nothing at all.",
+             "'whatif' opens a loop for trying hypothetical changes and seeing the figures move - "
+             "including for a ticker you do not own yet - and saves nothing at all.",
     )
     parser.add_argument(
         "args",

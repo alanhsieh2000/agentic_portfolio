@@ -64,6 +64,7 @@ Define the terms used throughout, in plain language:
 - [x] (2026-09-06 08:02Z) Milestone 6a — the cache: `src/dataset/holdings_cache.py` and `tests/test_holdings_cache.py` (16 tests). A ticker is stale when the cache lacks the monthly return for the most recent rebalance date on or before the report's date - derived from the data, so there is no `fetched_at` to drift out of agreement with the rows it describes. `--refresh-holdings` forces it.
 - [x] (2026-09-06 08:09Z) Milestone 6b — the honest price date: `HoldingsStats.priced_as_of`, `latest_price_date` in `src/optimizer/portfolio.py`, and `Total value: ... (priced YYYY-MM-DD)` in `print_user_portfolio`. The monthly rule keeps the returns current but lets the prices behind `Total value` age, so the report states how current they are rather than leaving a reader to assume.
 - [x] (2026-09-06 08:18Z) Milestone 6c — wiring: `_resolve_holdings` and `open_holdings_session` resolve through the cache instead of a throwaway database, `_validate_set_targets` gained `refresh_cache` so a re-tried what-if ticker costs nothing, and both CLIs gained `--holdings-cache-path` and `--refresh-holdings`. `--no-holdings-fetch` now reaches the cache, since reading a local file is not a network call.
+- [x] (2026-09-06 08:52Z) Item 5f — made Milestone 5's new-ticker capability discoverable: `whatif` has always accepted a ticker the user does not own, but nothing the program printed said so, and the repository owner reasonably read the loop as editing existing holdings only. Six user-facing strings reworded in `src/flow/holdings_cli.py`; no logic, no behaviour change, two tests pinning the prompts. Full suite: 569 passed.
 - [x] (2026-09-06 08:26Z) Milestone 6d — documentation: this plan's living sections, a `README.md` bullet, and the superseded `Decision Log` entry marked as such. Full suite: 567 passed.
 
 
@@ -112,6 +113,10 @@ Define the terms used throughout, in plain language:
 
 - Observation: the monthly staleness rule needs the month-boundary case handled or the cache is permanently stale for a day or two every month. `latest_expected_rebalance_date(date(2026, 11, 1))` must be October's first business day, not November's, because 2026-11-01 is a Sunday and November's return cannot exist yet. Getting it wrong would make every run that weekend see a "stale" cache and refetch.
   Evidence: pinned by `test_a_report_before_its_months_first_business_day_expects_the_previous_month`, and by `test_the_expected_month_uses_the_same_grid_the_returns_table_was_written_on`, which asserts the cache's idea of the monthly grid is `compute_rebalance_dates`' own - two different definitions would make a cache that can never look fresh.
+
+- Observation: a capability can be fully implemented, tested, live-verified AND specifically optimized for, and still be invisible - at which point the person who cannot see it correctly concludes it is missing. `whatif` accepted an unheld ticker from the day Milestone 5 landed; `test_whatif_reports_the_baseline_then_the_hypothetical` pinned it; the live run that produced this plan's headline finding (adding NVDA lowers the Sharpe ratio) WAS a new-ticker experiment; and Milestone 6's `refresh_cache=True` exists for no other purpose than making a re-tried unheld candidate free. The repository owner nonetheless reported the scope as limited to existing holdings, and was right about every word the program prints.
+  Evidence: the tell was that the ONLY in-program sentence describing the capability lived inside a refusal - `"Drop that flag to try a holding you do not already own"`, reachable only by somebody who had already tried it and passed `--no-holdings-fetch`. The loop said `[s]et shares`, the `args` help said `Ignored by ... 'whatif'`, and both `_run_whatif`'s docstring and this plan's own Milestone 5 Scope sentence said "changes to the saved holdings", which reads as editing what is there. The affirmative statement existed only in `README.md` and this plan - neither of which a person sees at a prompt.
+  Lesson: this project audits the provenance of NUMBERS rigorously - `plans/14`'s rate-origin line, Milestone 6's `(priced ...)` note, the refusal to print a figure without saying where it came from. It had no equivalent habit for AFFORDANCES. A feature's discoverability deserves the same suspicion as a figure's provenance, and "it is in the README" is the affordance equivalent of a bare `0.0200`.
 
 ## Decision Log
 
@@ -213,6 +218,14 @@ Define the terms used throughout, in plain language:
 
 - Decision: `--no-holdings-fetch` now reads the holdings cache, where before it read only the session database.
   Rationale: a deliberate widening of a documented flag, on the grounds that its help text described the letter and its name describes the intent. "Never by fetching" is about the network; a local DuckDB file is not the network. Before this, an offline run with a fully populated cache reported the holdings as unmeasurable, which is not what anybody asking for offline behaviour wants. The flag's help now says "from data already on disk - this session's database or the holdings cache - never by fetching", and the unavailable message names both places it looked.
+  Date/Author: 2026-09-06.
+
+- Decision: the reported "whatif cannot add new tickers" gap was fixed by REWORDING, not by adding a distinct `[a]dd` verb.
+  Rationale: the capability was already there, so a new verb would have added a second way to spell an existing action rather than a new action. `[s]et` has to keep accepting an unheld ticker regardless - what makes the loop trustworthy is that it predicts exactly what `set` would do, and `set` accepts one - so an `[a]dd` verb would be a synonym needing its own explanation of how it differs, which it does not. The actual defect was that six user-facing strings described the target as "the saved holdings" and the action as "changes", both of which read as editing existing rows. Six strings changed; no logic touched.
+  Date/Author: 2026-09-06, agreed with the repository owner after establishing the capability already existed.
+
+- Decision: connecting `whatif` to `memory/candidates.json` was considered and deliberately NOT taken here.
+  Rationale: it was the one reading of "expand the scope to add new tickers" that is genuinely unbuilt - a `[c]andidates` option listing the curated candidate pool for the run's currency, so a person could try one without typing a ticker, connecting the two halves of this project. The repository owner chose the wording fix instead when the three options were put side by side. Recorded because it is a real and reachable follow-up, and because whoever picks it up should know it was seen rather than missed: `load_all_pools` and `load_candidate_pool` in `src/flow/candidate_memory.py` already provide everything the listing would need.
   Date/Author: 2026-09-06.
 
 ## Outcomes & Retrospective
@@ -602,7 +615,7 @@ Expect no holdings block at all in the first, and in the second a single `n/a` l
 ### Milestone 5 — the what-if loop
 
 
-Scope: a way to ask what a CHANGE would do, without making it. At the end of this milestone `uv run portfolio-holdings whatif` opens a loop in which hypothetical changes to the saved holdings are applied, measured and reported with the signed change in all three figures, and nothing whatsoever is written. This milestone was added after the first four shipped, in response to a live run: seeing the current figures immediately raises the question of which change would improve them, and answering that by hand is the hard part. It closes, from the other direction, the gap this plan's own `Outcomes & Retrospective` pre-registered.
+Scope: a way to ask what a CHANGE would do, without making it. At the end of this milestone `uv run portfolio-holdings whatif` opens a loop in which hypothetical changes to the saved holdings - INCLUDING adding a ticker the person does not own - are applied, measured and reported with the signed change in all three figures, and nothing whatsoever is written. (That clause was added by item 5f: the original sentence said only "changes to the saved holdings", and both this plan and the CLI's own prompts thereby described a narrower feature than the one that shipped. See `Surprises & Discoveries`.) This milestone was added after the first four shipped, in response to a live run: seeing the current figures immediately raises the question of which change would improve them, and answering that by hand is the hard part. It closes, from the other direction, the gap this plan's own `Outcomes & Retrospective` pre-registered.
 
 **Step 5a — one session, one window.** In `src/flow/interactive.py`, beside `prepare_holdings`:
 
@@ -1037,3 +1050,18 @@ In `pyproject.toml`, under `[project.scripts]`:
   every assumption anybody made about it being throwaway, those assumptions are not all in the file
   being changed, and a green suite does not prove they were found - checking for files nobody meant
   to create does.
+- 2026-09-06, item 5f: the reported gap - "`whatif` focuses on existing holding tickers, expand it
+  to add new ones" - turned out to be documentation rather than code. Adding an unheld ticker had
+  worked since Milestone 5, was pinned by
+  `test_whatif_reports_the_baseline_then_the_hypothetical`, and was the subject of this plan's own
+  headline live finding; Milestone 6's `refresh_cache=True` exists solely to make re-trying one
+  free. What was missing was any user-facing sentence saying so. Six strings in
+  `src/flow/holdings_cli.py` reworded - the loop prompt now reads
+  `[s]et shares (any ticker)`, the sub-prompt `Ticker and shares, held or not` - plus two tests
+  pinning the prompts so a future tidy-up cannot quietly restore the confusion. No logic changed
+  and no behaviour changed; the words now match a feature that was already there.
+
+  Recorded at length in `Surprises & Discoveries` because the general lesson outlives this fix:
+  this project is rigorous about never printing a number without its provenance, and had no
+  equivalent habit for whether a feature announces itself. A capability documented only in the
+  README is, from the prompt, indistinguishable from one that does not exist.
