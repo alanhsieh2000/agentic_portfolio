@@ -26,6 +26,7 @@ import pytest
 
 from src.flow.cli import (
     _choose_pool_to_resume,
+    _resolve_mixed_persisted_pool,
     _run_edit_loop,
     _run_user_provided_confirm_loop,
     _settle_benchmark,
@@ -773,7 +774,23 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
     # `_rates_argv` instead, which points a real path into `tmp_path`.
     monkeypatch.setattr("src.flow.cli.load_risk_free_rate", MagicMock(return_value=None))
     monkeypatch.setattr("src.flow.cli.save_risk_free_rate", MagicMock(return_value=True))
+    # And `load_all_pools`, for the third time the same reason: a
+    # `--selection user_provided` test would otherwise read the developer's
+    # own `memory/candidates.json` and be shown - or asked about - whatever
+    # pools happen to be saved there. The tests that exercise the pool
+    # listing itself pass their own dict to the confirm loop directly.
+    monkeypatch.setattr("src.flow.cli.load_all_pools", MagicMock(return_value={}))
     return pipeline_spy, edit_spy, benchmark_spy
+
+
+def _stub_main_confirm_loop(monkeypatch, pool=None, currency="USD") -> MagicMock:
+    """Replace `_run_user_provided_confirm_loop` with a spy, so a
+    `--selection user_provided` test can assert what reached it without
+    driving the interactive add/remove loop or touching Yahoo Finance.
+    """
+    confirm_spy = MagicMock(return_value=(pool or ["AAPL"], currency))
+    monkeypatch.setattr("src.flow.cli._run_user_provided_confirm_loop", confirm_spy)
+    return confirm_spy
 
 
 def _rates_argv(tmp_path, *extra: str) -> list[str]:
@@ -1422,18 +1439,26 @@ def test_main_remembers_a_rate_given_on_the_command_line(monkeypatch, tmp_path, 
 
 
 def test_main_writes_the_rate_to_the_given_rates_path_and_not_the_default(monkeypatch, tmp_path):
-    """The guard against a test suite that edits the developer's own memory."""
+    """The guard against a test suite that edits the developer's own memory.
+
+    Asserted by spying on the PATH `save_risk_free_rate` was handed, not by
+    inspecting `DEFAULT_RATES_PATH`'s contents. An earlier version of this
+    test did the latter - "the real file has no USD entry" - which passed on
+    a clean checkout and then failed the moment somebody actually remembered
+    a USD rate, since `memory/` is untracked. A test that asserts something
+    about a developer's own data is the very coupling this test exists to
+    prevent, so it must not do it either.
+    """
     _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
-    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_risk_free_rate)
+    save_spy = MagicMock(return_value=True)
+    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_spy)
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
 
     main()
 
-    assert (tmp_path / "rates.json").exists()
-    assert not Path(DEFAULT_RATES_PATH).exists() or "USD" not in json.loads(
-        Path(DEFAULT_RATES_PATH).read_text()
-    ).get("rates", {})
+    assert save_spy.call_args.kwargs["path"] == str(tmp_path / "rates.json")
+    assert save_spy.call_args.kwargs["path"] != DEFAULT_RATES_PATH
 
 
 def test_main_applies_a_remembered_rate_when_the_flag_is_left_out(monkeypatch, tmp_path):
@@ -1588,3 +1613,285 @@ def test_main_names_the_rates_source_in_the_holdings_block_too(monkeypatch, tmp_
     assert print_spy.call_args.kwargs["risk_free_rate_origin"] == (
         "--risk-free-rate, remembered for USD"
     )
+
+
+# ---------------------------------------------------------------------------
+# --currency: answering the pool-resume prompt from the command line
+# ---------------------------------------------------------------------------
+
+
+def test_choose_pool_to_resume_with_an_override_resumes_without_prompting(monkeypatch, capsys):
+    """`_script` with no responses makes any `input()` raise StopIteration,
+    which is how this file asserts "did not prompt".
+    """
+    _script(monkeypatch)
+
+    tickers, currency = _choose_pool_to_resume(
+        {"USD": ["AAPL", "SPY"], "JPY": ["7203.T"]}, override="JPY"
+    )
+
+    assert (tickers, currency) == (["7203.T"], "JPY")
+    assert "Resuming the JPY pool (--currency)." in capsys.readouterr().out
+
+
+def test_choose_pool_to_resume_with_an_override_still_lists_what_is_saved(monkeypatch, capsys):
+    """The listing is what makes a mistyped currency discoverable rather than
+    silent - it shows JPY exists directly above the line saying JYP does not.
+    """
+    _script(monkeypatch)
+
+    _choose_pool_to_resume({"USD": ["AAPL"], "JPY": ["7203.T"]}, override="JYP")
+    out = capsys.readouterr().out
+
+    assert "Saved candidate pools:" in out
+    assert "JPY (1): 7203.T" in out
+    assert "No saved JYP pool; starting a new one (--currency)." in out
+
+
+def test_an_override_for_an_unsaved_currency_starts_empty_under_that_currency(monkeypatch):
+    """Returning the currency rather than `None` is the whole point: `None`
+    would let the first typed ticker establish the pool's currency, so a
+    scripted `--currency JPY` that typo'd a dollar ticker would silently
+    become a dollar pool instead of refusing it.
+    """
+    _script(monkeypatch)
+
+    assert _choose_pool_to_resume({"USD": ["AAPL"]}, override="EUR") == ([], "EUR")
+
+
+def test_an_override_pre_establishes_the_currency_when_nothing_is_saved(monkeypatch):
+    _script(monkeypatch)
+
+    assert _choose_pool_to_resume({}, override="JPY") == ([], "JPY")
+
+
+def test_an_override_is_normalized_to_upper_case(monkeypatch):
+    _script(monkeypatch)
+
+    tickers, currency = _choose_pool_to_resume({"JPY": ["7203.T"]}, override=" jpy ")
+
+    assert (tickers, currency) == (["7203.T"], "JPY")
+
+
+def test_no_override_leaves_the_prompt_exactly_as_it_was(monkeypatch):
+    """The flag is additive: the interactive path must be untouched."""
+    _script(monkeypatch, "JPY")
+
+    assert _choose_pool_to_resume({"USD": ["AAPL"], "JPY": ["7203.T"]}) == (["7203.T"], "JPY")
+
+
+def test_confirm_loop_with_an_override_refuses_a_foreign_ticker_on_the_first_add(
+    monkeypatch, capsys
+):
+    """With the currency settled up front there is no "first ticker decides"
+    window, so a dollar ticker typed into a JPY session is refused
+    immediately rather than establishing a dollar pool.
+    """
+    _fake_ingestion(monkeypatch, currencies={"AAPL": "USD"})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "d")
+
+    with pytest.raises(StopIteration):
+        # The pool never becomes non-empty, so `[d]one` is refused and the
+        # loop asks again - which exhausts the script.
+        _run_user_provided_confirm_loop(
+            {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json", currency="JPY"
+        )
+
+    out = capsys.readouterr().out
+    assert "Refused: AAPL is priced in USD but this pool is JPY." in out
+
+
+def test_confirm_loop_with_an_override_saves_under_that_currency(monkeypatch):
+    _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
+    save_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    _script(monkeypatch, "a", "7203.T", "d")
+
+    pool, currency = _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json", currency="JPY"
+    )
+
+    assert (pool, currency) == (["7203.T"], "JPY")
+    assert save_spy.call_args.kwargs["currency"] == "JPY"
+
+
+def test_confirm_loop_with_an_override_resumes_that_pool_without_prompting(monkeypatch):
+    _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("src.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
+    _script(monkeypatch, "d")  # only the [d]one answer; no resume prompt to answer
+
+    pool, currency = _run_user_provided_confirm_loop(
+        {"USD": ["AAPL"], "JPY": ["7203.T"]},
+        REBALANCE_DATE,
+        "session.duckdb",
+        memory_path="mem.json",
+        currency="JPY",
+    )
+
+    assert (pool, currency) == (["7203.T"], "JPY")
+
+
+# --- the mixed-pool repair prompt, which --currency must also answer -------
+
+
+def test_a_mixed_pool_with_an_override_keeps_that_group_without_prompting(monkeypatch, capsys):
+    """The second currency prompt on this path. A flag that silenced only the
+    first would still leave a scripted run waiting here.
+    """
+    _fake_ingestion(monkeypatch, currencies={"AAPL": "USD", "7203.T": "JPY"})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("src.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
+    _script(monkeypatch, "d")
+
+    pool, currency = _run_user_provided_confirm_loop(
+        {"JPY": ["AAPL", "7203.T"]},
+        REBALANCE_DATE,
+        "session.duckdb",
+        memory_path="mem.json",
+        currency="JPY",
+    )
+
+    assert (pool, currency) == (["7203.T"], "JPY")
+    out = capsys.readouterr().out
+    assert "mixes currencies" in out
+    # The data-loss record must survive the override - skipping the question
+    # is not a licence to hide the answer.
+    assert "Keeping JPY; dropping AAPL (--currency)." in out
+
+
+def test_a_mixed_pool_whose_groups_lack_the_override_starts_empty_under_it(monkeypatch, capsys):
+    _script(monkeypatch)
+
+    tickers, currency = _resolve_mixed_persisted_pool(
+        ["AAPL", "SPY"], {"AAPL": "USD", "SPY": "GBP"}, override="JPY"
+    )
+
+    assert (tickers, currency) == ([], "JPY")
+    assert "No JPY tickers in the saved pool" in capsys.readouterr().out
+
+
+def test_a_mixed_pool_without_an_override_still_prompts(monkeypatch, capsys):
+    _script(monkeypatch, "JPY")
+
+    tickers, currency = _resolve_mixed_persisted_pool(
+        ["AAPL", "7203.T"], {"AAPL": "USD", "7203.T": "JPY"}
+    )
+
+    assert (tickers, currency) == (["7203.T"], "JPY")
+    assert "Keeping JPY; dropping AAPL." in capsys.readouterr().out
+
+
+def test_a_resumed_pool_that_now_prices_elsewhere_reports_the_disagreement(monkeypatch, capsys):
+    """The one thing --currency does not override: what the tickers actually
+    price in per the database. A pool saved under USD whose ticker moved to
+    Tokyo really is JPY now - but the override losing must not be silent.
+    """
+    _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("src.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
+    _script(monkeypatch, "d")
+
+    pool, currency = _run_user_provided_confirm_loop(
+        {"USD": ["7203.T"]},
+        REBALANCE_DATE,
+        "session.duckdb",
+        memory_path="mem.json",
+        currency="USD",
+    )
+
+    assert (pool, currency) == (["7203.T"], "JPY")
+    assert "the saved USD pool's tickers now price in JPY; continuing as JPY." in (
+        capsys.readouterr().out
+    )
+
+
+# --- through main ----------------------------------------------------------
+
+
+def test_main_threads_the_currency_override_into_the_confirm_loop(monkeypatch, tmp_path):
+    _stub_main_pipeline(monkeypatch)
+    confirm_spy = _stub_main_confirm_loop(monkeypatch, pool=["7203.T"], currency="JPY")
+    monkeypatch.setattr(
+        "sys.argv",
+        _rates_argv(tmp_path, "--selection", "user_provided", "--currency", "jpy"),
+    )
+
+    main()
+
+    assert confirm_spy.call_args.kwargs["currency"] == "JPY"
+
+
+def test_main_carries_the_overridden_currency_through_the_whole_run(monkeypatch, tmp_path):
+    """The flag has to reach more than the pool choice: the report, the
+    benchmark, the remembered rate and the holdings block are all keyed off
+    the currency the confirm loop returns.
+    """
+    pipeline_spy, edit_spy, benchmark_spy = _stub_main_pipeline(monkeypatch)
+    _stub_main_confirm_loop(monkeypatch, pool=["7203.T"], currency="JPY")
+    holdings_spy = _stub_main_holdings(monkeypatch, {"1321.T": 50.0})
+    monkeypatch.setattr(
+        "sys.argv",
+        _rates_argv(tmp_path, "--selection", "user_provided", "--currency", "JPY"),
+    )
+
+    main()
+
+    assert pipeline_spy.call_args.kwargs["currency"] == "JPY"
+    assert edit_spy.call_args.kwargs["currency"] == "JPY"
+    assert benchmark_spy.call_args.args[1] == "JPY"
+    assert holdings_spy.call_args.args[1] == "JPY"
+
+
+def test_main_leaves_the_confirm_loop_unaffected_without_the_flag(monkeypatch, tmp_path):
+    _stub_main_pipeline(monkeypatch)
+    confirm_spy = _stub_main_confirm_loop(monkeypatch)
+    monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--selection", "user_provided"))
+
+    main()
+
+    assert confirm_spy.call_args.kwargs["currency"] is None
+
+
+def test_main_refuses_a_currency_for_an_agent_driven_selection(monkeypatch, tmp_path, capsys):
+    """Those selections screen the S&P 500 and are USD by construction, so
+    accepting the flag would print a USD report to somebody who asked for
+    JPY - the silent contradiction this codebase refuses everywhere else.
+    """
+    session_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr(
+        "sys.argv",
+        _rates_argv(tmp_path, "--selection", "llm_s_only", "--currency", "JPY"),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    assert "--currency applies only to --selection user_provided" in capsys.readouterr().err
+    assert session_spy.called is False
+
+
+def test_an_add_that_refuses_everything_does_not_forget_the_override(monkeypatch, capsys):
+    """`validate_and_edit_candidates` reports no currency when the resulting
+    pool is empty, so a fully-refused add used to clobber the one in force -
+    reporting "this pool is None" and then letting the NEXT add establish a
+    different currency, quietly undoing `--currency`. Reachable only once a
+    currency can be settled before the pool is non-empty.
+    """
+    _fake_ingestion(monkeypatch, currencies={"AAPL": "USD", "SPY": "USD"})
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "a", "SPY", "d")
+
+    with pytest.raises(StopIteration):
+        _run_user_provided_confirm_loop(
+            {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json", currency="JPY"
+        )
+
+    out = capsys.readouterr().out
+    # Both adds refused against JPY - the second proves the currency survived
+    # the first, rather than SPY establishing a USD pool.
+    assert out.count("but this pool is JPY.") == 2
+    assert "this pool is None" not in out

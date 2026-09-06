@@ -50,7 +50,9 @@ added ticker against Yahoo Finance so a typo is named rather than silently
 carried into the optimizer - then feeds the confirmed pool through the same
 optimizer and post-run edit loop every other selection uses. That file
 holds one pool per currency, since a portfolio can only hold one; when
-several are saved, the user is asked which to resume.
+several are saved, the user is asked which to resume - or names one with
+`--currency`, which answers that question (and the mixed-pool repair
+question behind it) from the command line so the run can be scripted.
 """
 
 from __future__ import annotations
@@ -408,21 +410,49 @@ def _print_add_outcome(
         )
 
 
-def _resolve_mixed_persisted_pool(pool: list[str], currencies: dict[str, str]) -> tuple[list[str], str]:
+def _resolve_mixed_persisted_pool(
+    pool: list[str], currencies: dict[str, str], override: str | None = None
+) -> tuple[list[str], str]:
     """Report a saved pool that spans several currencies and ask which one to
     keep, returning `(kept_tickers, currency)`.
 
     A pool saved before currencies were recorded can legitimately be mixed,
     and so can one whose ticker changed listing. The machine genuinely
     cannot decide which currency was intended - keeping the largest group
-    would just be guessing quietly - so this asks, which is safe because
-    this loop is already interactive and the pool is the person's own.
-    Nothing reaches disk until they confirm at the `[d]one` prompt.
+    would just be guessing quietly - so this asks unless `override` has
+    already said, which is safe because this loop is already interactive and
+    the pool is the person's own. Nothing reaches disk until they confirm at
+    the `[d]one` prompt.
+
+    `override` (`main`'s `--currency`) answers the question without asking
+    it. This is the SECOND currency prompt on the resume path, and a flag
+    that silenced only `_choose_pool_to_resume`'s would still hang a
+    scripted run here - so `--currency` has to reach this one too, or it
+    would not really mean "no prompts".
+
+    An override naming a currency the pool has no tickers in keeps nothing
+    rather than falling back to the prompt, for the same reason: a script
+    cannot answer a prompt, and "I asked for a JPY pool" is a coherent
+    instruction even when the mixed file turns out to hold no JPY tickers.
+    Either way the warning and the keeping/dropping line still print - they
+    are the only record that tickers were discarded, and an override is a
+    reason to skip the question, not a reason to hide the answer.
     """
     groups = group_by_currency(pool, currencies)
     print("\nWarning: the saved candidate pool mixes currencies, which one portfolio cannot do:")
     for currency, tickers in groups.items():
         print(f"  {currency}: {', '.join(tickers)}")
+
+    if override:
+        if override in groups:
+            dropped = sorted(t for c, ts in groups.items() if c != override for t in ts)
+            print(f"Keeping {override}; dropping {', '.join(dropped)} (--currency).")
+            return groups[override], override
+        print(
+            f"No {override} tickers in the saved pool; dropping all of it and starting "
+            f"an empty {override} pool (--currency)."
+        )
+        return [], override
 
     while True:
         chosen = input(f"Keep which currency? ({'/'.join(groups)}): ").strip().upper()
@@ -434,14 +464,17 @@ def _resolve_mixed_persisted_pool(pool: list[str], currencies: dict[str, str]) -
 
 
 def _choose_pool_to_resume(
-    pools: dict[str, list[str]], benchmarks: dict[str, str | None] | None = None
+    pools: dict[str, list[str]],
+    benchmarks: dict[str, str | None] | None = None,
+    override: str | None = None,
 ) -> tuple[list[str], str | None]:
     """Pick which saved pool this session works on, returning
     `(tickers, currency)`.
 
     `memory/candidates.json` holds one pool per currency, since a portfolio
     can only hold one, so with anything saved there is nothing but the
-    person's intent to go on and this asks. A `None` currency means "start a
+    person's intent to go on - which `override` supplies when given, and
+    which this asks for otherwise. A `None` currency means "start a
     new pool": the same not-yet-established state as a first-ever run, where
     the first ticker typed decides its currency. Choosing a currency that
     already has a pool and emptying it is simply editing that pool, which
@@ -459,9 +492,31 @@ def _choose_pool_to_resume(
     beside the tickers - which pool a person means to resume is often decided
     by what it is measured against, and a pool with none recorded is about to
     be asked about, so seeing that in advance is useful rather than noise.
+
+    `override` (`main`'s `--currency`) answers the question without asking
+    it, which is what makes this command scriptable: the prompt is the right
+    default for a person deciding at the keyboard, but it cannot be answered
+    from a shell history line or a cron entry. A saved pool in that currency
+    is resumed exactly as typing its code would resume it; no saved pool in
+    that currency starts a new one, the non-interactive equivalent of
+    `[n]ew`.
+
+    Note what that second case does differently from typing `[n]ew`: it
+    returns the currency rather than `None`, settling it up front instead of
+    leaving the first typed ticker to establish it. That is deliberate. A
+    scripted `--currency JPY` that then adds a dollar ticker by mistake
+    should be refused by name on the first add, not silently become a dollar
+    pool - which is exactly what `None` would let happen.
+
+    The listing still prints either way, so a mistyped `--currency JYP` shows
+    the saved `JPY` pool directly above the line saying no `JYP` pool was
+    found. Surprising, but never silent.
     """
+    if override:
+        override = override.strip().upper()
+
     if not pools:
-        return [], None
+        return [], override
 
     benchmarks = benchmarks or {}
     print("\nSaved candidate pools:")
@@ -469,6 +524,13 @@ def _choose_pool_to_resume(
         benchmark = benchmarks.get(currency)
         count = f"{len(tickers)}, benchmark {benchmark}" if benchmark else str(len(tickers))
         print(f"  {currency} ({count}): {', '.join(tickers)}")
+
+    if override:
+        if override in pools:
+            print(f"Resuming the {override} pool (--currency).")
+            return pools[override], override
+        print(f"No saved {override} pool; starting a new one (--currency).")
+        return [], override
 
     if len(pools) == 1:
         only_currency, only_tickers = next(iter(pools.items()))
@@ -493,6 +555,7 @@ def _run_user_provided_confirm_loop(
     rebalance_date: date,
     db_path: str,
     memory_path: str = DEFAULT_CANDIDATES_PATH,
+    currency: str | None = None,
 ) -> tuple[list[str], str]:
     """Show the persisted candidate pool, then prompt in a loop for
     add/remove until the user confirms they are done, and return the
@@ -501,7 +564,8 @@ def _run_user_provided_confirm_loop(
     candidates in every other selection.
 
     `initial_pools` is every pool saved at `memory_path`, keyed by currency;
-    `_choose_pool_to_resume` settles which one this session works on. The
+    `_choose_pool_to_resume` settles which one this session works on, from
+    the prompt or from `currency`. The
     chosen pool is persisted exactly once, when the user confirms, and only
     into its own currency's slot - an in-progress edit is never written, and
     the other currencies' pools are left exactly as they were. It is
@@ -513,11 +577,28 @@ def _run_user_provided_confirm_loop(
     Every ticker in the pool must trade in one currency, since prices in two
     different units cannot be allocated against a single budget. The first
     ticker added to an empty pool establishes that currency and later adds
-    are measured against it.
+    are measured against it - unless `currency` settled it in advance.
+
+    `currency` is `main`'s `--currency`, and it reaches BOTH currency
+    questions on this path (`_choose_pool_to_resume`'s "which pool" and
+    `_resolve_mixed_persisted_pool`'s "keep which"), because a flag that
+    silenced only the first would still leave a scripted run waiting on the
+    second. It also seeds `pool_currency` below, so a pool that starts empty
+    starts with its currency already known rather than waiting for the first
+    typed ticker to decide.
+
+    One thing `currency` does NOT override: the currency a resumed pool's
+    tickers actually price in, per the database. A pool saved under `USD`
+    whose ticker has since moved to Tokyo really is JPY now, and the
+    database is a better authority on that than a stale key in a JSON file.
+    The disagreement is reported rather than silently applied.
     """
     initial_pool, resumed_currency = _choose_pool_to_resume(
-        initial_pools, load_pool_benchmarks(memory_path)
+        initial_pools, load_pool_benchmarks(memory_path), override=currency
     )
+    # `_choose_pool_to_resume` normalizes; take its answer so the rest of
+    # this function compares against one spelling.
+    currency = resumed_currency if currency else None
 
     pool, invalid, currencies = validate_and_ingest_tickers(initial_pool, rebalance_date, db_path)
     if invalid:
@@ -527,9 +608,14 @@ def _run_user_provided_confirm_loop(
     if pool:
         groups = group_by_currency(pool, currencies)
         if len(groups) > 1:
-            pool, pool_currency = _resolve_mixed_persisted_pool(pool, currencies)
+            pool, pool_currency = _resolve_mixed_persisted_pool(pool, currencies, override=currency)
         else:
             pool_currency = next(iter(groups))
+            if currency and pool_currency != currency:
+                print(
+                    f"Note: the saved {currency} pool's tickers now price in {pool_currency}; "
+                    f"continuing as {pool_currency}."
+                )
 
     print(f"\nCurrent candidate pool ({len(pool)}): {', '.join(pool) if pool else '(empty)'}")
 
@@ -547,14 +633,23 @@ def _run_user_provided_confirm_loop(
             print(f"Saved {len(pool)} {confirmed_currency} ticker(s) to {memory_path}.")
             return pool, confirmed_currency
 
-        previous_pool = pool
+        previous_pool, previous_pool_currency = pool, pool_currency
         if choice in ("a", "add"):
             raw = input("Ticker(s) to add (space-separated): ").strip().upper()
             edit = validate_and_edit_candidates(
                 pool, add=raw.split(), remove=[], as_of=rebalance_date, db_path=db_path,
                 pool_currency=pool_currency,
             )
-            pool, pool_currency = edit.pool, edit.pool_currency
+            # `validate_and_edit_candidates` reports `pool_currency=None`
+            # whenever the resulting pool is empty, which loses the currency
+            # this add was actually measured against - so fall back to the
+            # one that was in force. Without that, an add whose every ticker
+            # was refused would report "this pool is None" and, worse, would
+            # forget the currency, letting the next add establish a different
+            # one. Reachable only once a currency can be settled before the
+            # pool is non-empty, i.e. via `--currency`.
+            pool = edit.pool
+            pool_currency = edit.pool_currency or previous_pool_currency
             _print_add_outcome(edit.added, edit.invalid, edit.refused, pool_currency)
         elif choice in ("r", "remove"):
             raw = input("Ticker(s) to remove (space-separated): ").strip().upper()
@@ -569,7 +664,12 @@ def _run_user_provided_confirm_loop(
 
         if not pool:
             print("Resulting pool would be empty; ignoring this edit and keeping the previous pool.")
-            pool = previous_pool
+            # The currency is restored with the pool. Reverting one without
+            # the other used to leave a restored non-empty pool alongside a
+            # `None` currency, so the next add would re-establish it from
+            # whatever was typed rather than from the pool that is actually
+            # still there.
+            pool, pool_currency = previous_pool, previous_pool_currency
             continue
 
         print(f"Candidate pool ({len(pool)}): {', '.join(pool)}")
@@ -948,7 +1048,18 @@ def main() -> None:
         help="Which file the user_provided selection's candidate pools are persisted in - an "
              "alternate or scratch store, for trying something without touching a curated pool. "
              "One file holds one pool per currency, so this is not how currencies are kept apart; "
-             "when several pools are saved you are asked which to resume.",
+             "when several pools are saved you are asked which to resume, or name one with "
+             "--currency.",
+    )
+    parser.add_argument(
+        "--currency",
+        default=None,
+        help="Which currency's saved candidate pool to resume, answering the 'Resume which pool?' "
+             "prompt from the command line so the run can be scripted. A currency with no saved "
+             "pool starts a new one, with that currency settled up front - so a ticker in any "
+             "other currency is then refused by name rather than silently establishing a "
+             "different pool. Applies only to --selection user_provided; every other selection "
+             "screens the S&P 500 and is USD by construction.",
     )
     parser.add_argument(
         "--rates-path",
@@ -978,6 +1089,21 @@ def main() -> None:
              "reporting the holdings as unmeasurable when the cache does not contain them.",
     )
     args = parser.parse_args()
+
+    if args.currency:
+        args.currency = args.currency.strip().upper()
+        if args.selection != "user_provided":
+            # Refused rather than ignored. For every other selection the
+            # currency is the hardcoded DEFAULT_CURRENCY, because those
+            # selections screen the S&P 500 - so accepting the flag would
+            # print a USD report to someone who just asked for JPY, which is
+            # exactly the silent contradiction this codebase refuses
+            # everywhere else. `parser.error` exits 2 with argparse's own
+            # formatting, the same path a malformed --risk-free-rate takes.
+            parser.error(
+                "--currency applies only to --selection user_provided; every other selection "
+                "screens the S&P 500 and is USD by construction"
+            )
 
     if args.risk_free_rate is not None:
         # Checked here, before `open_pipeline_session` builds a live snapshot
@@ -1013,6 +1139,7 @@ def main() -> None:
                 rebalance_date,
                 session_db_path,
                 memory_path=args.memory_path,
+                currency=args.currency,
             )
 
         # Settled after the confirm loop, never before: an empty pool has no
