@@ -25,6 +25,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
+from src.dataset.dividends import build_dividends_for_tickers
 from src.dataset.prices import fetch_and_reshape_for_tickers, upsert_prices_tables
 from src.dataset.returns import build_returns_for_tickers
 from src.dataset.ticker_currency import (
@@ -63,6 +64,12 @@ def validate_and_ingest_tickers(
     each valid ticker to its normalized currency - `'GBP'`, never the
     `'GBp'` Yahoo Finance reports for a pence quote. Never raises for a bad
     ticker; an empty `tickers` list short-circuits without any network call.
+
+    Dividend history is fetched on the same pass and stored in the same
+    database, so a ticker somebody just typed can immediately carry a
+    minimum-dividend constraint. That fetch is allowed to fail without
+    failing the ingestion: a missing yield is reported by name where it
+    matters, and losing an otherwise-good ticker over it would be worse.
 
     This is the only place in the project that looks up a currency, which
     keeps the cost proportional to what it buys: one extra request per
@@ -111,6 +118,35 @@ def validate_and_ingest_tickers(
     upsert_prices_tables(long_prices, unresolved, cleaned, db_path)
     upsert_ticker_currency_table(_currency_frame(currencies, multipliers, raw_currencies), cleaned, db_path)
     build_returns_for_tickers(cleaned, db_path, start=start, end=as_of.isoformat())
+
+    # Dividends land on the same pass, into the same database, so a
+    # user-provided pool can carry a dividend floor without a separate build
+    # step. Without this, every session snapshot would have prices and no
+    # yields, and `--min-annual-dividend` would be refused for every ticker a
+    # person typed - correctly, since a missing yield is not a zero yield,
+    # but uselessly.
+    #
+    # `multipliers` is passed so a pence dividend is scaled exactly as that
+    # ticker's pence prices were, and `invalid` so a ticker that could not be
+    # resolved - or whose currency could not be classified, leaving its unit
+    # unknown - is recorded as having NO dividend coverage rather than a
+    # confident zero yield.
+    #
+    # Failure here is logged and swallowed: a dividend gap is reported by
+    # name downstream, whereas raising would turn a working ingestion into a
+    # rejected ticker list and lose the prices, returns and currencies this
+    # call already stored.
+    try:
+        build_dividends_for_tickers(
+            cleaned,
+            db_path,
+            start=start,
+            end=end,
+            multipliers=multipliers,
+            unresolved=set(invalid),
+        )
+    except Exception as e:  # noqa: BLE001 - yfinance and duckdb raise assorted types here
+        logger.warning("could not ingest dividend history for %s: %s", cleaned, e)
 
     valid = [ticker for ticker in cleaned if ticker not in invalid]
     return valid, invalid, currencies

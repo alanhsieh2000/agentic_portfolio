@@ -25,10 +25,12 @@ import pandas as pd
 import pytest
 
 from src.optimizer.benchmark import benchmark_stats_for_window, BenchmarkSource
+from src.optimizer.dividends import NO_DIVIDEND_FIGURES, dividend_figures
 from src.optimizer.holdings import (
     DEFAULT_LOOKBACK_MONTHS,
     HOLDINGS_MIN_MONTHS,
     holdings_stats,
+    unavailable_holdings,
     stored_month_counts,
     validate_lookback_months,
     weights_from_positions,
@@ -784,3 +786,103 @@ def test_a_non_integer_window_is_refused_naming_its_source():
 def test_a_boolean_window_is_refused_even_though_bool_is_an_int():
     with pytest.raises(ValueError, match="whole number of months"):
         validate_lookback_months(True, "[w]indow")
+
+
+# --- dividend figures on a held portfolio -----------------------------------
+
+
+def test_holdings_stats_does_not_consult_dividends_by_default(tmp_path):
+    """Every caller and test predating this feature must be unaffected, so
+    the dividend figures are opt-in and their absence is a distinguishable
+    state rather than a portfolio that pays nothing.
+    """
+    db = str(tmp_path / "h.duckdb")
+    _make_db(db, [_monthly_returns(40, "T")], {"T": 20.0})
+    stats = holdings_stats({"T": 100.0}, AS_OF, db, "USD")
+    assert stats.dividends is NO_DIVIDEND_FIGURES
+
+
+def test_holdings_stats_reports_annual_dividends_from_shares_and_per_share_cash(tmp_path):
+    db = str(tmp_path / "h.duckdb")
+    _make_db(db, [_monthly_returns(40, "T")], {"T": 20.0})
+    stats = holdings_stats(
+        {"T": 100.0}, AS_OF, db, "USD", dividends_per_share={"T": 1.11}
+    )
+    assert stats.dividends.annual_dividends["T"] == pytest.approx(111.0)
+    assert stats.dividends.total_annual_dividends == pytest.approx(111.0)
+    assert stats.dividends.value_covered == pytest.approx(2000.0)
+    assert stats.dividends.dividend_yield == pytest.approx(111.0 / 2000.0)
+
+
+def test_holdings_stats_dividends_cover_a_holding_excluded_from_the_return_figures(tmp_path):
+    """The denominator-discipline test. A dividend yield needs no return
+    history at all, so a holding dropped from the risk figures for being too
+    recently listed still pays what it pays - and leaving it out would
+    understate the income the portfolio really produces.
+    """
+    db = str(tmp_path / "h.duckdb")
+    _make_db(
+        db,
+        [_monthly_returns(40, "T"), _monthly_returns(8, "NEWCO", shift=1)],
+        {"T": 20.0, "NEWCO": 50.0},
+    )
+    stats = holdings_stats(
+        {"T": 100.0, "NEWCO": 10.0},
+        AS_OF,
+        db,
+        "USD",
+        dividends_per_share={"T": 1.11, "NEWCO": 2.00},
+    )
+    assert "NEWCO" in stats.excluded
+    assert "NEWCO" not in stats.weights
+    assert stats.dividends.annual_dividends["NEWCO"] == pytest.approx(20.0)
+    assert stats.dividends.total_annual_dividends == pytest.approx(131.0)
+
+
+def test_holdings_stats_dividends_do_not_move_with_the_lookback_window(tmp_path):
+    """A trailing dividend is a record of cash paid, not an estimate over a
+    returns window - which is what lets `whatif`'s `[w]indow` report a real
+    zero change in income rather than withholding the comparison.
+    """
+    db = str(tmp_path / "h.duckdb")
+    _make_db(db, [_monthly_returns(60, "T")], {"T": 20.0})
+    short = holdings_stats(
+        {"T": 100.0}, AS_OF, db, "USD", lookback_months=24, dividends_per_share={"T": 1.11}
+    )
+    long = holdings_stats(
+        {"T": 100.0}, AS_OF, db, "USD", lookback_months=60, dividends_per_share={"T": 1.11}
+    )
+    assert short.window_months != long.window_months
+    assert short.dividends == long.dividends
+
+
+def test_holdings_stats_shrinks_the_dividend_denominator_for_a_holding_with_no_data(tmp_path):
+    db = str(tmp_path / "h.duckdb")
+    _make_db(
+        db,
+        [_monthly_returns(40, "T"), _monthly_returns(40, "GROWTH", shift=1)],
+        {"T": 20.0, "GROWTH": 100.0},
+    )
+    stats = holdings_stats(
+        {"T": 100.0, "GROWTH": 10.0},
+        AS_OF,
+        db,
+        "USD",
+        dividends_per_share={"T": 1.11},
+        dividend_unavailable={"GROWTH": "no trailing dividend data"},
+    )
+    assert stats.dividends.value_covered == pytest.approx(2000.0)
+    assert stats.total_value == pytest.approx(3000.0)
+    assert "GROWTH" in stats.dividends.unavailable
+
+
+def test_unavailable_holdings_can_still_carry_dividend_figures():
+    """A portfolio whose returns cannot be measured still pays what it pays,
+    and that is the one number such a holder most wants.
+    """
+    figures = dividend_figures({"T": 100.0}, {"T": 2000.0}, {"T": 1.11})
+    stats = unavailable_holdings(
+        "USD", {"T": 100.0}, 0.02, "too little history", dividends=figures
+    )
+    assert stats.annual_return is None
+    assert stats.dividends.total_annual_dividends == pytest.approx(111.0)

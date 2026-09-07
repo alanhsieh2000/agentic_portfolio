@@ -96,6 +96,14 @@ from src.optimizer.benchmark import (
     benchmark_stats_for_window,
     resolve_benchmark_ticker,
 )
+from src.optimizer.dividends import (
+    DIVIDEND_BINDING_TOLERANCE,
+    MAX_DIVIDEND_YIELD,
+    NO_DIVIDEND_FIGURES,
+    DividendFloor,
+    validate_dividend_yield,
+    validate_min_annual_dividend,
+)
 from src.optimizer.holdings import HoldingsStats
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
 
@@ -175,6 +183,112 @@ def format_risk_free_rate(rate: float, origin: str | None = None) -> str:
     return f"Risk-free rate used: {rate:.4f}{suffix}"
 
 
+def format_signed_money(amount: float, currency: str = DEFAULT_CURRENCY) -> str:
+    """A signed money amount: `'+$1,240.00 USD'`, `'-$310.00 USD'`.
+
+    `format_money` cannot render a delta directly - it would produce
+    `'$-310.00 USD'`, with the sign wedged between the symbol and the
+    digits. The sign belongs in front of the whole quantity, where a reader
+    scanning a column of deltas expects to find it.
+    """
+    return f"{'+' if amount >= 0 else '-'}{format_money(abs(amount), currency)}"
+
+
+def format_dividend_floor(
+    floor: float | None, origin: str | None, realized: float | None
+) -> str:
+    """The `Minimum dividend yield:` line, printed on EVERY run.
+
+    Follows two conventions this module already established. The floor's
+    provenance rides in parentheses after the figure, exactly as
+    `format_risk_free_rate` names a rate's source, because a floor printed
+    without saying which flag produced it is the same ambiguity that
+    convention exists to prevent - and here the provenance also restates a
+    cash request in the unit it was made in, so a reader who typed 3000 need
+    not multiply anything to check that 0.0300 is the same instruction. And
+    the line is printed whether or not a floor was asked for, saying so
+    explicitly when none was, so its presence and position never depend on
+    how this particular run was invoked - the same rule the target-return
+    line follows.
+
+    Whether the floor BINDS is worth stating and cheap to determine. A
+    linear inequality that is strictly slack at the optimum is inactive, so
+    removing it would give the same weights: "clears it unaided" is a true
+    claim about the portfolio, not a hedge, and it tells a reader that their
+    floor changed nothing.
+    """
+    if floor is None:
+        return (
+            "Minimum dividend yield: n/a (no floor was asked for; use "
+            "--min-annual-dividend or --min-dividend-yield)"
+        )
+    source = f" ({origin})" if origin else ""
+    if realized is None:
+        return f"Minimum dividend yield: {floor:.4f}{source}"
+    if realized <= floor + DIVIDEND_BINDING_TOLERANCE:
+        return (
+            f"Minimum dividend yield: {floor:.4f}{source} - binding, the portfolio sits "
+            "on the floor"
+        )
+    return (
+        f"Minimum dividend yield: {floor:.4f}{source} - not binding, the portfolio clears "
+        f"it by {realized - floor:.4f} unaided"
+    )
+
+
+def print_dividend_section(
+    stats: PortfolioStats,
+    held: list[str],
+    currency: str,
+    portfolio_value: float | None = None,
+) -> None:
+    """The per-ticker `Dividend yield / annual income` block for an
+    optimized pool.
+
+    A section of its own rather than two more figures on the existing
+    `Expected return / volatility (annualized)` lines, because that block's
+    title would then be false and because these are different KINDS of
+    number: an expected return is an estimate over a returns window, a
+    trailing dividend is a record of cash already paid. Placed immediately
+    after that block so the per-ticker sections stay adjacent, in the same
+    order, and can be read against each other line for line.
+
+    A confirmed non-payer prints `0.0000` and is labelled as such; a ticker
+    whose dividend data is missing prints `n/a` and says so. Those are
+    different facts and the report never merges them - merging them is the
+    one silently wrong answer this feature could give.
+
+    `portfolio_value` is what `--value` allocated, and it is what turns a
+    yield into money. Left `None`, the yields print without a cash column
+    rather than against a fabricated basis - the interactive edit loop
+    always has the value to hand, so this is a courtesy to a programmatic
+    caller rather than a path the CLI takes.
+    """
+    if stats.dividend_yields is None:
+        print(
+            "\nDividend yield / annual income (trailing 12 months): n/a - dividend data "
+            "was not consulted for this run"
+        )
+        return
+
+    print("\nDividend yield / annual income (trailing 12 months):")
+    for ticker in held:
+        if ticker not in stats.dividend_yields:
+            print(f"  {ticker}: yield n/a - no trailing dividend data")
+            continue
+        ticker_yield = stats.dividend_yields[ticker]
+        note = "  (pays no dividend)" if ticker_yield == 0.0 else ""
+        if portfolio_value is None:
+            print(f"  {ticker}: yield={ticker_yield:.4f}{note}")
+            continue
+        # This ticker's share of --value at the CONTINUOUS weight the
+        # optimizer solved for, so these lines sum to the portfolio figure
+        # printed below them rather than to the whole-share allocation,
+        # which is reported separately and deliberately differs.
+        cash = stats.weights.get(ticker, 0.0) * float(portfolio_value) * ticker_yield
+        print(f"  {ticker}: yield={ticker_yield:.4f}  {format_money(cash, currency)}{note}")
+
+
 def print_weights_and_allocation(
     stats: PortfolioStats,
     allocation: tuple[dict[str, int], float],
@@ -182,6 +296,7 @@ def print_weights_and_allocation(
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkStats | None = None,
     risk_free_rate_origin: str | None = None,
+    portfolio_value: float | None = None,
 ) -> None:
     """Human-readable rendering of one `compute_weights_and_allocation`
     result, including the figures the optimizer decided from.
@@ -211,6 +326,20 @@ def print_weights_and_allocation(
     that never asked for a benchmark is unaffected) and what `--benchmark
     none` produces.
 
+    `portfolio_value` is what `--value` allocated, and it is what lets the
+    dividend lines report money as well as a yield. Left `None`, they report
+    the yield alone rather than money against a basis nobody supplied.
+
+    The dividend figures sit in two places, for the same reason the existing
+    figures do: the per-ticker block goes beside the other per-ticker block,
+    and the portfolio-level lines go with the other portfolio-level lines,
+    beneath the benchmark and the risk-free rate. Note that the two money
+    figures a run prints - the income on the continuous weights here, and
+    the income on the whole-share allocation further down - deliberately
+    differ, because whole shares plus leftover cash cannot buy the
+    continuous portfolio exactly. Both are printed because they answer
+    different questions.
+
     `risk_free_rate_origin` names where the rate on the line below came from
     - this run's flag, the currency's remembered rate, or the configured
     default - see `format_risk_free_rate`. It is carried through the edit
@@ -232,12 +361,37 @@ def print_weights_and_allocation(
     for ticker in held:
         print(f"  {ticker}: return={stats.expected_returns[ticker]:.4f}  volatility={stats.volatility[ticker]:.4f}")
 
+    print_dividend_section(stats, held, currency, portfolio_value)
+
     print(f"\nPortfolio expected return: {stats.portfolio_expected_return:.4f}  "
           f"Portfolio volatility: {stats.portfolio_volatility:.4f}  "
           f"Portfolio Sharpe: {stats.portfolio_sharpe:.4f}")
     if benchmark is not None:
         print(format_benchmark(benchmark, stats.returns_window_months))
     print(format_risk_free_rate(stats.risk_free_rate, risk_free_rate_origin))
+    if stats.portfolio_dividend_yield is not None:
+        income = (
+            f"  Annual dividend income: "
+            f"{format_money(stats.portfolio_dividend_yield * portfolio_value, currency)} "
+            f"(on --value {format_money(portfolio_value, currency)})"
+            if portfolio_value is not None
+            else ""
+        )
+        print(f"Portfolio dividend yield: {stats.portfolio_dividend_yield:.4f}{income}")
+        if stats.dividend_yields_missing:
+            print(
+                f"  covers {stats.dividend_weight_covered:.4f} of the weight; "
+                f"{', '.join(stats.dividend_yields_missing)} "
+                f"{'has' if len(stats.dividend_yields_missing) == 1 else 'have'} no trailing "
+                "dividend data and are left out"
+                if len(stats.dividend_yields_missing) != 1
+                else f"  covers {stats.dividend_weight_covered:.4f} of the weight; "
+                     f"{stats.dividend_yields_missing[0]} has no trailing dividend data and is "
+                     "left out"
+            )
+    print(format_dividend_floor(
+        stats.dividend_yield_floor, stats.dividend_floor_origin, stats.portfolio_dividend_yield
+    ))
     if objective == "MV":
         print(f"Target annual return: {stats.target_annual_return:.4f}")
     else:
@@ -248,6 +402,68 @@ def print_weights_and_allocation(
     for ticker, count in sorted(shares.items()):
         print(f"  {ticker}: {count}")
     print(f"Leftover cash: {format_money(leftover_cash, currency)}")
+    allocated = format_allocated_dividends(stats, shares, currency, portfolio_value)
+    if allocated is not None:
+        print(allocated)
+
+
+def format_allocated_dividends(
+    stats: PortfolioStats,
+    shares: dict[str, int],
+    currency: str,
+    portfolio_value: float | None,
+) -> str | None:
+    """What the WHOLE-SHARE allocation actually pays over a year, or `None`
+    when dividends were not consulted.
+
+    Deliberately a different figure from the `Portfolio dividend yield`
+    line above, and printed anyway. That one describes the continuous
+    portfolio the optimizer solved for; this one describes the shares a
+    person would really buy. They answer two different questions - "what
+    does the portfolio I asked for yield" and "what will these share counts
+    pay me" - and each belongs beside the block it describes.
+
+    Two things separate them, and the second is larger than it looks.
+    Whole shares plus leftover cash cannot reproduce continuous weights
+    exactly, which is a rounding effect worth a fraction of a percent. But
+    `allocate_shares` prices shares from `load_latest_prices`, which reads
+    `adj_close`, while a dividend yield is cash over the raw market `close`
+    (see `src/dataset/dividends.py`'s `load_latest_close` for why it must
+    be). On a database whose price window ended well before it was fetched,
+    `adj_close` sits meaningfully below `close` - by 6.7% to 17.8% across
+    the dividend payers in the shipped `data/portfolio.duckdb` - so the
+    share counts are struck against the lower number and this total comes
+    out correspondingly higher. It is an accurate statement about the share
+    counts printed above it; the gap is a property of which price column
+    the pre-existing allocation step uses, not of this arithmetic. On a
+    cache fetched up to today the two columns agree at the newest date and
+    the gap collapses to rounding alone.
+
+    Computed as `sum(shares * dividends_per_share)`, from the per-share
+    cash the data layer stored rather than from a yield, because a share
+    count times a per-share dividend IS the money. A ticker in the
+    allocation with no per-share figure makes the whole line `n/a` and is
+    named: a total that silently omitted one holding would understate the
+    income while looking complete.
+    """
+    if stats.dividends_per_share is None:
+        return None
+
+    missing = sorted(t for t in shares if t not in stats.dividends_per_share)
+    if missing:
+        return (
+            "Annual dividends at these share counts: n/a - no trailing "
+            f"dividends-per-share for {', '.join(missing)}"
+        )
+
+    total = sum(float(count) * stats.dividends_per_share[t] for t, count in shares.items())
+    basis = (
+        f" (a {total / portfolio_value:.4f} yield on --value "
+        f"{format_money(portfolio_value, currency)})"
+        if portfolio_value
+        else ""
+    )
+    return f"Annual dividends at these share counts: {format_money(total, currency)}{basis}"
 
 
 def format_share_count(shares: float) -> str:
@@ -261,6 +477,107 @@ def format_share_count(shares: float) -> str:
     if float(shares).is_integer():
         return f"{int(shares):,}"
     return f"{shares:,.4f}".rstrip("0").rstrip(".")
+
+
+def format_holding_dividend(holdings: HoldingsStats, ticker: str, currency: str) -> str:
+    """The dividend tail on one holding's line: `'  yield 0.0397  $2,530.88
+    USD/yr'`, or `''` when dividends were not consulted at all.
+
+    The cash figure is `shares * dividends_per_share`, the money this holder
+    will actually receive, and the yield printed beside it is that cash over
+    the same `market_values` entry the line's own value came from - so the
+    two numbers on one line reconcile against one price rather than against
+    a yield struck at some other date.
+
+    A holding with no dividend data prints `yield n/a`, never `0.0000`. That
+    distinction is the whole discipline of this feature: a confirmed
+    non-payer and an unmeasured holding are different facts.
+    """
+    figures = holdings.dividends
+    if figures is NO_DIVIDEND_FIGURES or not figures.dividends_per_share:
+        return ""
+    if ticker not in figures.annual_dividends:
+        return "  yield n/a"
+
+    cash = figures.annual_dividends[ticker]
+    # The dividend layer's own yield, NOT `cash / market_value`. The two
+    # differ because market values are struck from `adj_close` while a yield
+    # is cash over the raw market close, and printing the quotient would make
+    # this line disagree with the identical ticker's line in an optimized
+    # pool's report - see `DividendFigures.yields`.
+    ticker_yield = figures.yields.get(ticker)
+    if ticker_yield is None:
+        return f"  yield n/a  {format_money(cash, currency)}/yr"
+    return f"  yield {ticker_yield:.4f}  {format_money(cash, currency)}/yr"
+
+
+def format_holdings_dividend_total(holdings: HoldingsStats, currency: str) -> str | None:
+    """The portfolio-level `Trailing annual dividends:` line, or `None` when
+    dividends were not consulted.
+
+    The denominator is stated EVERY time, including when it is the whole
+    total. That is the same discipline the returns-window and risk-free-rate
+    lines follow, and for the same reason: a yield whose base is not printed
+    beside it invites being compared against one computed on a different
+    base. When a holding has no dividend data the base shrinks and both
+    numbers are shown, so the gap between them is visible rather than
+    absorbed.
+    """
+    figures = holdings.dividends
+    if figures is NO_DIVIDEND_FIGURES or not figures.dividends_per_share:
+        return None
+
+    if figures.total_annual_dividends is None:
+        return "Trailing annual dividends: n/a - no trailing dividend data for any holding"
+
+    total_value = holdings.total_value
+    covered = figures.value_covered
+    if total_value and covered is not None and abs(covered - total_value) > 0.005:
+        gap = sorted(figures.unavailable)
+        base = (
+            f"on {format_money(covered, currency)} of the "
+            f"{format_money(total_value, currency)} total; "
+            f"{', '.join(gap)} {'has' if len(gap) == 1 else 'have'} no trailing dividend data"
+        )
+    else:
+        base = f"on the full {format_money(covered or 0.0, currency)} total"
+    return (
+        f"Trailing annual dividends: {format_money(figures.total_annual_dividends, currency)}  "
+        f"Dividend yield: {figures.dividend_yield:.4f} ({base})"
+    )
+
+
+def format_dividend_delta(baseline: HoldingsStats, hypothetical: HoldingsStats) -> str:
+    """How the trailing dividend yield and annual income moved between the
+    saved holdings and a hypothetical variant.
+
+    A separate line from `format_holdings_delta` rather than two more
+    figures on it, for two reasons. That line is already three figures
+    wide. And this one has genuinely DIFFERENT comparability rules:
+    `format_holdings_delta` withholds a delta when the two sides were
+    measured over different returns windows, because the difference between
+    two Sharpe ratios spanning different months is partly a difference of
+    months. A trailing dividend is not estimated over a window at all - it
+    is a record of twelve months of cash - so `whatif`'s `[w]indow` leaves
+    these two figures untouched, and this function reports a real
+    `+0.0000` across a window change rather than an apology. That is worth
+    printing: it tells the reader the window they just changed cannot
+    flatter the income.
+
+    Still withheld when either side has no dividend figures, for
+    `format_holdings_delta`'s own reason - subtracting from `None` is not a
+    small bug but a misleading number.
+    """
+    before, after = baseline.dividends, hypothetical.dividends
+    if before.dividend_yield is None or after.dividend_yield is None:
+        return "Dividend change: n/a - one of the two has no dividend figures to compare."
+
+    currency = hypothetical.currency
+    return (
+        f"Dividend change: yield {after.dividend_yield - before.dividend_yield:+.4f}  "
+        f"annual income "
+        f"{format_signed_money(after.total_annual_dividends - before.total_annual_dividends, currency)}"
+    )
 
 
 def print_user_portfolio(
@@ -346,11 +663,20 @@ def print_user_portfolio(
         weight = holdings.weights.get(ticker)
         weight_text = f"weight {weight:.4f}" if weight is not None else "weight n/a"
         print(f"  {ticker}: {format_share_count(holdings.positions[ticker])} shares  "
-              f"{value_text}  {weight_text}")
+              f"{value_text}  {weight_text}"
+              f"{format_holding_dividend(holdings, ticker, currency)}")
 
     if holdings.total_value is not None:
         priced = f" (priced {holdings.priced_as_of})" if holdings.priced_as_of else ""
         print(f"Total value: {format_money(holdings.total_value, currency)}{priced}")
+
+    # Printed here, above the figures/n-a branch, because a trailing
+    # dividend is window-independent and therefore belongs on BOTH sides of
+    # that branch: a portfolio whose returns cannot be measured still pays
+    # what it pays, and that is precisely the number its holder wants.
+    dividend_total = format_holdings_dividend_total(holdings, currency)
+    if dividend_total is not None:
+        print(dividend_total)
 
     if holdings.unavailable_reason is not None:
         print(f"Figures: n/a - {holdings.unavailable_reason}")
@@ -441,13 +767,20 @@ def format_holdings_delta(baseline: HoldingsStats, hypothetical: HoldingsStats) 
     )
 
 
-def print_pipeline_result(result: dict, risk_free_rate_origin: str | None = None) -> None:
+def print_pipeline_result(
+    result: dict,
+    risk_free_rate_origin: str | None = None,
+    portfolio_value: float | None = None,
+) -> None:
     """Human-readable rendering of one `run_pipeline_against` result dict.
 
     `risk_free_rate_origin` is a parameter rather than a key inside `result`
     on purpose: it is a display string, and `run_pipeline_against` lives in
     the orchestration layer, which should not acquire resolution's vocabulary
-    just so a parenthetical can ride along.
+    just so a parenthetical can ride along. `portfolio_value` is a parameter
+    for a plainer reason: it is what `--value` allocated, the orchestration
+    layer never puts it in the result dict, and it is what turns a dividend
+    yield into money.
     """
     print(f"Mode: {result['mode']}  Rebalance date: {result['rebalance_date']}  "
           f"Objective: {result['objective']}  Selection: {result['selection']}")
@@ -468,6 +801,7 @@ def print_pipeline_result(result: dict, risk_free_rate_origin: str | None = None
     print_weights_and_allocation(
         result["stats"], result["allocation"], result["objective"], result["currency"],
         benchmark=result.get("benchmark"), risk_free_rate_origin=risk_free_rate_origin,
+        portfolio_value=portfolio_value,
     )
 
 
@@ -910,6 +1244,152 @@ def _remember_risk_free_rate(resolved: ResolvedRiskFreeRate, currency: str, rate
         )
 
 
+def _settle_dividend_floor(
+    min_annual_dividend: float | None,
+    min_dividend_yield: float | None,
+    portfolio_value: float,
+    currency: str,
+) -> DividendFloor | None:
+    """Turn this run's dividend flags into the single yield floor the
+    optimizer consumes, plus the phrase the report prints beside it.
+
+    Called after the pool's currency has settled and never before, for the
+    same reason `_settle_risk_free_rate` is: the floor's numeric value does
+    not depend on the currency, but the sentence describing it does, and a
+    cash amount printed without its unit is exactly the ambiguity
+    `format_money` and `CURRENCY_SYMBOLS` exist to remove.
+
+    Both flags were already refused back at `parser.error` time for being
+    non-numeric, non-finite, negative or a mistyped percentage. This
+    function repeats only the mutual exclusion, which argparse enforces for
+    a command line but a programmatic caller could still violate - and it
+    refuses rather than reconciling, because any reconciliation (`max`,
+    `min`, last-one-wins) would silently discard a number somebody typed.
+
+    `None` means no floor was asked for, and it is a genuinely different
+    value from a floor of `0.0` - which is a deliberate no-op somebody
+    typed, and which the report therefore prints as a floor.
+    """
+    if min_dividend_yield is not None and min_annual_dividend is not None:
+        raise ValueError(
+            "--min-annual-dividend and --min-dividend-yield are two spellings of one "
+            "constraint; give at most one. Reconciling them would mean discarding a number "
+            "you typed."
+        )
+
+    if min_dividend_yield is not None:
+        return DividendFloor(
+            yield_floor=validate_dividend_yield(min_dividend_yield, "--min-dividend-yield"),
+            origin="--min-dividend-yield",
+            cash_floor=None,
+            portfolio_value=float(portfolio_value),
+            currency=currency,
+        )
+
+    if min_annual_dividend is not None:
+        return DividendFloor(
+            yield_floor=validate_min_annual_dividend(
+                min_annual_dividend, "--min-annual-dividend", portfolio_value
+            ),
+            origin=(
+                f"--min-annual-dividend {format_money(min_annual_dividend, currency)} "
+                f"/ --value {format_money(portfolio_value, currency)}"
+            ),
+            cash_floor=float(min_annual_dividend),
+            portfolio_value=float(portfolio_value),
+            currency=currency,
+        )
+
+    return None
+
+
+def _prompt_dividend_floor(
+    current: DividendFloor | None, portfolio_value: float, currency: str
+) -> DividendFloor | None:
+    """Ask for a new minimum dividend, returning `current` unchanged when the
+    answer is blank or unusable - the same keep-what-you-had treatment
+    `_prompt_target_return` gives a rejected edit, and what lets the caller
+    skip a pointless recompute.
+
+    Accepts three shapes, and ECHOES which one it read, because the
+    cash-versus-yield distinction is an inference this function makes and
+    the person must be able to check it:
+
+        3000    a cash amount, divided by --value
+        3%      a yield
+        0.03    a yield
+        none    clears the floor
+
+    The rule separating cash from yield is magnitude: below 1 is a yield, 1
+    or above is cash. A minimum annual dividend of thirty cents is not
+    something anybody asks for, whereas `0.03` unmistakably reads as a
+    decimal - and this is the same magnitude reasoning
+    `validate_risk_free_rate` already uses to catch a mistyped percentage. A
+    trailing `%` overrides the rule outright, which is how `3%` and `0.03`
+    can both mean the same thing.
+
+    `0` clears the floor rather than setting a zero one. Both readings are
+    non-binding, and "I typed zero to turn it off" is overwhelmingly the
+    likelier intent here - unlike `--min-dividend-yield 0` on a command
+    line, which is a deliberate scripted no-op and is honoured as one.
+    """
+    current_text = (
+        f"{current.yield_floor:.4f} from {current.origin}" if current is not None else "none"
+    )
+    raw = input(
+        "Minimum dividend - cash like 3000, a yield like 3% or 0.03, or [n]one to clear "
+        f"(current {current_text}): "
+    ).strip()
+
+    if not raw:
+        return current
+    if raw.lower() in ("n", "no", "none", "clear", "0"):
+        print("Dividend floor cleared.")
+        return None
+
+    as_yield = raw.endswith("%")
+    try:
+        number = float(raw[:-1]) / 100 if as_yield else float(raw)
+    except ValueError:
+        print(f"Unrecognized minimum dividend {raw!r}; keeping {current_text}.")
+        return current
+
+    try:
+        if as_yield or number < 1:
+            floor = DividendFloor(
+                yield_floor=validate_dividend_yield(number, "the dividend floor"),
+                origin="[d]ividend, this session only",
+                cash_floor=None,
+                portfolio_value=float(portfolio_value),
+                currency=currency,
+            )
+            print(f"Read as a {floor.yield_floor:.4f} minimum portfolio dividend yield.")
+            return floor
+
+        floor = DividendFloor(
+            yield_floor=validate_min_annual_dividend(
+                number, "the dividend floor", portfolio_value
+            ),
+            origin=(
+                f"[d]ividend {format_money(number, currency)} / --value "
+                f"{format_money(portfolio_value, currency)}, this session only"
+            ),
+            cash_floor=float(number),
+            portfolio_value=float(portfolio_value),
+            currency=currency,
+        )
+    except ValueError as e:
+        print(f"Keeping {current_text}: {e}")
+        return current
+
+    print(
+        f"Read as a {floor.yield_floor:.4f} minimum portfolio dividend yield "
+        f"({format_money(number, currency)} on --value "
+        f"{format_money(portfolio_value, currency)})."
+    )
+    return floor
+
+
 def _prompt_target_return(prompt: str, current: float) -> float:
     """Ask for a new MV target annual return, returning `current` unchanged
     when the user presses enter or types something unparseable - the same
@@ -935,6 +1415,7 @@ def _run_edit_loop(
     selection: str = "llm_s_only",
     memory_path: str = DEFAULT_CANDIDATES_PATH,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+    dividend_floor: DividendFloor | None = None,
     risk_free_rate: float = settings.risk_free_rate,
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkSource | None = None,
@@ -986,13 +1467,18 @@ def _run_edit_loop(
     while True:
         choice = input(
             "\nEdit candidates? [a]dd tickers / [r]emove tickers / [o]bjective / "
-            "[t]arget-return / [b]enchmark / [f]inish: "
+            "[t]arget-return / [d]ividend / [b]enchmark / [f]inish: "
         ).strip().lower()
 
         if choice in ("", "f", "finish"):
             return
 
-        previous_candidates, previous_objective, previous_target = candidates, objective, target_annual_return
+        previous_candidates, previous_objective, previous_target, previous_dividend_floor = (
+            candidates,
+            objective,
+            target_annual_return,
+            dividend_floor,
+        )
         if choice in ("a", "add"):
             raw = input("Ticker(s) to add (space-separated): ").strip().upper()
             if selection == "user_provided":
@@ -1017,6 +1503,14 @@ def _run_edit_loop(
                 target_annual_return = _prompt_target_return(
                     f"Target annual return for MV (default {target_annual_return}): ", target_annual_return
                 )
+        elif choice in ("d", "dividend"):
+            new_floor = _prompt_dividend_floor(dividend_floor, portfolio_value, currency)
+            # NamedTuple equality is by value, so re-typing the same floor
+            # is correctly a no-op and skips the recompute - matching
+            # [t]arget-return's own `if new_target == target_annual_return`.
+            if new_floor == dividend_floor:
+                continue
+            dividend_floor = new_floor
         elif choice in ("t", "target-return"):
             if objective != "MV":
                 print(f"Target annual return applies only to objective MV; current objective is {objective!r}.")
@@ -1054,6 +1548,7 @@ def _run_edit_loop(
             stats, allocation = compute_weights_and_allocation(
                 candidates, objective, portfolio_value, rebalance_date, db_path,
                 target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
+                dividend_floor=dividend_floor,
             )
         except ValueError as e:
             # An edit can be individually valid and still leave the optimizer
@@ -1065,15 +1560,22 @@ def _run_edit_loop(
             # snapshot open, so letting it escape would throw away the fetched
             # data and the user's confirmed pool along with it.
             print(f"Cannot optimize that edit: {e}")
-            print("Keeping the previous candidates, objective, and target return.")
-            candidates, objective, target_annual_return = previous_candidates, previous_objective, previous_target
+            print(
+                "Keeping the previous candidates, objective, target return, and dividend floor."
+            )
+            candidates, objective, target_annual_return, dividend_floor = (
+                previous_candidates,
+                previous_objective,
+                previous_target,
+                previous_dividend_floor,
+            )
             continue
 
         if selection == "user_provided" and choice in ("a", "add", "r", "remove"):
             save_candidate_pool(candidates, path=memory_path, currency=currency)
 
         print_weights_and_allocation(
-            stats, allocation, objective, currency,
+            stats, allocation, objective, currency, portfolio_value=portfolio_value,
             benchmark=benchmark_stats_for_window(
                 benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
             ),
@@ -1111,6 +1613,31 @@ def main() -> None:
              "by later runs of both this command and 'uv run portfolio-holdings'. Left out, the "
              "rate is whatever that currency remembered, else the configured RISK_FREE_RATE, "
              "else 2%%. The report always says which of those it used.",
+    )
+    dividend_floor_group = parser.add_mutually_exclusive_group()
+    dividend_floor_group.add_argument(
+        "--min-annual-dividend",
+        type=float,
+        default=None,
+        metavar="CASH",
+        help="Refuse any portfolio expected to pay less than this in dividends over the coming "
+             "year, in the portfolio's own currency - the same unit as --value, shown as the "
+             "'Portfolio currency' line. It becomes one linear constraint on the weights by "
+             "being divided by --value, so '--min-annual-dividend 3000 --value 100000' is "
+             "exactly '--min-dividend-yield 0.03'. Applies to GMV, MV and MSR alike. The "
+             "estimate is each ticker's TRAILING twelve-month yield - a record of what was "
+             "paid, not a promise of what will be. Mutually exclusive with "
+             "--min-dividend-yield.",
+    )
+    dividend_floor_group.add_argument(
+        "--min-dividend-yield",
+        type=float,
+        default=None,
+        metavar="YIELD",
+        help="The same single constraint --min-annual-dividend produces, stated as a decimal "
+             "yield rather than a cash amount and so independent of --value (3%% is 0.03; the "
+             f"ceiling is {MAX_DIVIDEND_YIELD}). Mutually exclusive with "
+             "--min-annual-dividend.",
     )
     parser.add_argument("--db-path", default="data/portfolio.duckdb")
     parser.add_argument(
@@ -1229,6 +1756,33 @@ def main() -> None:
         except ValueError as e:
             parser.error(str(e))
 
+    # Both dividend flags are refused here, before `open_pipeline_session`
+    # builds a live snapshot out of real Wikipedia/yfinance/SEC calls, for
+    # the same reason the rate above is - and because argparse's
+    # `type=float` accepts `nan` and `inf` quite happily, so this is the
+    # only place they can be caught at all. A `nan` floor would otherwise
+    # reach cvxpy as a constraint that is neither met nor refused, reported
+    # with a message naming neither the flag nor the number.
+    if args.min_dividend_yield is not None:
+        try:
+            args.min_dividend_yield = validate_dividend_yield(
+                args.min_dividend_yield, "--min-dividend-yield"
+            )
+        except ValueError as e:
+            parser.error(str(e))
+
+    if args.min_annual_dividend is not None:
+        # Checked against --value here, but NOT converted: the conversion's
+        # `origin` string needs the pool's currency, which is not settled
+        # until the confirm loop returns. The numeric refusal happens before
+        # any network work; only the wording is built later.
+        try:
+            validate_min_annual_dividend(
+                args.min_annual_dividend, "--min-annual-dividend", args.value
+            )
+        except ValueError as e:
+            parser.error(str(e))
+
     rebalance_date = parse_date(args.date)
 
     benchmark_enabled = args.benchmark != BENCHMARK_DISABLED
@@ -1260,6 +1814,13 @@ def main() -> None:
         # flag (which is now `None` whenever it was not given).
         args.risk_free_rate = resolved_rate.rate
 
+        # Settled here, beside the rate, for the same reason: the floor's
+        # numeric value is currency-independent but the sentence describing
+        # it is not, and `currency` is only known now.
+        dividend_floor = _settle_dividend_floor(
+            args.min_annual_dividend, args.min_dividend_yield, args.value, currency
+        )
+
         benchmark = _settle_benchmark(
             candidates or [],
             currency,
@@ -1275,8 +1836,11 @@ def main() -> None:
             rebalance_date, args.objective, args.value, args.selection, session_db_path, mode,
             candidates=candidates, target_annual_return=args.target_return,
             risk_free_rate=args.risk_free_rate, currency=currency, benchmark=benchmark,
+            dividend_floor=dividend_floor,
         )
-        print_pipeline_result(result, risk_free_rate_origin=resolved_rate.origin)
+        print_pipeline_result(
+            result, risk_free_rate_origin=resolved_rate.origin, portfolio_value=args.value
+        )
 
         # Remembered only now, after the run has actually produced a report.
         # `plans/10_performance_reporting_and_target_return.md` established
@@ -1317,6 +1881,7 @@ def main() -> None:
             result["scan_detail"]["candidates"], args.objective, args.value, rebalance_date, session_db_path,
             selection=args.selection, memory_path=args.memory_path,
             target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
+            dividend_floor=dividend_floor,
             currency=currency, benchmark=benchmark,
             allow_benchmark_fetch=not args.no_benchmark_fetch,
             risk_free_rate_origin=resolved_rate.origin,

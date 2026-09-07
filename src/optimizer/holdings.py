@@ -45,6 +45,11 @@ from typing import NamedTuple
 import pandas as pd
 
 from src.config.settings import settings
+from src.optimizer.dividends import (
+    NO_DIVIDEND_FIGURES,
+    DividendFigures,
+    dividend_figures,
+)
 from src.optimizer.portfolio import (
     apply_min_history_rule,
     load_latest_prices,
@@ -162,6 +167,21 @@ class HoldingsStats(NamedTuple):
     old - and a money figure whose age is not stated is a money figure a
     reader will assume is current.
 
+    `dividends` is what this portfolio PAYS over a trailing year, and it is
+    deliberately measured over a wider set of holdings than the three
+    return figures are. A dividend yield needs no return history at all -
+    it is trailing cash per share over the latest price - so a holding
+    excluded from `annual_return`/`annual_volatility`/`sharpe` for having
+    under `HOLDINGS_MIN_MONTHS` of monthly returns still pays what it pays,
+    and leaving it out would understate the income the portfolio actually
+    produces. `DividendFigures` carries its own `value_covered` denominator
+    for exactly that reason, so the report states the base each figure sits
+    on rather than letting a reader assume it matches the line above. This
+    is the same "two honest denominators, with the gap printed" split this
+    record already makes between `total_value` and `weights`. It defaults to
+    `NO_DIVIDEND_FIGURES`, the distinguishable "dividends were not
+    consulted" state, so every existing caller is unaffected.
+
     `expected_returns` and `volatility` are the annualized per-HOLDING
     estimates the three portfolio-level figures were computed from, named to
     match `src/optimizer/portfolio.py`'s `PortfolioStats` fields so the
@@ -190,6 +210,7 @@ class HoldingsStats(NamedTuple):
     priced_as_of: date | None
     excluded: dict[str, str]
     unavailable_reason: str | None
+    dividends: DividendFigures = NO_DIVIDEND_FIGURES
 
 
 def unavailable_holdings(
@@ -200,10 +221,19 @@ def unavailable_holdings(
     market_values: dict[str, float] | None = None,
     total_value: float | None = None,
     excluded: dict[str, str] | None = None,
+    dividends: DividendFigures = NO_DIVIDEND_FIGURES,
 ) -> HoldingsStats:
     """A `HoldingsStats` carrying only `unavailable_reason` and whatever is
     still knowable, so every "there are no figures" path produces the same
     all-or-nothing shape rather than each assembling its own.
+
+    `dividends` is accepted here rather than forced to
+    `NO_DIVIDEND_FIGURES`, because a portfolio whose return figures are
+    unavailable can still have perfectly good income figures - most obviously
+    one whose every holding is too recently listed to measure but which pays
+    dividends every quarter. Withholding what it pays merely because its
+    covariance cannot be estimated would throw away the one number such a
+    holder most wants.
 
     Public because `src/flow/interactive.py`'s `prepare_holdings` needs it
     for the cases it discovers before this module is ever reached - a
@@ -228,6 +258,7 @@ def unavailable_holdings(
         priced_as_of=None,
         excluded=excluded or {},
         unavailable_reason=reason,
+        dividends=dividends,
     )
 
 
@@ -329,6 +360,9 @@ def holdings_stats(
     risk_free_rate: float = settings.risk_free_rate,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
     min_months: int = HOLDINGS_MIN_MONTHS,
+    dividends_per_share: dict[str, float] | None = None,
+    dividend_unavailable: dict[str, str] | None = None,
+    dividend_yields: dict[str, float] | None = None,
 ) -> HoldingsStats:
     """Measure `positions` as of `as_of` against the prices and monthly
     returns already stored in `db_path`.
@@ -346,6 +380,14 @@ def holdings_stats(
     a different window is a different number and a figure whose derivation
     is not stated beside it invites being compared with one derived
     differently.
+
+    `dividends_per_share` and `dividend_unavailable` come from
+    `src/dataset/dividends.py`'s `load_dividend_figures`, resolved by the
+    caller for the same reason the returns and prices are read from
+    `db_path` here rather than fetched: this function must stay callable
+    against a fixture database in a test with no network seam to stub.
+    Left `None`, no dividend figures are reported at all and the result is
+    indistinguishable from before this feature existed.
 
     An empty `positions` is a legitimate state, not an error - the user may
     genuinely hold nothing in this currency yet - and comes back as an
@@ -368,6 +410,16 @@ def holdings_stats(
         if ticker not in market_values:
             excluded[ticker] = f"no price on or before {as_of}"
 
+    # Computed from `positions` and `market_values` alone, deliberately
+    # BEFORE the min-history filter is consulted: a trailing dividend is a
+    # record of cash already paid, not an estimate over a returns window, so
+    # every priced holding contributes - including one dropped from the
+    # return figures below for having too little history to estimate a
+    # covariance from. See `HoldingsStats.dividends`.
+    dividends = dividend_figures(
+        positions, market_values, dividends_per_share, dividend_unavailable, dividend_yields
+    )
+
     # A holding must clear BOTH bars to be measured: enough history to
     # estimate from, and a price to turn its shares into a weight.
     measured = [t for t in kept.columns if t in market_values]
@@ -381,6 +433,7 @@ def holdings_stats(
             market_values=market_values,
             total_value=total_value if market_values else None,
             excluded=excluded,
+            dividends=dividends,
         )
 
     matrix = kept[measured]
@@ -407,4 +460,5 @@ def holdings_stats(
         priced_as_of=latest_price_date(measured, as_of, db_path),
         excluded=excluded,
         unavailable_reason=None,
+        dividends=dividends,
     )

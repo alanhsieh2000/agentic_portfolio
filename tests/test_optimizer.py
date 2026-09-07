@@ -18,8 +18,18 @@ import pandas as pd
 import pytest
 from pypfopt import EfficientFrontier, expected_returns, risk_models
 
+import cvxpy as cp
+import inspect
+from pypfopt.exceptions import OptimizationError
+
 from src.config.settings import settings
+from src.optimizer.dividends import (
+    DividendFloor,
+    DividendFloorError,
+    DividendYieldUnavailableError,
+)
 from src.optimizer.portfolio import (
+    MV_RETURN_TOLERANCE,
     _covariance_input,
     allocate_shares,
     apply_min_history_rule,
@@ -418,3 +428,352 @@ def test_allocate_shares_exact_fit_leaves_zero_leftover_cash():
 def test_allocate_shares_raises_on_nan_price():
     with pytest.raises((TypeError, ValueError)):
         allocate_shares({"A": 1.0}, pd.Series({"A": float("nan")}), 1000.0)
+
+
+# ==========================================================================
+# The minimum expected-dividend constraint
+# ==========================================================================
+
+
+def _dividend_yields() -> dict[str, float]:
+    """Trailing yields for `_three_ticker_fixture`'s three tickers, chosen so
+    the constraint has something to trade against: RISKY_A is the best payer
+    at 6%, so it sets the ceiling, while STABLE - the ticker GMV wants
+    almost all of - pays only 1%. A floor above ~1.2% therefore has to pull
+    weight out of STABLE, which is what makes these tests measure something.
+    """
+    return {"STABLE": 0.01, "RISKY_A": 0.06, "RISKY_B": 0.02}
+
+
+def _dividends_per_share() -> dict[str, float]:
+    return {"STABLE": 1.0, "RISKY_A": 6.0, "RISKY_B": 2.0}
+
+
+def _floor(value: float, origin: str = "--min-dividend-yield") -> DividendFloor:
+    return DividendFloor(yield_floor=value, origin=origin)
+
+
+def test_compute_weights_signature_cannot_express_a_dividend_floor():
+    """`compute_weights` feeds `src/flow/backtest.py`, whose published
+    52-month figures must not move. Leaving its signature alone makes "the
+    backtest cannot acquire a dividend floor" a property of the type system
+    rather than a promise in a docstring.
+    """
+    assert list(inspect.signature(compute_weights).parameters) == [
+        "returns_matrix",
+        "objective",
+        "target_annual_return",
+    ]
+
+
+@pytest.mark.parametrize("objective", ["GMV", "MV", "MSR"])
+def test_compute_weights_and_stats_without_a_floor_reproduces_the_unconstrained_weights(objective):
+    """The regression guard. Supplying yields must change what is REPORTED
+    and nothing about what is SOLVED, so the report can be unconditional
+    without making the optimizer conditional.
+    """
+    df = _three_ticker_fixture()
+    baseline = compute_weights_and_stats(df, objective, target_annual_return=0.05)
+    reported = compute_weights_and_stats(
+        df,
+        objective,
+        target_annual_return=0.05,
+        dividend_yields=_dividend_yields(),
+        dividends_per_share=_dividends_per_share(),
+    )
+    assert reported.weights == baseline.weights
+    assert reported.portfolio_expected_return == baseline.portfolio_expected_return
+    assert reported.dividend_yield_floor is None
+
+
+def test_supplying_yields_without_a_floor_adds_no_constraint(monkeypatch):
+    """Counted rather than asserted-empty, because `EfficientFrontier` adds
+    its own weight-bound constraints in `__init__` and `min_volatility` adds
+    the fully-invested one. What matters is that supplying yields adds
+    nothing BEYOND those.
+    """
+    counts: list[int] = []
+    original = EfficientFrontier.add_constraint
+
+    def spy(self, constraint):
+        counts.append(1)
+        return original(self, constraint)
+
+    monkeypatch.setattr(EfficientFrontier, "add_constraint", spy)
+
+    compute_weights_and_stats(_three_ticker_fixture(), "GMV")
+    without_yields = len(counts)
+
+    counts.clear()
+    compute_weights_and_stats(
+        _three_ticker_fixture(), "GMV", dividend_yields=_dividend_yields()
+    )
+    assert len(counts) == without_yields
+
+    counts.clear()
+    compute_weights_and_stats(
+        _three_ticker_fixture(),
+        "GMV",
+        dividend_floor=_floor(0.04),
+        dividend_yields=_dividend_yields(),
+    )
+    assert len(counts) == without_yields + 1
+
+
+@pytest.mark.parametrize("objective", ["GMV", "MV", "MSR"])
+def test_a_binding_dividend_floor_is_met_under_every_objective(objective):
+    df = _three_ticker_fixture()
+    stats = compute_weights_and_stats(
+        df,
+        objective,
+        target_annual_return=0.05,
+        dividend_floor=_floor(0.04),
+        dividend_yields=_dividend_yields(),
+        dividends_per_share=_dividends_per_share(),
+    )
+    assert stats.portfolio_dividend_yield >= 0.04 - 1e-6
+
+
+def test_the_dividend_floor_survives_max_sharpes_variable_substitution():
+    """The homogenization guard, and the reason
+    `_fit_efficient_frontier` writes its constraint with the floor alone on
+    one side.
+
+    `max_sharpe` solves a transformed problem in which `w = y/k` and
+    rebuilds every constraint by homogenizing it with `k`. Written as
+    `vector @ w - floor >= 0` instead, the rebuild silently produces
+    `vector @ w >= floor / k` - a different constraint, wrong under MSR
+    only, with nothing raised. Measured on this fixture with a 0.04 floor,
+    that form returns the UNCONSTRAINED MSR weights and a realized yield of
+    roughly 0.0136. This test is what catches a rewrite of that line.
+    """
+    stats = compute_weights_and_stats(
+        _three_ticker_fixture(),
+        "MSR",
+        dividend_floor=_floor(0.04),
+        dividend_yields=_dividend_yields(),
+    )
+    assert stats.portfolio_dividend_yield == pytest.approx(0.04, abs=1e-6)
+
+    unconstrained = compute_weights_and_stats(
+        _three_ticker_fixture(), "MSR", dividend_yields=_dividend_yields()
+    )
+    assert unconstrained.portfolio_dividend_yield < 0.04
+    assert stats.weights != unconstrained.weights
+
+
+def test_the_dividend_constraint_puts_the_floor_alone_on_one_side(monkeypatch):
+    """Pins the constraint's FORM structurally, not just its consequence.
+
+    Both the correct and the broken spelling build a cvxpy `Inequality`
+    whose `args[0]` is a `Constant`, so merely checking the type proves
+    nothing - the difference is that constant's VALUE, which is the floor in
+    the correct form and `0` in the broken one.
+    """
+    captured: list = []
+    original = EfficientFrontier.add_constraint
+
+    def spy(self, constraint):
+        result = original(self, constraint)
+        captured.append(self._constraints[-1])
+        return result
+
+    monkeypatch.setattr(EfficientFrontier, "add_constraint", spy)
+    compute_weights_and_stats(
+        _three_ticker_fixture(),
+        "GMV",
+        dividend_floor=_floor(0.04),
+        dividend_yields=_dividend_yields(),
+    )
+
+    # `EfficientFrontier.__init__` adds the two weight-bound constraints
+    # first, whose own constants are vectors; the dividend constraint is the
+    # one whose left-hand constant is the scalar floor.
+    scalars = [
+        c
+        for c in captured
+        if isinstance(c.args[0], cp.expressions.constants.constant.Constant)
+        and c.args[0].shape == ()
+    ]
+    assert len(scalars) == 1, [str(c) for c in captured]
+    assert float(scalars[0].args[0].value) == pytest.approx(0.04)
+
+
+def test_a_non_binding_dividend_floor_leaves_the_weights_untouched():
+    df = _three_ticker_fixture()
+    baseline = compute_weights_and_stats(df, "GMV", dividend_yields=_dividend_yields())
+    constrained = compute_weights_and_stats(
+        df,
+        "GMV",
+        dividend_floor=_floor(0.001),
+        dividend_yields=_dividend_yields(),
+    )
+    assert constrained.weights == baseline.weights
+    assert constrained.portfolio_dividend_yield > 0.001
+
+
+def test_a_floor_above_the_ceiling_is_refused_before_the_solver_runs(monkeypatch):
+    called: list[str] = []
+    monkeypatch.setattr(
+        EfficientFrontier,
+        "min_volatility",
+        lambda self: called.append("solved"),
+    )
+    with pytest.raises(DividendFloorError) as excinfo:
+        compute_weights_and_stats(
+            _three_ticker_fixture(),
+            "GMV",
+            dividend_floor=_floor(0.07),
+            dividend_yields=_dividend_yields(),
+        )
+    assert "RISKY_A at 0.0600" in str(excinfo.value)
+    assert called == []
+
+
+def test_a_solver_infeasibility_under_a_floor_is_wrapped_as_a_value_error(monkeypatch):
+    """Belt and braces. `OptimizationError` subclasses plain `Exception`, so
+    an unwrapped one would sail past `src/flow/cli.py`'s `except ValueError`
+    and destroy live mode's only snapshot.
+    """
+    def boom(self):
+        raise OptimizationError("Solver status: infeasible")
+
+    monkeypatch.setattr(EfficientFrontier, "min_volatility", boom)
+    with pytest.raises(DividendFloorError) as excinfo:
+        compute_weights_and_stats(
+            _three_ticker_fixture(),
+            "GMV",
+            dividend_floor=_floor(0.02),
+            dividend_yields=_dividend_yields(),
+        )
+    assert isinstance(excinfo.value, ValueError)
+    assert "ceiling check did not predict" in str(excinfo.value)
+
+
+def test_a_solver_infeasibility_with_no_floor_keeps_its_own_type(monkeypatch):
+    def boom(self):
+        raise OptimizationError("Solver status: infeasible")
+
+    monkeypatch.setattr(EfficientFrontier, "min_volatility", boom)
+    with pytest.raises(OptimizationError):
+        compute_weights_and_stats(_three_ticker_fixture(), "GMV")
+
+
+def test_mv_target_made_unreachable_by_a_floor_says_so_and_names_both_numbers():
+    """A floor can only shrink the feasible set, so it can only lower the
+    attainable return - and PyPortfolioOpt's own message for that names no
+    dividend at all.
+    """
+    df = _three_ticker_fixture()
+    # The target has to sit between the maximum return attainable UNDER the
+    # floor and the unconstrained maximum, or the floor is not what blocks
+    # it. Measured on this fixture: 0.1104 under a 0.0599 floor against
+    # 0.1216 unconstrained, so 0.118 is blocked only by the floor.
+    target = 0.118
+    reachable_without_floor = compute_weights_and_stats(
+        df, "MV", target_annual_return=target, dividend_yields=_dividend_yields()
+    )
+    assert reachable_without_floor.portfolio_expected_return >= target - MV_RETURN_TOLERANCE
+
+    with pytest.raises(DividendFloorError) as excinfo:
+        compute_weights_and_stats(
+            df,
+            "MV",
+            target_annual_return=target,
+            dividend_floor=_floor(0.0599),
+            dividend_yields=_dividend_yields(),
+        )
+    message = str(excinfo.value)
+    assert "0.1180" in message
+    assert "dividend floor of 0.0599" in message
+    assert "Lower --target-return" in message
+
+
+def test_a_dividend_floor_requires_yields_to_enforce_it_against():
+    with pytest.raises(ValueError, match="both or neither"):
+        compute_weights_and_stats(
+            _three_ticker_fixture(), "GMV", dividend_floor=_floor(0.02)
+        )
+
+
+def test_a_missing_yield_is_refused_under_a_floor_rather_than_read_as_zero():
+    with pytest.raises(DividendYieldUnavailableError) as excinfo:
+        compute_weights_and_stats(
+            _three_ticker_fixture(),
+            "GMV",
+            dividend_floor=_floor(0.02),
+            dividend_yields={"STABLE": 0.01, "RISKY_A": 0.06},
+        )
+    assert "RISKY_B" in str(excinfo.value)
+
+
+def test_a_missing_yield_with_no_floor_reports_its_own_denominator():
+    """`src/optimizer/holdings.py`'s rule applied to income: shrink the
+    denominator and say so, rather than withhold a correct answer about the
+    rest of the portfolio - or dilute the figure toward zero by reading an
+    unknown as a zero.
+    """
+    stats = compute_weights_and_stats(
+        _three_ticker_fixture(), "GMV", dividend_yields={"STABLE": 0.01, "RISKY_A": 0.06}
+    )
+    assert stats.dividend_yields_missing == ("RISKY_B",)
+    assert 0.0 < stats.dividend_weight_covered < 1.0
+    assert stats.portfolio_dividend_yield is not None
+
+
+def test_the_dividend_yield_vector_is_aligned_after_min_history_drops_a_ticker():
+    """`apply_min_history_rule` removes a short-history column, so the
+    ceiling is the ceiling over the SURVIVORS. A high-yielding ticker that
+    was dropped cannot carry weight and so must not raise it - and must
+    never be the ticker a refusal names.
+    """
+    df = _three_ticker_fixture()
+    df["HIGHPAY"] = [0.01] * 8 + [None] * 16
+    filtered = apply_min_history_rule(df, min_months=24)
+    assert "HIGHPAY" not in filtered.columns
+
+    yields = {**_dividend_yields(), "HIGHPAY": 0.09}
+    with pytest.raises(DividendFloorError) as excinfo:
+        compute_weights_and_stats(
+            filtered, "GMV", dividend_floor=_floor(0.07), dividend_yields=yields
+        )
+    message = str(excinfo.value)
+    assert "RISKY_A at 0.0600" in message
+    assert "HIGHPAY" not in message
+
+
+def test_the_reported_dividend_yield_comes_from_the_raw_solved_weights():
+    df = _three_ticker_fixture()
+    stats = compute_weights_and_stats(
+        df, "GMV", dividend_floor=_floor(0.04), dividend_yields=_dividend_yields()
+    )
+    # Recomputed from the rounded weights the report displays; the two agree
+    # to well beyond display precision but are not the same computation.
+    from_clean = sum(
+        stats.weights[t] * _dividend_yields()[t] for t in stats.weights
+    )
+    assert stats.portfolio_dividend_yield == pytest.approx(from_clean, abs=1e-4)
+    assert stats.portfolio_dividend_yield >= 0.04 - 1e-9
+
+
+def test_dividend_fields_are_all_none_when_dividends_were_not_consulted():
+    stats = compute_weights_and_stats(_three_ticker_fixture(), "GMV")
+    assert stats.dividend_yields is None
+    assert stats.dividends_per_share is None
+    assert stats.portfolio_dividend_yield is None
+    assert stats.dividend_yield_floor is None
+    assert stats.dividend_floor_origin is None
+    assert stats.dividend_yields_missing == ()
+
+
+def test_the_floor_and_its_origin_are_echoed_back_for_the_report():
+    stats = compute_weights_and_stats(
+        _three_ticker_fixture(),
+        "GMV",
+        dividend_floor=_floor(0.04, "--min-annual-dividend $4,000.00 USD / --value $100,000.00 USD"),
+        dividend_yields=_dividend_yields(),
+    )
+    assert stats.dividend_yield_floor == 0.04
+    assert stats.dividend_floor_origin == (
+        "--min-annual-dividend $4,000.00 USD / --value $100,000.00 USD"
+    )

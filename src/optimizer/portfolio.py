@@ -22,9 +22,20 @@ import numpy as np
 import pandas as pd
 from pypfopt import DiscreteAllocation, EfficientFrontier, expected_returns, risk_models
 from pypfopt.base_optimizer import portfolio_performance
+from pypfopt.exceptions import OptimizationError
 
 from src.config.settings import settings
 from src.dataset.fundamentals import attach_nearest_price
+from src.optimizer.dividends import (
+    DIVIDEND_BINDING_TOLERANCE,
+    DividendFloor,
+    DividendFloorError,
+    check_dividend_floor_feasible,
+    covered_dividend_yield,
+    dividend_yield_ceiling,
+    dividend_yield_vector,
+    portfolio_dividend_yield,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +327,8 @@ def _fit_efficient_frontier(
     objective: str,
     target_annual_return: float,
     risk_free_rate: float,
+    dividend_floor: DividendFloor | None = None,
+    dividend_yields: dict[str, float] | None = None,
 ) -> tuple[EfficientFrontier, pd.Series, pd.DataFrame]:
     """Estimate `mu`/`cov_matrix` from `returns_matrix` and solve `objective`,
     returning the fitted `EfficientFrontier` alongside both estimates.
@@ -344,14 +357,142 @@ def _fit_efficient_frontier(
     mu, cov_matrix = _estimate_mu_and_cov(returns_matrix)
 
     ef = EfficientFrontier(mu, cov_matrix)
-    if objective == "GMV":
-        ef.min_volatility()
-    elif objective == "MSR":
-        ef.max_sharpe(risk_free_rate=risk_free_rate)
-    else:
-        ef.efficient_return(target_return=float(target_annual_return))
+
+    yields_vector = None
+    if dividend_floor is not None:
+        if dividend_yields is None:
+            raise ValueError(
+                "a dividend_floor was given with no dividend_yields to enforce it against; "
+                "the caller must supply both or neither"
+            )
+        tickers = list(mu.index)
+        yields_vector = dividend_yield_vector(dividend_yields, tickers)
+        check_dividend_floor_feasible(dividend_floor, yields_vector, tickers)
+
+        vector, floor = yields_vector, float(dividend_floor.yield_floor)
+        # Added BEFORE the objective call, and that is not a style choice:
+        # `min_volatility`, `efficient_return` and `max_sharpe` each append
+        # `sum(w) == 1` and then SOLVE, and `add_constraint` refuses once a
+        # problem has been built.
+        #
+        # The FORM of this line is load-bearing. `max_sharpe` solves a
+        # transformed problem in which `w = y/k`, and it rebuilds every
+        # existing constraint by homogenizing it with `k`: for an
+        # `Inequality` whose `args[0]` is a cvxpy `Constant`, it emits
+        # `args[1] >= args[0] * k`. Written with the floor ALONE on one
+        # side, cvxpy builds `Inequality(floor, vector @ w)`, so `args[0]`
+        # is the Constant `floor` and this becomes `vector @ y >= floor * k`
+        # - dividing through by `k > 0` recovers `vector @ w >= floor`.
+        # Correct.
+        #
+        # Written instead as `vector @ w - floor >= 0`, cvxpy builds
+        # `Inequality(0, vector @ w - floor)`, whose `args[0]` is the
+        # Constant `0.0` - so it homogenizes without complaint into
+        # `vector @ y - floor >= 0`, i.e. `vector @ w >= floor / k`. That is
+        # a DIFFERENT constraint, it is wrong under MSR only, and nothing
+        # raises. Measured on a three-ticker pool with a 0.04 floor: the
+        # correct form solves to a realized yield of 0.0400, the subtracted
+        # form to 0.0136 - the unconstrained MSR answer, floor entirely
+        # ignored. Do not rewrite this line.
+        ef.add_constraint(lambda w: vector @ w >= floor)
+
+    try:
+        if objective == "GMV":
+            ef.min_volatility()
+        elif objective == "MSR":
+            ef.max_sharpe(risk_free_rate=risk_free_rate)
+        else:
+            ef.efficient_return(target_return=float(target_annual_return))
+    except OptimizationError as e:
+        # `pypfopt.exceptions.OptimizationError` subclasses plain
+        # `Exception`, so left alone it would sail straight past
+        # `src/flow/cli.py`'s `except ValueError` and take live mode's only
+        # snapshot with it. Wrapped ONLY when a floor was actually asked
+        # for: an infeasibility with no dividend constraint in play is not
+        # this feature's to explain and must keep its own type.
+        if dividend_floor is None:
+            raise
+        raise _dividend_infeasibility(
+            dividend_floor, objective, yields_vector, list(mu.index), e
+        ) from e
+    except ValueError as e:
+        if dividend_floor is None or objective != "MV" or "maximum possible return" not in str(e):
+            raise
+        raise _dividend_blocked_target(dividend_floor, ef, target_annual_return) from e
 
     return ef, mu, cov_matrix
+
+
+def _dividend_infeasibility(
+    floor: DividendFloor,
+    objective: str,
+    vector,
+    tickers: list[str],
+    cause: Exception,
+) -> DividendFloorError:
+    """The belt-and-braces wrap around a solver infeasibility.
+
+    `check_dividend_floor_feasible` should have caught every unreachable
+    floor before the solver was asked, so arriving here means the solver
+    disagreed with the ceiling arithmetic - a numerically marginal floor, or
+    some interaction this project has not met yet. The message says exactly
+    that rather than implying the pre-check was consulted and agreed, because
+    a refusal that misdescribes its own cause sends the reader looking in the
+    wrong place.
+    """
+    ticker, ceiling = dividend_yield_ceiling(vector, tickers)
+    return DividendFloorError(
+        f"{floor.origin}'s dividend floor of {floor.yield_floor:.4f} left the {objective} "
+        f"optimization with no feasible portfolio, which the ceiling check did not predict: "
+        f"the highest-yielding candidate is {ticker} at {ceiling:.4f}, so a floor at or below "
+        f"that should have been reachable. Lower the floor and try again. Solver said: {cause}"
+    )
+
+
+def _dividend_blocked_target(
+    floor: DividendFloor, ef: EfficientFrontier, target_annual_return: float
+) -> DividendFloorError:
+    """Re-word `efficient_return`'s own `ValueError` to name the dividend
+    floor, which its message does not.
+
+    `efficient_return` computes its return ceiling as
+    `self.deepcopy()._max_return()`, and that deepcopy INCLUDES the dividend
+    constraint - so the ceiling is correctly the highest return reachable
+    subject to the floor, and a `--target-return` that was fine yesterday can
+    become unreachable today purely because income was demanded. That is a
+    true and useful thing to tell somebody; "target_return must be lower than
+    the maximum possible return" is neither, since it names no dividend at
+    all and reads as though the target itself were absurd.
+
+    This is not an edge case. A floor shrinks the feasible set, so it can
+    only lower the attainable return - measured on a three-ticker pool, a
+    floor of 0.030 pulled the maximum attainable annual return from 0.1400
+    down to 0.0925, well below this project's default 0.12 target.
+
+    The ceiling is read off `_max_return_value`, which `efficient_return`
+    populates before it raises. That is a private attribute, so it is read
+    defensively and the message degrades to a version without the number
+    rather than raising a second time from inside an error path.
+    """
+    reachable = getattr(ef, "_max_return_value", None)
+    detail = (
+        f"the highest annual return any portfolio meeting that floor can reach is "
+        f"{float(reachable):.4f}, because "
+        if reachable is not None
+        else "this happens because "
+    )
+    remedy = (
+        f"Lower --target-return to at most {float(reachable):.4f}, lower the dividend floor, "
+        "or switch to GMV or MSR."
+        if reachable is not None
+        else "Lower --target-return, lower the dividend floor, or switch to GMV or MSR."
+    )
+    return DividendFloorError(
+        f"a target annual return of {float(target_annual_return):.4f} is unreachable once "
+        f"{floor.origin}'s dividend floor of {floor.yield_floor:.4f} is applied: {detail}"
+        "the floor forces weight into the higher-yielding candidates, which are not the "
+        f"highest-returning ones. {remedy}"
+    )
 
 
 def compute_weights(
@@ -421,6 +562,67 @@ class PortfolioStats(NamedTuple):
     returns_window_start: date
     returns_window_end: date
     returns_window_months: int
+    dividend_yields: dict[str, float] | None = None
+    dividends_per_share: dict[str, float] | None = None
+    portfolio_dividend_yield: float | None = None
+    dividend_yield_floor: float | None = None
+    dividend_floor_origin: str | None = None
+    dividend_yields_missing: tuple[str, ...] = ()
+    dividend_weight_covered: float | None = None
+
+
+def _dividend_stats_fields(
+    ef: EfficientFrontier,
+    mu: pd.Series,
+    weights: dict[str, float],
+    dividend_floor: DividendFloor | None,
+    dividend_yields: dict[str, float] | None,
+    dividends_per_share: dict[str, float] | None,
+) -> dict[str, object]:
+    """The dividend half of a `PortfolioStats`, computed in exactly one
+    place so the reported figure and the enforced constraint cannot drift
+    apart.
+
+    `portfolio_dividend_yield` is computed from `ef.weights`, the RAW solved
+    vector, whenever every considered ticker has a known yield - not from the
+    rounded `clean_weights` dict. That mirrors what `portfolio_performance`
+    already does for the return/volatility/Sharpe triplet, and here it
+    matters for a sharper reason: the constraint was enforced on the raw
+    vector, so a floor that binds exactly could print as `0.0299` against a
+    `0.0300` floor purely from `clean_weights`' 5-decimal rounding, and look
+    violated when it is not.
+
+    When some ticker's yield is unknown - only possible with no floor in
+    force, since `dividend_yield_vector` refuses to build a constraint over
+    an unknown - the figure falls back to `covered_dividend_yield` over the
+    cleaned weights, and `dividend_weight_covered` records the share of
+    weight it actually describes so the report can print its own honest
+    denominator instead of one bent to look complete.
+    """
+    if dividend_yields is None:
+        return {}
+
+    tickers = list(mu.index)
+    missing = tuple(sorted(t for t in tickers if t not in dividend_yields))
+
+    fields: dict[str, object] = {
+        "dividend_yields": {t: float(v) for t, v in dividend_yields.items()},
+        "dividends_per_share": dict(dividends_per_share or {}),
+        "dividend_yields_missing": missing,
+        "dividend_yield_floor": None if dividend_floor is None else float(dividend_floor.yield_floor),
+        "dividend_floor_origin": None if dividend_floor is None else dividend_floor.origin,
+    }
+
+    if not missing:
+        vector = dividend_yield_vector(dividend_yields, tickers)
+        fields["portfolio_dividend_yield"] = portfolio_dividend_yield(ef.weights, vector)
+        fields["dividend_weight_covered"] = 1.0
+        return fields
+
+    yield_value, covered, _ = covered_dividend_yield(weights, dividend_yields)
+    fields["portfolio_dividend_yield"] = yield_value
+    fields["dividend_weight_covered"] = covered
+    return fields
 
 
 def compute_weights_and_stats(
@@ -428,6 +630,10 @@ def compute_weights_and_stats(
     objective: str,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
+    *,
+    dividend_floor: DividendFloor | None = None,
+    dividend_yields: dict[str, float] | None = None,
+    dividends_per_share: dict[str, float] | None = None,
 ) -> PortfolioStats:
     """`compute_weights`'s result plus the estimates behind it, for a caller
     that reports why a portfolio looks the way it does rather than only what
@@ -456,12 +662,23 @@ def compute_weights_and_stats(
     is why a holding printed as 0.0000 can still be reflected in them.
     """
     ef, mu, cov_matrix = _fit_efficient_frontier(
-        returns_matrix, objective, target_annual_return, risk_free_rate
+        returns_matrix,
+        objective,
+        target_annual_return,
+        risk_free_rate,
+        dividend_floor=dividend_floor,
+        dividend_yields=dividend_yields,
     )
     weights = dict(ef.clean_weights())
 
     if objective == "MV":
         _validate_efficient_return_result(weights, ef, target_annual_return)
+
+    dividend_fields = _dividend_stats_fields(
+        ef, mu, weights, dividend_floor, dividend_yields, dividends_per_share
+    )
+    if dividend_floor is not None:
+        _validate_dividend_floor_result(dividend_fields, dividend_floor)
 
     expected_returns, volatility = _per_ticker_figures(mu, cov_matrix)
     portfolio_return, portfolio_volatility, sharpe = ef.portfolio_performance(risk_free_rate=risk_free_rate)
@@ -480,7 +697,41 @@ def compute_weights_and_stats(
         returns_window_start=window_index.min().date(),
         returns_window_end=window_index.max().date(),
         returns_window_months=len(window_index),
+        **dividend_fields,
     )
+
+
+def _validate_dividend_floor_result(
+    dividend_fields: dict[str, object], floor: DividendFloor
+) -> None:
+    """Positively verify that a solved portfolio actually meets the floor it
+    was constrained by, rather than assuming the solver's silence means
+    success.
+
+    The same discipline `_validate_efficient_return_result` applies to MV's
+    target return, and warranted by the same history: PyPortfolioOpt can
+    return weights that quietly fail a constraint it appeared to accept - the
+    `max_sharpe` homogenization trap documented in `_fit_efficient_frontier`
+    does exactly that, and this check is what would catch it if that line
+    were ever rewritten.
+
+    Deliberately ONE-SIDED (`>= floor`, not "close to" `floor`), for the
+    reason `_validate_efficient_return_result` spells out for returns: the
+    constraint is an inequality, so whenever the unconstrained optimum
+    already clears the floor, the floor is non-binding and a realized yield
+    legitimately sits ABOVE it. Only a yield meaningfully BELOW the floor
+    indicates a real problem.
+    """
+    realized = dividend_fields.get("portfolio_dividend_yield")
+    if realized is None:
+        return
+    if float(realized) < float(floor.yield_floor) - DIVIDEND_BINDING_TOLERANCE:
+        raise DividendFloorError(
+            f"the solved portfolio's dividend yield {float(realized):.6f} is below the floor "
+            f"{float(floor.yield_floor):.6f} asked for by {floor.origin} (tolerance "
+            f"{DIVIDEND_BINDING_TOLERANCE}); the dividend constraint did not reach the solver "
+            "correctly - see _fit_efficient_frontier on max_sharpe's constraint homogenization."
+        )
 
 
 def _per_ticker_figures(

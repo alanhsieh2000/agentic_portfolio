@@ -30,12 +30,14 @@ from src.flow.cli import (
     _run_edit_loop,
     _run_user_provided_confirm_loop,
     _settle_benchmark,
+    _settle_dividend_floor,
     format_benchmark,
     main,
     print_weights_and_allocation,
 )
 from src.config.settings import settings
 from src.optimizer.benchmark import BenchmarkSource, BenchmarkStats
+from src.optimizer.dividends import DividendFloor, DividendFloorError
 from src.flow.backtest import compute_sharpe_ratio
 from src.flow.rate_memory import (
     DEFAULT_RATES_PATH,
@@ -401,6 +403,25 @@ def _stats(**overrides) -> PortfolioStats:
     return PortfolioStats(**{**fields, **overrides})
 
 
+
+def _render(stats, allocation=None, objective="GMV", currency="USD", portfolio_value=None) -> str:
+    """`print_weights_and_allocation` captured as a string, so a test can
+    assert on the lines it printed.
+    """
+    import io
+    import contextlib
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        print_weights_and_allocation(
+            stats,
+            allocation if allocation is not None else ({}, 0.0),
+            objective,
+            currency,
+            portfolio_value=portfolio_value,
+        )
+    return buffer.getvalue()
+
 @pytest.fixture
 def stub_optimizer(monkeypatch):
     """`_run_edit_loop` recomputes weights after every accepted edit; that
@@ -577,7 +598,8 @@ def test_run_edit_loop_an_unoptimizable_edit_is_reverted_instead_of_ending_the_s
     calls: list[float] = []
 
     def fake_optimizer(
-        candidates, objective, value, rebalance_date, db_path, target_annual_return=0.12, risk_free_rate=0.02
+        candidates, objective, value, rebalance_date, db_path, target_annual_return=0.12,
+        risk_free_rate=0.02, dividend_floor=None,
     ):
         calls.append(target_annual_return)
         if target_annual_return > 0.5:
@@ -594,7 +616,7 @@ def test_run_edit_loop_an_unoptimizable_edit_is_reverted_instead_of_ending_the_s
 
     out = capsys.readouterr().out
     assert "Cannot optimize that edit" in out
-    assert "Keeping the previous candidates, objective, and target return." in out
+    assert "Keeping the previous candidates, objective, target return, and dividend floor." in out
     assert calls == [0.99, 0.10]
 
 
@@ -1895,3 +1917,313 @@ def test_an_add_that_refuses_everything_does_not_forget_the_override(monkeypatch
     # the first, rather than SPY establishing a USD pool.
     assert out.count("but this pool is JPY.") == 2
     assert "this pool is None" not in out
+
+
+# ==========================================================================
+# Dividend reporting and the [d]ividend edit-loop option
+# ==========================================================================
+
+
+def _dividend_stats(**overrides) -> PortfolioStats:
+    """A `PortfolioStats` carrying dividend figures for a two-ticker pool,
+    with T the payer at 3.97% and GROWTH a confirmed non-payer.
+    """
+    fields = {
+        "weights": {"T": 0.7, "GROWTH": 0.3},
+        "expected_returns": {"T": 0.08, "GROWTH": 0.19},
+        "volatility": {"T": 0.20, "GROWTH": 0.26},
+        "dividend_yields": {"T": 0.0397, "GROWTH": 0.0},
+        "dividends_per_share": {"T": 1.11, "GROWTH": 0.0},
+        "portfolio_dividend_yield": 0.02779,
+        "dividend_weight_covered": 1.0,
+    }
+    return _stats(**{**fields, **overrides})
+
+
+def test_print_weights_and_allocation_reports_the_dividend_figures():
+    out = _render(_dividend_stats(), portfolio_value=100000.0)
+    assert "Dividend yield / annual income (trailing 12 months):" in out
+    assert "T: yield=0.0397" in out
+    assert "Portfolio dividend yield: 0.0278" in out
+    assert "Annual dividend income: $2,779.00 USD (on --value $100,000.00 USD)" in out
+
+
+def test_print_weights_and_allocation_names_a_non_payer_separately_from_missing_data():
+    """The distinction the whole feature turns on: a confirmed non-payer
+    prints a real zero and says so, while a ticker with no data prints n/a.
+    """
+    out = _render(_dividend_stats(), portfolio_value=100000.0)
+    assert "GROWTH: yield=0.0000  $0.00 USD  (pays no dividend)" in out
+
+    missing = _dividend_stats(
+        dividend_yields={"T": 0.0397},
+        dividends_per_share={"T": 1.11},
+        dividend_yields_missing=("GROWTH",),
+        dividend_weight_covered=0.7,
+    )
+    out = _render(missing, portfolio_value=100000.0)
+    assert "GROWTH: yield n/a - no trailing dividend data" in out
+    assert "GROWTH: yield=0.0000" not in out
+
+
+def test_print_weights_and_allocation_states_the_covered_weight_when_a_yield_is_missing():
+    missing = _dividend_stats(
+        dividend_yields={"T": 0.0397},
+        dividends_per_share={"T": 1.11},
+        dividend_yields_missing=("GROWTH",),
+        dividend_weight_covered=0.7,
+    )
+    out = _render(missing, portfolio_value=100000.0)
+    assert "covers 0.7000 of the weight; GROWTH has no trailing dividend data" in out
+
+
+def test_print_weights_and_allocation_omits_the_coverage_line_when_every_yield_is_known():
+    out = _render(_dividend_stats(), portfolio_value=100000.0)
+    assert "of the weight" not in out
+
+
+def test_print_weights_and_allocation_prints_the_dividend_floor_line_with_no_floor():
+    """The house convention: a line's presence never depends on how the run
+    was invoked, so the floor line appears even when none was asked for.
+    """
+    out = _render(_dividend_stats(), portfolio_value=100000.0)
+    assert (
+        "Minimum dividend yield: n/a (no floor was asked for; use "
+        "--min-annual-dividend or --min-dividend-yield)"
+    ) in out
+
+
+def test_print_weights_and_allocation_says_whether_the_dividend_floor_binds():
+    binding = _dividend_stats(
+        dividend_yield_floor=0.02779, dividend_floor_origin="--min-dividend-yield"
+    )
+    out = _render(binding, portfolio_value=100000.0)
+    assert "- binding, the portfolio sits on the floor" in out
+
+    slack = _dividend_stats(
+        dividend_yield_floor=0.02, dividend_floor_origin="--min-dividend-yield"
+    )
+    out = _render(slack, portfolio_value=100000.0)
+    assert "- not binding, the portfolio clears it by 0.0078 unaided" in out
+
+
+def test_print_weights_and_allocation_names_the_flag_the_floor_came_from():
+    origin = "--min-annual-dividend $3,000.00 USD / --value $100,000.00 USD"
+    out = _render(
+        _dividend_stats(dividend_yield_floor=0.03, dividend_floor_origin=origin),
+        portfolio_value=100000.0,
+    )
+    assert f"Minimum dividend yield: 0.0300 ({origin})" in out
+
+
+def test_print_weights_and_allocation_reports_dividends_at_the_allocated_share_counts():
+    """Deliberately a different figure from the portfolio yield above it -
+    whole shares plus leftover cash cannot buy continuous weights exactly.
+    """
+    out = _render(
+        _dividend_stats(), allocation=({"T": 2500, "GROWTH": 100}, 214.87),
+        portfolio_value=100000.0,
+    )
+    assert "Annual dividends at these share counts: $2,775.00 USD" in out
+    assert "(a 0.0278 yield on --value $100,000.00 USD)" in out
+
+
+def test_print_weights_and_allocation_says_so_when_an_allocated_ticker_has_no_per_share_figure():
+    stats = _dividend_stats(dividends_per_share={"T": 1.11})
+    out = _render(stats, allocation=({"T": 2500, "GROWTH": 100}, 0.0), portfolio_value=100000.0)
+    assert (
+        "Annual dividends at these share counts: n/a - no trailing "
+        "dividends-per-share for GROWTH"
+    ) in out
+
+
+def test_print_weights_and_allocation_says_dividends_were_not_consulted_when_they_were_not():
+    out = _render(_stats(weights={"T": 1.0}, expected_returns={"T": 0.08}, volatility={"T": 0.2}))
+    assert (
+        "Dividend yield / annual income (trailing 12 months): n/a - dividend data "
+        "was not consulted for this run"
+    ) in out
+
+
+def test_run_edit_loop_prompt_offers_the_dividend_option(monkeypatch, stub_optimizer, capsys):
+    prompts: list[str] = []
+
+    def record(prompt=""):
+        prompts.append(prompt)
+        return "f"
+
+    monkeypatch.setattr("builtins.input", record)
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+    assert "[d]ividend" in prompts[0]
+
+
+@pytest.mark.parametrize(
+    "typed,expected_yield,expects_cash_note",
+    [
+        ("3000", 0.03, True),
+        ("3%", 0.03, False),
+        ("0.03", 0.03, False),
+    ],
+)
+def test_run_edit_loop_dividend_option_reads_each_accepted_shape(
+    monkeypatch, stub_optimizer, capsys, typed, expected_yield, expects_cash_note
+):
+    """One prompt accepts both units the flags accept, separated by
+    magnitude, with the reading echoed back so the inference can be checked.
+    """
+    _script(monkeypatch, "d", typed, "f")
+    _run_edit_loop(["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb")
+
+    floor = stub_optimizer.call_args.kwargs["dividend_floor"]
+    assert floor.yield_floor == pytest.approx(expected_yield)
+    out = capsys.readouterr().out
+    assert f"Read as a {expected_yield:.4f} minimum portfolio dividend yield" in out
+    assert ("on --value $100,000.00 USD" in out) is expects_cash_note
+
+
+def test_run_edit_loop_dividend_option_clears_the_floor(monkeypatch, stub_optimizer, capsys):
+    _script(monkeypatch, "d", "none", "f")
+    _run_edit_loop(
+        ["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb",
+        dividend_floor=DividendFloor(0.03, "--min-dividend-yield"),
+    )
+    assert stub_optimizer.call_args.kwargs["dividend_floor"] is None
+    assert "Dividend floor cleared." in capsys.readouterr().out
+
+
+def test_run_edit_loop_dividend_option_reads_zero_as_clearing_the_floor(
+    monkeypatch, stub_optimizer
+):
+    _script(monkeypatch, "d", "0", "f")
+    _run_edit_loop(
+        ["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb",
+        dividend_floor=DividendFloor(0.03, "--min-dividend-yield"),
+    )
+    assert stub_optimizer.call_args.kwargs["dividend_floor"] is None
+
+
+def test_run_edit_loop_dividend_option_blank_input_skips_the_recompute(
+    monkeypatch, stub_optimizer
+):
+    _script(monkeypatch, "d", "", "f")
+    _run_edit_loop(["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb")
+    assert stub_optimizer.call_count == 0
+
+
+def test_run_edit_loop_dividend_option_retyping_the_same_floor_skips_the_recompute(
+    monkeypatch, stub_optimizer
+):
+    _script(monkeypatch, "d", "0.03", "f")
+    _run_edit_loop(
+        ["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb",
+        dividend_floor=DividendFloor(
+            0.03, "[d]ividend, this session only", None, 100000.0, "USD"
+        ),
+    )
+    assert stub_optimizer.call_count == 0
+
+
+def test_run_edit_loop_dividend_option_unparseable_input_keeps_the_floor(
+    monkeypatch, stub_optimizer, capsys
+):
+    _script(monkeypatch, "d", "lots", "f")
+    _run_edit_loop(
+        ["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb",
+        dividend_floor=DividendFloor(0.03, "--min-dividend-yield"),
+    )
+    assert stub_optimizer.call_count == 0
+    assert "Unrecognized minimum dividend 'lots'" in capsys.readouterr().out
+
+
+def test_run_edit_loop_dividend_option_refuses_a_mistyped_percentage(
+    monkeypatch, stub_optimizer, capsys
+):
+    _script(monkeypatch, "d", "0.5", "f")
+    _run_edit_loop(["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb")
+    assert stub_optimizer.call_count == 0
+    assert "3% is 0.03" in capsys.readouterr().out
+
+
+def test_run_edit_loop_an_unreachable_dividend_floor_reverts_instead_of_ending_the_session(
+    monkeypatch, capsys
+):
+    """The edit loop holds live mode's only snapshot open, so an unreachable
+    floor must be a rejected edit rather than a crash - which is why
+    `DividendFloorError` subclasses `ValueError`.
+    """
+    seen: list = []
+
+    def fake_optimizer(
+        candidates, objective, value, rebalance_date, db_path, target_annual_return=0.12,
+        risk_free_rate=0.02, dividend_floor=None,
+    ):
+        seen.append(dividend_floor)
+        if dividend_floor is not None and dividend_floor.yield_floor > 0.1:
+            raise DividendFloorError("the highest-yielding candidate is T at 0.0397")
+        return _dividend_stats(), ({}, 0.0)
+
+    monkeypatch.setattr("src.flow.cli.compute_weights_and_allocation", fake_optimizer)
+    monkeypatch.setattr("src.flow.cli.print_weights_and_allocation", lambda *a, **k: None)
+    # A floor the VALIDATOR accepts (it is under MAX_DIVIDEND_YIELD) but this
+    # pool cannot reach, then an unrelated edit whose recompute shows what
+    # actually survived the revert. A floor the validator would refuse never
+    # reaches the optimizer at all, which is a different path - see
+    # `test_run_edit_loop_dividend_option_refuses_a_mistyped_percentage`.
+    _script(monkeypatch, "d", "0.2", "o", "MSR", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb",
+        dividend_floor=DividendFloor(0.02, "--min-dividend-yield"),
+    )
+
+    out = capsys.readouterr().out
+    assert "Cannot optimize that edit: the highest-yielding candidate is T at 0.0397" in out
+    assert "Keeping the previous candidates, objective, target return, and dividend floor." in out
+    # The rejected 0.2 was replaced by the original 0.02, not left in place.
+    assert [f.yield_floor for f in seen] == [0.2, 0.02]
+
+
+def test_run_edit_loop_carries_the_dividend_floor_into_an_unrelated_recompute(
+    monkeypatch, stub_optimizer
+):
+    _script(monkeypatch, "o", "MSR", "f")
+    _run_edit_loop(
+        ["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb",
+        dividend_floor=DividendFloor(0.03, "--min-dividend-yield"),
+    )
+    assert stub_optimizer.call_args.kwargs["dividend_floor"].yield_floor == 0.03
+
+
+def test_settle_dividend_floor_divides_a_cash_amount_by_value():
+    floor = _settle_dividend_floor(3000.0, None, 100000.0, "USD")
+    assert floor.yield_floor == pytest.approx(0.03)
+    assert floor.cash_floor == 3000.0
+    assert floor.origin == (
+        "--min-annual-dividend $3,000.00 USD / --value $100,000.00 USD"
+    )
+
+
+def test_settle_dividend_floor_passes_a_yield_through_naming_its_flag():
+    floor = _settle_dividend_floor(None, 0.03, 100000.0, "USD")
+    assert floor.yield_floor == 0.03
+    assert floor.origin == "--min-dividend-yield"
+    assert floor.cash_floor is None
+
+
+def test_settle_dividend_floor_is_none_when_neither_flag_was_given():
+    assert _settle_dividend_floor(None, None, 100000.0, "USD") is None
+
+
+def test_settle_dividend_floor_keeps_an_explicit_zero_as_a_floor():
+    """A scripted `--min-dividend-yield 0` is a deliberate no-op somebody
+    typed, and a different thing from no floor at all - so the report prints
+    it as a floor.
+    """
+    floor = _settle_dividend_floor(None, 0.0, 100000.0, "USD")
+    assert floor is not None
+    assert floor.yield_floor == 0.0
+
+
+def test_settle_dividend_floor_refuses_both_flags_rather_than_reconciling_them():
+    with pytest.raises(ValueError, match="two spellings of one"):
+        _settle_dividend_floor(3000.0, 0.03, 100000.0, "USD")

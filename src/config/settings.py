@@ -1,8 +1,9 @@
 """Single source of truth for every environment-configurable runtime value
 in this project: the DuckDB path, fetch/rebalance date windows, batch
 sizes, rate-limit pause seconds, HTTP timeouts, the book-equity reporting
-lag, the transaction cost and risk-free rate used by Backtest Mode Stage 2,
-the LLM model name, and the `SEC_UA`/Anthropic environment variables.
+lag, the trailing dividend-yield window, the transaction cost and risk-free
+rate used by Backtest Mode Stage 2, the LLM model name, and the
+`SEC_UA`/Anthropic environment variables.
 
 `transaction_cost_bps` and `risk_free_rate` are consumed by
 `plans/06_interactive_flow.md`'s backtest runner (not yet implemented as
@@ -57,6 +58,12 @@ class Settings(BaseSettings):
     yfinance_fundamentals_pause_seconds: float = 0.25
 
     book_equity_lag_months: int = 3
+
+    dividend_lookback_months: int = 12
+    """Trailing window for a per-ticker dividend yield: the per-share
+    dividends with an ex-date in this many months before the as-of date,
+    divided by the latest price. 12 is the trailing-twelve-month
+    convention; override with DIVIDEND_LOOKBACK_MONTHS."""
 
     transaction_cost_bps: float = 10.0
     risk_free_rate: float = 0.02

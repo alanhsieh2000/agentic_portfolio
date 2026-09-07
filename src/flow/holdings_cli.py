@@ -80,7 +80,12 @@ import sys
 
 from src.config.settings import settings
 from src.dataset.ticker_currency import DEFAULT_CURRENCY, partition_by_currency
-from src.flow.cli import format_holdings_delta, parse_date, print_user_portfolio
+from src.flow.cli import (
+    format_dividend_delta,
+    format_holdings_delta,
+    parse_date,
+    print_user_portfolio,
+)
 from src.flow.rate_memory import (
     DEFAULT_RATES_PATH,
     load_risk_free_rate,
@@ -627,6 +632,12 @@ def _run_whatif(args) -> None:
                 window_origin=window_note(),
             )
             print(format_holdings_delta(baseline, hypothetical))
+            # A separate line, and one that stays informative across a
+            # [w]indow change: a trailing dividend is a record of cash
+            # paid, not an estimate over a returns window, so the two
+            # sides remain comparable where the Sharpe delta above does
+            # not. See `format_dividend_delta`.
+            print(format_dividend_delta(baseline, hypothetical))
 
 
 def _whatif_set(

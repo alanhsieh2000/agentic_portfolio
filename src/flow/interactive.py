@@ -82,6 +82,8 @@ from src.optimizer.holdings import (
     stored_month_counts,
     unavailable_holdings,
 )
+from src.dataset.dividends import load_dividend_figures
+from src.optimizer.dividends import DividendFloor, DividendFloorError
 from src.optimizer.portfolio import (
     DEFAULT_TARGET_ANNUAL_RETURN,
     PortfolioStats,
@@ -484,10 +486,51 @@ def _holdings_stats_excluding(
             excluded=excluded,
         )
 
+    # Loaded here, the one choke point every holdings path passes through
+    # (`prepare_holdings`, `measure_holdings`, and so every
+    # `portfolio-holdings` subcommand plus `uv run portfolio`'s holdings
+    # block), so no caller can forget to consult dividends and silently
+    # report a portfolio as paying nothing. Read from `db_path`, which for
+    # these callers is the holdings cache or a throwaway session database -
+    # never the shared universe cache.
+    dividends_per_share, dividend_unavailable, dividend_yields = _load_holdings_dividends(
+        list(measurable), rebalance_date, db_path
+    )
+
     stats = holdings_stats(
-        measurable, rebalance_date, db_path, currency, risk_free_rate, lookback_months
+        measurable,
+        rebalance_date,
+        db_path,
+        currency,
+        risk_free_rate,
+        lookback_months,
+        dividends_per_share=dividends_per_share,
+        dividend_unavailable=dividend_unavailable,
+        dividend_yields=dividend_yields,
     )
     return stats._replace(positions=positions, excluded={**excluded, **stats.excluded})
+
+
+def _load_holdings_dividends(
+    tickers: list[str], as_of: date, db_path: str
+) -> tuple[dict[str, float], dict[str, str], dict[str, float]]:
+    """`(dividends_per_share, unavailable, yields)` for `tickers` from
+    `db_path`, degrading to "nothing known" rather than raising.
+
+    A holdings report must never fail because of dividends. The rest of it -
+    what is owned, what it is worth, its return and Sharpe ratio - is useful
+    on its own, and `prepare_holdings` promises never to raise; letting a
+    missing `dividends` table or a corrupt row take the whole report down
+    would trade a complete answer for no answer. A failure is logged and
+    every ticker is reported as having no dividend data, which the report
+    then says out loud.
+    """
+    try:
+        yields, per_share, unavailable = load_dividend_figures(tickers, as_of, db_path)
+        return per_share, unavailable, yields
+    except Exception as e:  # noqa: BLE001 - duckdb raises assorted types here
+        logger.warning("could not read dividend history for %s: %s", sorted(tickers), e)
+        return {}, {t: f"dividend history could not be read: {e}" for t in tickers}, {}
 
 
 def _resolve_holdings(
@@ -637,6 +680,52 @@ def prepare_holdings(
         )
 
 
+def _explain_dropped_dividend_payers(
+    error: DividendFloorError,
+    candidates: list[str],
+    returns_matrix: pd.DataFrame,
+    as_of: date,
+    db_path: str,
+) -> DividendFloorError:
+    """`error` with a sentence appended naming any candidate that out-yields
+    the reported ceiling but never reached the optimizer.
+
+    `apply_min_history_rule` drops a ticker with under 24 months of history,
+    or with an internal gap, from the returns matrix - so the ceiling the
+    optimizer computed is the ceiling over the SURVIVORS. That is correct,
+    because a dropped ticker cannot carry weight and therefore cannot lift
+    the portfolio's yield, but it reads as a contradiction: the user can see
+    a 6.2% payer sitting in their own candidate list while the message says
+    the best available is 2.2%.
+
+    The optimizer cannot explain this, because it only ever sees the
+    filtered matrix. This layer knows both lists, so the sentence belongs
+    here. Re-raised as the same type so `src/flow/cli.py`'s `except
+    ValueError` still reverts the edit rather than ending the session.
+
+    Any failure to build the explanation is swallowed: this runs inside an
+    error path, and losing the original refusal to a secondary problem while
+    trying to make it friendlier would be strictly worse than the bare
+    message.
+    """
+    try:
+        dropped = [t for t in candidates if t not in returns_matrix.columns]
+        if not dropped:
+            return error
+        yields, _per_share, _unavailable = load_dividend_figures(dropped, as_of, db_path)
+        if not yields:
+            return error
+        best = max(yields, key=lambda t: yields[t])
+        return DividendFloorError(
+            f"{error} Note that {best} yields {yields[best]:.4f} but is not in the returns "
+            "matrix at all - the minimum-history rule dropped it for having under 24 month(s) "
+            "of monthly returns, so it cannot carry weight and does not raise the ceiling."
+        )
+    except Exception:  # noqa: BLE001 - never lose the original refusal
+        logger.debug("could not explain dropped dividend payers", exc_info=True)
+        return error
+
+
 def compute_weights_and_allocation(
     candidates: list[str],
     objective: str,
@@ -645,6 +734,7 @@ def compute_weights_and_allocation(
     db_path: str,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
+    dividend_floor: DividendFloor | None = None,
 ) -> tuple[PortfolioStats, tuple[dict[str, int], float]]:
     """`compute_weights_and_stats` + `allocate_shares` for `candidates` as of
     `rebalance_date`, reading `db_path` - the part of the pipeline an
@@ -668,7 +758,28 @@ def compute_weights_and_allocation(
     """
     _require_single_currency(candidates, db_path)
     returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
-    stats = compute_weights_and_stats(returns_matrix, objective, target_annual_return, risk_free_rate)
+
+    # Re-read on every call, deliberately never carried by the edit loop:
+    # `[a]dd` can introduce a ticker nobody has a yield for yet, and a loop
+    # holding a static dict would either refuse that ticker forever or
+    # silently omit it from the income figures.
+    yields, per_share, _unavailable = load_dividend_figures(
+        list(returns_matrix.columns), rebalance_date, db_path
+    )
+    try:
+        stats = compute_weights_and_stats(
+            returns_matrix,
+            objective,
+            target_annual_return,
+            risk_free_rate,
+            dividend_floor=dividend_floor,
+            dividend_yields=yields,
+            dividends_per_share=per_share,
+        )
+    except DividendFloorError as e:
+        raise _explain_dropped_dividend_payers(
+            e, candidates, returns_matrix, rebalance_date, db_path
+        ) from e
 
     latest_prices = load_latest_prices(list(stats.weights.keys()), as_of=rebalance_date, db_path=db_path)
     allocation = allocate_shares(stats.weights, latest_prices, portfolio_value)
@@ -751,6 +862,7 @@ def run_pipeline_against(
     risk_free_rate: float = settings.risk_free_rate,
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkSource | None = None,
+    dividend_floor: DividendFloor | None = None,
 ) -> dict:
     """The shared sequence behind both modes: `run_scan` (LLM-S/LLM-F/the
     scanner) followed by the optimizer (`compute_weights_and_allocation`)
@@ -777,6 +889,7 @@ def run_pipeline_against(
     stats, allocation = compute_weights_and_allocation(
         scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date, db_path,
         target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
+        dividend_floor=dividend_floor,
     )
 
     return {

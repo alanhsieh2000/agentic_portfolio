@@ -45,11 +45,16 @@ def _patch_chain(monkeypatch, fetch_result, currencies: dict[str, str] | None = 
     `currencies` maps ticker -> the RAW code yfinance would report (so pass
     `'GBp'` to exercise the pence path). Defaulting it to `'USD'` for every
     fetched ticker keeps the pre-currency tests reading unchanged.
+
+    The dividend build is patched too - it performs network I/O of its own -
+    and its spy is reachable as `_patch_chain.dividends` rather than through
+    the return tuple, so every existing caller's unpacking keeps working.
     """
     fetch_spy = MagicMock(return_value=fetch_result) if fetch_result is not None else MagicMock()
     upsert_prices_spy = MagicMock()
     upsert_currency_spy = MagicMock()
     build_returns_spy = MagicMock()
+    build_dividends_spy = MagicMock()
 
     def fake_currencies(tickers, *args, **kwargs):
         if currencies is None:
@@ -62,6 +67,10 @@ def _patch_chain(monkeypatch, fetch_result, currencies: dict[str, str] | None = 
     monkeypatch.setattr("src.dataset.ticker_ingestion.upsert_ticker_currency_table", upsert_currency_spy)
     monkeypatch.setattr("src.dataset.ticker_ingestion.build_returns_for_tickers", build_returns_spy)
     monkeypatch.setattr("src.dataset.ticker_ingestion.fetch_ticker_currencies", currency_spy)
+    monkeypatch.setattr(
+        "src.dataset.ticker_ingestion.build_dividends_for_tickers", build_dividends_spy
+    )
+    _patch_chain.dividends = build_dividends_spy
     return fetch_spy, upsert_prices_spy, build_returns_spy, currency_spy, upsert_currency_spy
 
 
@@ -117,7 +126,10 @@ def test_validate_and_ingest_tickers_dedupes_and_upcases_before_fetching(monkeyp
 
 def test_validate_and_ingest_tickers_ingests_prices_then_currency_then_returns(monkeypatch):
     """`build_returns_for_tickers` reads the `prices` table, so the price
-    upsert must already have happened when it runs.
+    upsert must already have happened when it runs. The dividend build is
+    ordered too - and patched, because it performs network I/O of its own and
+    `upsert_dividends_tables` would otherwise create the relative
+    `fixture.duckdb` this test names right in the repository root.
     """
     call_order: list[str] = []
     monkeypatch.setattr(
@@ -139,10 +151,17 @@ def test_validate_and_ingest_tickers_ingests_prices_then_currency_then_returns(m
         "src.dataset.ticker_ingestion.build_returns_for_tickers",
         lambda *a, **k: call_order.append("returns"),
     )
+    monkeypatch.setattr(
+        "src.dataset.ticker_ingestion.build_dividends_for_tickers",
+        lambda *a, **k: call_order.append("dividends"),
+    )
 
     validate_and_ingest_tickers(["AAPL"], AS_OF, "fixture.duckdb")
 
-    assert call_order == ["prices", "currency", "returns"]
+    # Dividends land last: they need the multipliers the currency lookup
+    # produced, and committing them after the prices they will be divided by
+    # keeps the pair consistent.
+    assert call_order == ["prices", "currency", "returns", "dividends"]
 
 
 def test_validate_and_ingest_tickers_handles_symbol_collision_gracefully(monkeypatch):
@@ -247,3 +266,63 @@ def test_validate_and_ingest_tickers_rejects_a_ticker_whose_currency_is_unknown(
     assert valid == ["AAPL"]
     assert invalid["MYSTERY"] == CURRENCY_LOOKUP_FAILED_REASON
     assert currencies == {"AAPL": "USD"}
+
+
+def test_validate_and_ingest_tickers_ingests_dividends_on_the_same_pass(monkeypatch):
+    """Without this, a `user_provided` pool would have prices in its session
+    snapshot and no yields, so `--min-annual-dividend` would be refused for
+    every ticker the person typed - correctly, since a missing yield is not a
+    zero yield, but uselessly.
+    """
+    _patch_chain(monkeypatch, (_prices("AAPL"), _unresolved()))
+    validate_and_ingest_tickers(["AAPL"], AS_OF, "session.duckdb")
+
+    spy = _patch_chain.dividends
+    assert spy.call_count == 1
+    assert spy.call_args.args[0] == ["AAPL"]
+    assert spy.call_args.args[1] == "session.duckdb"
+
+
+def test_validate_and_ingest_tickers_scales_a_pence_dividend_like_its_prices(monkeypatch):
+    """The dividend and the price must share a unit, or a 3% yielder reports
+    at 310% and satisfies any floor a person could type.
+    """
+    _patch_chain(
+        monkeypatch,
+        (_prices("BARC.L"), _unresolved()),
+        currencies={"BARC.L": "GBp"},
+    )
+    validate_and_ingest_tickers(["BARC.L"], AS_OF, "session.duckdb")
+
+    multipliers = _patch_chain.dividends.call_args.kwargs["multipliers"]
+    assert multipliers["BARC.L"] == pytest.approx(0.01)
+
+
+def test_validate_and_ingest_tickers_records_no_dividend_coverage_for_an_invalid_ticker(
+    monkeypatch,
+):
+    _patch_chain(
+        monkeypatch,
+        (_prices("AAPL"), _unresolved("BOGUS")),
+        currencies={"AAPL": "USD"},
+    )
+    validate_and_ingest_tickers(["AAPL", "BOGUS"], AS_OF, "session.duckdb")
+
+    assert "BOGUS" in _patch_chain.dividends.call_args.kwargs["unresolved"]
+
+
+def test_validate_and_ingest_tickers_survives_a_failing_dividend_fetch(monkeypatch):
+    """A dividend gap is reported by name downstream; raising here would
+    throw away the prices, returns and currencies already stored and reject
+    a perfectly good ticker.
+    """
+    _patch_chain(monkeypatch, (_prices("AAPL"), _unresolved()))
+    monkeypatch.setattr(
+        "src.dataset.ticker_ingestion.build_dividends_for_tickers",
+        MagicMock(side_effect=RuntimeError("yfinance exploded")),
+    )
+    valid, invalid, currencies = validate_and_ingest_tickers(
+        ["AAPL"], AS_OF, "session.duckdb"
+    )
+    assert valid == ["AAPL"]
+    assert invalid == {}
