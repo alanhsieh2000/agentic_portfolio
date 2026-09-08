@@ -66,7 +66,30 @@ A **candidate pool** is the list of tickers a person has assembled to build a po
 - [x] (2026-09-06 02:35Z) Documented in `README.md`'s Live Mode section.
 - [x] (2026-09-06 02:40Z) Full suite: 360 passed, up from 290 before this plan.
 - [x] (2026-09-06 03:05Z) Recorded the shrinkage asymmetry — the one thing the ddof fix does NOT make symmetric — in `src/optimizer/benchmark.py`'s module docstring, in `annualized_return_and_volatility`'s docstring, in this plan's Surprises & Discoveries and Decision Log, and as `tests/test_benchmark.py::test_the_benchmark_is_not_shrunk_against_a_pool`. The report deliberately stays silent about it.
-- [ ] Not done, deliberately out of scope: a `DEFAULT_BENCHMARKS` entry for any currency other than USD (the person is asked instead — see the Decision Log); a benchmark for `src/flow/backtest.py`'s 52-month backtest scoring, which reports a realized Sharpe ratio from a different computation entirely; and any currency conversion, which remains unimplemented across the whole project.
+- [ ] Not done, deliberately out of scope, and re-verified still absent on 2026-09-08 — this
+      item is a standing scope record, not a task, so it stays unchecked:
+      a `DEFAULT_BENCHMARKS` entry for any currency other than USD (the person is asked
+      instead — see the Decision Log; `src/optimizer/benchmark.py:82` is still
+      `{"USD": "SPY"}` and `resolve_benchmark_ticker` still falls through
+      override → saved → that table → `None`). **What changed under this half since it was
+      written:** the item describes a benchmark the person is merely asked about, from when a
+      benchmark was reporting-only — "never a holding", three figures printed beside the
+      portfolio's. Since the revision note at the end of this plan (2026-09-08) a benchmark
+      also CHOOSES the objective, so a currency absent from that table whose pool never named
+      one now gets a different optimization rather than a thinner report:
+      `objective_from_benchmark` returns MV at the benchmark's own expected return when one is
+      measurable, and `DEFAULT_OBJECTIVE_WITHOUT_BENCHMARK` — GMV — when none is. It is not
+      hidden (`src/flow/cli.py` prints `Objective: GMV (no benchmark for this pool)`), and the
+      Decision Log's argument against compiling in an index nobody chose still governs; the
+      exclusion is simply worth more than it was.
+      A benchmark for `src/flow/backtest.py`'s 52-month backtest scoring, which reports a
+      realized Sharpe ratio from a different computation entirely (still true: that module
+      imports nothing from `src/optimizer/benchmark.py`, fixes its objective at
+      `run_full_backtest("MSR")`, and prints the paper's hardcoded
+      `Paper-reported S&P 500 baseline Sharpe, 2020-2024: 0.6324`).
+      And any currency conversion, which remains unimplemented across the whole project
+      (`src/flow/interactive.py` still refuses a pool that mixes currencies, and `README.md`
+      says in two places that no conversion exists).
 
 
 ## Surprises & Discoveries
