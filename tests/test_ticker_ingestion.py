@@ -326,3 +326,22 @@ def test_validate_and_ingest_tickers_survives_a_failing_dividend_fetch(monkeypat
     )
     assert valid == ["AAPL"]
     assert invalid == {}
+
+
+def test_validate_and_ingest_tickers_skips_dividends_when_the_fetch_is_declined(monkeypatch):
+    """`--no-dividend-fetch` should not pay for data the report is about to
+    ignore, and a `user_provided` run reaches its dividends through here
+    rather than through the snapshot build.
+    """
+    _patch_chain(monkeypatch, (_prices("AAPL"), _unresolved()))
+
+    valid, invalid, currencies = validate_and_ingest_tickers(
+        ["AAPL"], AS_OF, "session.duckdb", fetch_dividends=False
+    )
+
+    _patch_chain.dividends.assert_not_called()
+    # Everything else still happened: the ticker is usable, just without
+    # dividend figures.
+    assert valid == ["AAPL"]
+    assert invalid == {}
+    assert currencies == {"AAPL": "USD"}

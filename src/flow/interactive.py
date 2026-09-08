@@ -110,7 +110,12 @@ def _is_backtest_date(rebalance_date: date) -> bool:
 
 
 @contextmanager
-def open_pipeline_session(rebalance_date: date, selection: str, db_path: str = "data/portfolio.duckdb"):
+def open_pipeline_session(
+    rebalance_date: date,
+    selection: str,
+    db_path: str = "data/portfolio.duckdb",
+    allow_dividend_fetch: bool = True,
+):
     """Yield `(effective_db_path, mode)` for `rebalance_date`: `(db_path,
     "backtest")` unchanged for a date within the stored window, or a
     freshly-built live snapshot's temp path and `"live"` for any other
@@ -125,10 +130,21 @@ def open_pipeline_session(rebalance_date: date, selection: str, db_path: str = "
     shared historical cache) must never be mutated. Its snapshot is cheap -
     see `build_live_snapshot`, which builds empty tables for it rather than
     fetching anything.
+
+    `allow_dividend_fetch=False` (from `--no-dividend-fetch`) is passed on to
+    the snapshot builder, which then skips its dividend pass over the whole
+    membership universe. It has no effect on the `db_path` branch: that
+    reads the shared historical cache, whose dividends are a build artifact
+    of `uv run portfolio-build-dividends` and are never fetched during a run.
     """
     mode = "backtest" if _is_backtest_date(rebalance_date) else "live"
     if selection == "user_provided" or mode == "live":
-        with build_live_snapshot(rebalance_date, selection, source_db_path=db_path) as session_db_path:
+        with build_live_snapshot(
+            rebalance_date,
+            selection,
+            source_db_path=db_path,
+            allow_dividend_fetch=allow_dividend_fetch,
+        ) as session_db_path:
             yield session_db_path, mode
     else:
         yield db_path, mode
@@ -740,6 +756,7 @@ def compute_weights_and_allocation(
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,
     dividend_floor: DividendFloor | None = None,
+    consult_dividends: bool = True,
 ) -> tuple[PortfolioStats, tuple[dict[str, int], float]]:
     """`compute_weights_and_stats` + `allocate_shares` for `candidates` as of
     `rebalance_date`, reading `db_path` - the part of the pipeline an
@@ -768,9 +785,17 @@ def compute_weights_and_allocation(
     # `[a]dd` can introduce a ticker nobody has a yield for yet, and a loop
     # holding a static dict would either refuse that ticker forever or
     # silently omit it from the income figures.
-    yields, per_share, _unavailable, splits_in_window = load_dividend_figures(
-        list(returns_matrix.columns), rebalance_date, db_path
-    )
+    # `None` rather than `{}` when nobody asked: the report words those two
+    # states differently, and it should. `None` means "dividends were not
+    # consulted for this run", which is what `--no-dividend-fetch` means;
+    # `{}` means "consulted, nothing found", which names each ticker's
+    # reason and would imply a failed lookup that never happened.
+    if consult_dividends:
+        yields, per_share, _unavailable, splits_in_window = load_dividend_figures(
+            list(returns_matrix.columns), rebalance_date, db_path
+        )
+    else:
+        yields = per_share = splits_in_window = None
     try:
         stats = compute_weights_and_stats(
             returns_matrix,
@@ -869,6 +894,7 @@ def run_pipeline_against(
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkSource | None = None,
     dividend_floor: DividendFloor | None = None,
+    consult_dividends: bool = True,
 ) -> dict:
     """The shared sequence behind both modes: `run_scan` (LLM-S/LLM-F/the
     scanner) followed by the optimizer (`compute_weights_and_allocation`)
@@ -895,7 +921,7 @@ def run_pipeline_against(
     stats, allocation = compute_weights_and_allocation(
         scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date, db_path,
         target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
-        dividend_floor=dividend_floor,
+        dividend_floor=dividend_floor, consult_dividends=consult_dividends,
     )
 
     return {

@@ -43,6 +43,7 @@ import pandas as pd
 
 from src.dataset.fundamentals import build_factors
 from src.dataset.membership import apply_changes_asof, compute_rebalance_dates, fetch_and_normalize_membership, write_membership_table
+from src.dataset.dividends import build_dividends
 from src.dataset.momentum import build_momentum_factors
 from src.dataset.prices import build_price_history
 from src.dataset.returns import build_returns
@@ -74,9 +75,13 @@ def _causal_masking_date(as_of: date) -> date:
 
 def _init_empty_price_and_returns_tables(db_path: str) -> None:
     """Create the empty `prices`/`unresolved_tickers`/`returns`/
-    `ticker_currency` tables the `user_provided` selection incrementally
-    fills in via `src/dataset/ticker_ingestion.py`'s upserts, with the same
-    column shapes plans 1's and 11's own writers use. No `sp500_membership`
+    `ticker_currency`/`dividends`/`splits`/`dividend_coverage` tables the
+    `user_provided` selection incrementally fills in via
+    `src/dataset/ticker_ingestion.py`'s upserts, with the same column shapes
+    plans 1's, 11's and 15's own writers use. The three corporate-action
+    tables are created here for completeness rather than out of necessity -
+    the upserts use CREATE TABLE IF NOT EXISTS - but omitting them from this
+    list would suggest dividends are not part of this flow, which they are. No `sp500_membership`
     table: nothing in that selection's downstream path reads one, since its
     candidates come from the user rather than from index membership.
     """
@@ -88,6 +93,11 @@ def _init_empty_price_and_returns_tables(db_path: str) -> None:
         con.execute(
             "CREATE TABLE ticker_currency "
             "(ticker VARCHAR, currency VARCHAR, quoted_currency VARCHAR, price_multiplier DOUBLE)"
+        )
+        con.execute("CREATE TABLE dividends (ex_date DATE, ticker VARCHAR, amount DOUBLE)")
+        con.execute("CREATE TABLE splits (ex_date DATE, ticker VARCHAR, ratio DOUBLE)")
+        con.execute(
+            "CREATE TABLE dividend_coverage (ticker VARCHAR, fetch_start DATE, fetch_end DATE)"
         )
     finally:
         con.close()
@@ -151,7 +161,9 @@ def build_scratch_snapshot(prefix: str = "benchmark_snapshot_"):
 
 
 @contextmanager
-def build_live_snapshot(as_of: date, selection: str, source_db_path: str):
+def build_live_snapshot(
+    as_of: date, selection: str, source_db_path: str, allow_dividend_fetch: bool = True
+):
     """Build a throwaway DuckDB file covering `as_of` (always) and,
     when `selection` needs LLM-S, the causal-masking December date too -
     membership for each via a fresh Wikipedia fetch, `LOOKBACK_MONTHS`
@@ -163,6 +175,15 @@ def build_live_snapshot(as_of: date, selection: str, source_db_path: str):
     disk" - a temp file that exists only for this call's duration and is
     always removed before returning satisfies that intent even though it
     technically touches disk briefly).
+
+    Dividend history is built too, for the same screened selections, so the
+    report's income figures and any `--min-annual-dividend` floor work in
+    live mode. Without it a live screened run had no `dividends` table at
+    all and named every candidate's dividend data as unavailable - the
+    default selection's most visible gap, since the snapshot is discarded
+    at the end of the run and no build command could reach it.
+    `allow_dividend_fetch=False` (from `--no-dividend-fetch`) skips that one
+    pass, which is a pass over the whole membership universe.
 
     `selection="user_provided"` skips every fetch and build above, delegating
     to `build_scratch_snapshot` for a file holding only the empty
@@ -202,6 +223,28 @@ def build_live_snapshot(as_of: date, selection: str, source_db_path: str):
             build_momentum_factors(db_path=temp_db_path)
 
         build_returns(db_path=temp_db_path, start=price_start, end=as_of.isoformat())
+
+        if allow_dividend_fetch:
+            # After `build_price_history`, never before: `build_dividends`
+            # takes its ticker universe from the `prices` table it is
+            # pointed at, and raises if that table is empty.
+            #
+            # A failure here is logged and swallowed. This snapshot has by
+            # now cost minutes of fetching - membership, prices, factors,
+            # momentum, returns - and discarding all of it because a
+            # dividend batch was rate-limited would be a poor trade. The
+            # report already names a ticker whose dividend data is missing
+            # rather than assuming it pays nothing, so the degradation is
+            # visible and honest. Same discipline
+            # `src/dataset/ticker_ingestion.py` applies to its own dividend
+            # call.
+            try:
+                build_dividends(db_path=temp_db_path, start=price_start, end=price_end)
+            except Exception as e:  # noqa: BLE001 - yfinance and duckdb raise assorted types
+                logger.warning(
+                    "live snapshot: could not build dividend history (%s); the report will "
+                    "name each candidate's dividend data as unavailable", e
+                )
 
         if selection in ("llm_f_only", "llm_s_and_f"):
             _copy_news_archive(source_db_path, temp_db_path)

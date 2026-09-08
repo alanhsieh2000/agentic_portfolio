@@ -1167,3 +1167,59 @@ reads it, so the price a share is bought at, valued at and has its dividend divi
 number by construction rather than by coincidence. The duplication this plan introduced was
 itself part of how the column choice drifted, which is worth remembering the next time a
 convenient local copy looks harmless.
+
+
+## Revision Note: dividends reach live mode, and `--no-dividend-fetch` (2026-09-08)
+
+A user asked when `uv run portfolio-build-dividends` is meant to be run, noted that backtest
+mode does not need dividend data, and asked why `uv run portfolio` does not use the
+`--refresh-holdings` flag that `uv run portfolio-holdings` does. Tracing it found a gap this
+plan had left, and the gap was in the mode people use most.
+
+Where candidate-pool dividends came from:
+
+    date         selection                reads                        dividends?
+    historical   screened (llm_s_only..)  data/portfolio.duckdb (RO)   only if built
+    historical   user_provided            throwaway snapshot           automatic
+    today        screened (the DEFAULT)   live snapshot                NONE, EVER
+    today        user_provided            throwaway snapshot           automatic
+
+This plan wired `validate_and_ingest_tickers` and never `build_live_snapshot`, so a live run
+with a screened selection - `uv run portfolio --date today`, the default `--selection
+llm_s_only` - produced a snapshot with prices, factors, momentum and returns but no
+`dividends` table at all. Every candidate reported its dividend data as unavailable and
+`--min-annual-dividend` was refused for the whole pool, and no flag or build command could
+reach it, because the snapshot is created and discarded inside the run. That was the third
+end-to-end run in this feature's history to find what the unit tests could not, and the
+lesson is the same each time: this project has four mode/selection paths through the session
+database, and wiring one of them is not wiring the feature.
+
+`build_live_snapshot` now calls `build_dividends` after `build_returns` for the screened
+selections, which needed no new plumbing because that function already derives its ticker
+universe from the `prices` table it is pointed at. Its failure is logged and swallowed: by
+that point the snapshot has cost minutes of fetching membership, prices, factors, momentum
+and returns, and discarding all of it over a rate-limited dividend batch would be a poor
+trade, while the report already names a ticker whose dividend data is missing rather than
+assuming it pays nothing.
+
+`--no-dividend-fetch` was added alongside `--no-benchmark-fetch`, because that build is one
+more pass over ~500 tickers on every live run. It does two things, and doing both is what
+makes it honest: it skips the snapshot's dividend build (and
+`validate_and_ingest_tickers`' per-ticker fetch), and it skips CONSULTING dividends, so the
+report reaches the `None` "not consulted" state rather than the `{}` "consulted, nothing
+found" state that names each ticker's reason. Those two states were already modelled and
+worded differently by this plan; the flag simply had to land on the right one. Combining it
+with either floor flag is a contradiction and is refused at `parser.error` time before any
+snapshot is paid for, and `[d]ividend` in the edit loop refuses for the same reason.
+
+On the `--refresh-holdings` question, which was reasonable and whose answer is worth writing
+down: `data/holdings.duckdb` is a CACHE of what the user owns, with a data-derived monthly
+staleness rule that `--refresh-holdings` forces. `data/portfolio.duckdb` is a BUILD ARTIFACT
+maintained by the `portfolio-build-*` family, and `uv run portfolio` is forbidden from
+mutating it, so it cannot have a refresh flag at all. Different storage, different lifecycle,
+different control - but the confusion was justified, because a third case was getting neither.
+
+`portfolio-build-dividends` is kept and now documents its own single job, in its docstring,
+in the command's output and in `README.md`: populate `data/portfolio.duckdb` for
+historical-date screened runs, run after `portfolio-build-prices`. Every other path needs
+nothing.

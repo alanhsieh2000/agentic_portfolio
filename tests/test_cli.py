@@ -15,6 +15,7 @@ is under test, `_settle_benchmark` when only `main`'s wiring is - since
 resolving one for real reaches yfinance too.
 """
 
+import contextlib
 import json
 from contextlib import contextmanager
 from datetime import date
@@ -601,7 +602,7 @@ def test_run_edit_loop_an_unoptimizable_edit_is_reverted_instead_of_ending_the_s
 
     def fake_optimizer(
         candidates, objective, value, rebalance_date, db_path, target_annual_return=0.12,
-        risk_free_rate=0.02, dividend_floor=None,
+        risk_free_rate=0.02, dividend_floor=None, **_kwargs,
     ):
         calls.append(target_annual_return)
         if target_annual_return > 0.5:
@@ -774,7 +775,7 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
     """
 
     @contextmanager
-    def fake_session(rebalance_date, selection, db_path):
+    def fake_session(rebalance_date, selection, db_path, **_kwargs):
         yield "session.duckdb", "backtest"
 
     pipeline_spy = MagicMock(return_value={"scan_detail": {"candidates": ["AAPL"]}})
@@ -2157,7 +2158,7 @@ def test_run_edit_loop_an_unreachable_dividend_floor_reverts_instead_of_ending_t
 
     def fake_optimizer(
         candidates, objective, value, rebalance_date, db_path, target_annual_return=0.12,
-        risk_free_rate=0.02, dividend_floor=None,
+        risk_free_rate=0.02, dividend_floor=None, **_kwargs,
     ):
         seen.append(dividend_floor)
         if dividend_floor is not None and dividend_floor.yield_floor > 0.1:
@@ -2375,3 +2376,99 @@ def test_format_stale_share_counts_is_silent_without_a_splits_table(tmp_path):
 
 def test_format_stale_share_counts_is_silent_for_an_empty_portfolio(tmp_path):
     assert format_stale_share_counts(str(tmp_path / "p.json"), "JPY", {}, "x.duckdb") is None
+
+
+# ==========================================================================
+# --no-dividend-fetch
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "floor_flag", [["--min-dividend-yield", "0.02"], ["--min-annual-dividend", "3000"]]
+)
+def test_main_refuses_no_dividend_fetch_alongside_a_dividend_floor(
+    monkeypatch, capsys, floor_flag
+):
+    """A contradiction: the floor is enforced against the very data the flag
+    declines to fetch. Refused at the door, before a live snapshot is paid
+    for - the optimizer's own complaint would name every ticker in the pool,
+    which is a poor way to learn you typed two incompatible flags.
+    """
+    session_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "today", "--objective", "GMV", "--value", "100000",
+         "--no-dividend-fetch", *floor_flag],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--no-dividend-fetch cannot be combined with" in err
+    session_spy.assert_not_called()
+
+
+def test_main_threads_the_dividend_fetch_choice_into_the_session_and_the_pipeline(monkeypatch):
+    seen: dict = {}
+
+    @contextlib.contextmanager
+    def session(rebalance_date, selection, db_path, allow_dividend_fetch=True):
+        seen["allow_fetch"] = allow_dividend_fetch
+        yield "session.duckdb", "live"
+
+    def pipeline(*_a, **kwargs):
+        seen["consult"] = kwargs.get("consult_dividends")
+        return {
+            "mode": "live", "rebalance_date": REBALANCE_DATE, "objective": "GMV",
+            "selection": "llm_s_only", "rule": None,
+            "scan_detail": {"branch": "b", "buy_s_size": 1, "buy_f_size": 0,
+                            "intersection_size": 0, "union_size": 1, "candidates": ["AAA"]},
+            "weights": {"AAA": 1.0}, "allocation": ({}, 0.0), "stats": _stats(),
+            "currency": "USD", "benchmark": None,
+        }
+
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr("src.flow.cli.run_pipeline_against", pipeline)
+    monkeypatch.setattr("src.flow.cli.print_pipeline_result", lambda *a, **k: None)
+    monkeypatch.setattr("src.flow.cli._run_edit_loop", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "today", "--objective", "GMV", "--value", "100000",
+         "--no-dividend-fetch", "--no-holdings", "--benchmark", "none"],
+    )
+
+    main()
+
+    assert seen["allow_fetch"] is False
+    assert seen["consult"] is False
+
+
+def test_print_weights_and_allocation_says_dividends_were_not_consulted_when_skipped():
+    """`--no-dividend-fetch` must land on the "not consulted" wording, not on
+    the "consulted, nothing found" wording that names each ticker's reason -
+    it never looked, so implying a failed lookup would be false.
+    """
+    out = _render(_stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1},
+                         volatility={"AAA": 0.2}))
+    assert "n/a - dividend data was not consulted for this run" in out
+    assert "no trailing dividend data" not in out
+
+
+def test_run_edit_loop_refuses_a_dividend_floor_when_dividends_were_not_consulted(
+    monkeypatch, stub_optimizer, capsys
+):
+    """The same contradiction reached from inside the loop rather than from
+    the command line.
+    """
+    _script(monkeypatch, "d", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 100000.0, REBALANCE_DATE, "session.duckdb", consult_dividends=False
+    )
+
+    out = capsys.readouterr().out
+    assert "A dividend floor needs dividend data" in out
+    assert stub_optimizer.call_count == 0

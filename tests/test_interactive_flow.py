@@ -49,7 +49,11 @@ from src.flow.interactive import (
     run_scan,
     validate_and_edit_candidates,
 )
-from src.flow.live import build_scratch_snapshot
+from src.flow.live import (
+    _init_empty_price_and_returns_tables,
+    build_live_snapshot,
+    build_scratch_snapshot,
+)
 from src.optimizer.benchmark import BENCHMARK_MIN_MONTHS, BenchmarkSource
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
@@ -270,7 +274,7 @@ def test_run_pipeline_stats_agree_with_the_flat_weights_key(tmp_path, monkeypatc
     _build_fixture_db(db_path, include_factors=False)
 
     @contextmanager
-    def fake_snapshot(as_of, selection, source_db_path):
+    def fake_snapshot(as_of, selection, source_db_path, **_kwargs):
         yield db_path
 
     monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
@@ -289,7 +293,7 @@ def test_run_pipeline_target_return_defaults_and_can_be_overridden(tmp_path, mon
     _build_fixture_db(db_path, include_factors=False)
 
     @contextmanager
-    def fake_snapshot(as_of, selection, source_db_path):
+    def fake_snapshot(as_of, selection, source_db_path, **_kwargs):
         yield db_path
 
     monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
@@ -358,7 +362,7 @@ def test_open_pipeline_session_user_provided_uses_a_snapshot_even_for_a_backtest
     """
 
     @contextmanager
-    def fake_snapshot(as_of, selection, source_db_path):
+    def fake_snapshot(as_of, selection, source_db_path, **_kwargs):
         yield "/tmp/fake-snapshot.duckdb"
 
     snapshot_spy = MagicMock(side_effect=fake_snapshot)
@@ -475,7 +479,7 @@ def test_run_pipeline_user_provided_optimizes_the_supplied_candidates(tmp_path, 
     _build_fixture_db(db_path, include_factors=False)
 
     @contextmanager
-    def fake_snapshot(as_of, selection, source_db_path):
+    def fake_snapshot(as_of, selection, source_db_path, **_kwargs):
         yield db_path
 
     generate_rule_spy = MagicMock()
@@ -777,3 +781,171 @@ def test_build_scratch_snapshot_yields_empty_tables_and_always_deletes_the_file(
             raise RuntimeError("boom")
 
     assert not Path(failed_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# The live snapshot builds dividends
+# ---------------------------------------------------------------------------
+
+
+def _stats_stub():
+    """Minimal stand-in for a `PortfolioStats` where only `weights` is read."""
+    stub = MagicMock()
+    stub.weights = {"AAA": 1.0}
+    return stub
+
+
+def _patch_snapshot_builds(monkeypatch, dividends_raises: Exception | None = None):
+    """Patch every `build_*` call `build_live_snapshot` makes, returning the
+    dividend spy. No test here may fetch anything.
+    """
+    calls: list[str] = []
+
+    def dividends(*_a, **_k):
+        calls.append("dividends")
+        if dividends_raises is not None:
+            raise dividends_raises
+        return None
+
+    monkeypatch.setattr("src.flow.live.write_membership_table", lambda *a, **k: None)
+    monkeypatch.setattr("src.flow.live.build_price_history", lambda *a, **k: calls.append("prices"))
+    monkeypatch.setattr("src.flow.live.build_factors", lambda *a, **k: calls.append("factors"))
+    monkeypatch.setattr(
+        "src.flow.live.build_momentum_factors", lambda *a, **k: calls.append("momentum")
+    )
+    monkeypatch.setattr("src.flow.live.build_returns", lambda *a, **k: calls.append("returns"))
+    monkeypatch.setattr("src.flow.live.build_dividends", dividends)
+    monkeypatch.setattr(
+        "src.flow.live.fetch_and_normalize_membership",
+        lambda *a, **k: (pd.DataFrame({"ticker": ["AAA"], "company": ["A"]}), pd.DataFrame()),
+    )
+    monkeypatch.setattr("src.flow.live.apply_changes_asof", lambda cur, ch, d: cur)
+    # Timestamps, not dates: `_causal_masking_date` calls `.date()` on them.
+    monkeypatch.setattr(
+        "src.flow.live.compute_rebalance_dates",
+        lambda *a, **k: [pd.Timestamp("2025-12-01")],
+    )
+    return calls
+
+
+@pytest.mark.parametrize("selection", ["llm_s_only", "llm_f_only", "llm_s_and_f"])
+def test_build_live_snapshot_builds_dividends_for_every_screened_selection(
+    monkeypatch, selection
+):
+    """The gap this closed: a live screened run had no `dividends` table at
+    all, so every candidate reported its dividend data as unavailable and a
+    floor was refused for the whole pool - and no build command could reach
+    it, because the snapshot is discarded when the run ends.
+    """
+    calls = _patch_snapshot_builds(monkeypatch)
+    monkeypatch.setattr("src.flow.live._copy_news_archive", lambda *a, **k: None)
+
+    with build_live_snapshot(date(2026, 9, 8), selection, "data/portfolio.duckdb"):
+        pass
+
+    assert "dividends" in calls
+    # After the prices it reads to know which tickers to fetch.
+    assert calls.index("prices") < calls.index("dividends")
+
+
+def test_build_live_snapshot_skips_dividends_when_the_fetch_is_declined(monkeypatch):
+    calls = _patch_snapshot_builds(monkeypatch)
+
+    with build_live_snapshot(
+        date(2026, 9, 8), "llm_s_only", "data/portfolio.duckdb", allow_dividend_fetch=False
+    ):
+        pass
+
+    assert "dividends" not in calls
+    assert "prices" in calls
+
+
+def test_build_live_snapshot_survives_a_failing_dividend_build(monkeypatch):
+    """By this point the snapshot has cost minutes of fetching, so a
+    rate-limited dividend batch must not discard it. The report already
+    names a ticker whose dividend data is missing.
+    """
+    calls = _patch_snapshot_builds(monkeypatch, dividends_raises=RuntimeError("rate limited"))
+
+    with build_live_snapshot(date(2026, 9, 8), "llm_s_only", "data/portfolio.duckdb") as db_path:
+        assert db_path is not None
+
+    assert "dividends" in calls
+    assert "returns" in calls
+
+
+def test_build_live_snapshot_user_provided_never_builds_dividends(monkeypatch):
+    """That selection fetches per typed ticker through
+    `validate_and_ingest_tickers` instead, so the universe build would be
+    pure waste.
+    """
+    calls = _patch_snapshot_builds(monkeypatch)
+
+    with build_live_snapshot(date(2026, 9, 8), "user_provided", "data/portfolio.duckdb"):
+        pass
+
+    assert calls == []
+
+
+def test_init_empty_tables_creates_the_corporate_action_tables(tmp_path):
+    """`user_provided` fills these in incrementally; the upserts would
+    create them anyway, but omitting them from this list would suggest
+    dividends are not part of that flow.
+    """
+    db = str(tmp_path / "scratch.duckdb")
+    _init_empty_price_and_returns_tables(db)
+
+    con = duckdb.connect(db, read_only=True)
+    try:
+        tables = {t[0] for t in con.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()}
+    finally:
+        con.close()
+    assert {"dividends", "splits", "dividend_coverage"} <= tables
+
+
+def test_open_pipeline_session_passes_the_dividend_fetch_choice_to_the_snapshot(monkeypatch):
+    seen: dict = {}
+
+    @contextmanager
+    def snapshot_spy(as_of, selection, source_db_path, allow_dividend_fetch=True):
+        seen["allow"] = allow_dividend_fetch
+        yield "snapshot.duckdb"
+
+    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", snapshot_spy)
+
+    with open_pipeline_session(
+        date(2026, 9, 8), "llm_s_only", "data/portfolio.duckdb", allow_dividend_fetch=False
+    ):
+        pass
+
+    assert seen["allow"] is False
+
+
+def test_compute_weights_and_allocation_can_skip_consulting_dividends(monkeypatch):
+    """`None` means "not consulted", which is a different report line from
+    `{}` meaning "consulted, nothing found" - so the flag must land on the
+    first, not imply a lookup that never happened.
+    """
+    figures_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.load_dividend_figures", figures_spy)
+    stats_spy = MagicMock(return_value=_stats_stub())
+    monkeypatch.setattr("src.flow.interactive.compute_weights_and_stats", stats_spy)
+    monkeypatch.setattr("src.flow.interactive._require_single_currency", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "src.flow.interactive.load_returns_matrix",
+        lambda *a, **k: pd.DataFrame({"AAA": [0.01] * 24}),
+    )
+    monkeypatch.setattr(
+        "src.flow.interactive.load_latest_prices", lambda *a, **k: pd.Series({"AAA": 10.0})
+    )
+    monkeypatch.setattr("src.flow.interactive.allocate_shares", lambda *a, **k: ({}, 0.0))
+
+    compute_weights_and_allocation(
+        ["AAA"], "GMV", 1000.0, date(2026, 9, 8), "db.duckdb", consult_dividends=False
+    )
+
+    figures_spy.assert_not_called()
+    assert stats_spy.call_args.kwargs["dividend_yields"] is None
+    assert stats_spy.call_args.kwargs["dividends_per_share"] is None

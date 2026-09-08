@@ -936,6 +936,21 @@ def build_dividends(
     """Build the whole `dividends` table for every ticker in the `prices`
     table at `db_path`, returning the long frame that was stored.
 
+    WHEN TO RUN THIS, since it is the question the command's name does not
+    answer. Its one job is populating `data/portfolio.duckdb`, so run it
+    after `uv run portfolio-build-prices`, exactly as `-returns` and
+    `-momentum` are run. That database is read by one path only: `uv run
+    portfolio` at a HISTORICAL date with a screened selection
+    (`llm_s_only`, `llm_f_only`, `llm_s_and_f`), which reads the shared
+    cache read-only and therefore cannot fetch its own dividends.
+
+    Every other path needs nothing. A live-mode run builds dividends into
+    its own throwaway snapshot (`src/flow/live.py`'s `build_live_snapshot`,
+    which calls this function). `--selection user_provided` fetches per
+    typed ticker through `src/dataset/ticker_ingestion.py`. And the
+    holdings report maintains `data/holdings.duckdb` on its own monthly
+    staleness rule, forced by `--refresh-holdings`.
+
     The universe comes from `prices` rather than from `sp500_membership`
     because `prices` is what the optimizer can actually price and measure,
     and it already includes every ticker any earlier run ingested - a
@@ -1001,6 +1016,14 @@ def main() -> None:
     df = build_dividends()
     payers = df["ticker"].nunique() if not df.empty else 0
     print(f"Wrote {len(df)} dividend row(s) for {payers} paying ticker(s) to {settings.db_path}.")
+    # Said here because the command's name does not say it, and the answer
+    # is otherwise only findable by tracing which database each mode reads.
+    print(
+        "This is only needed for 'uv run portfolio' at a historical date with a screened "
+        "selection, which reads this database read-only. Live-mode runs build their own "
+        "dividends, --selection user_provided fetches per ticker, and the holdings report "
+        "maintains its own cache."
+    )
 
 
 if __name__ == "__main__":

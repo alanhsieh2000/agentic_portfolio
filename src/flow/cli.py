@@ -1581,6 +1581,7 @@ def _run_edit_loop(
     memory_path: str = DEFAULT_CANDIDATES_PATH,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     dividend_floor: DividendFloor | None = None,
+    consult_dividends: bool = True,
     risk_free_rate: float = settings.risk_free_rate,
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkSource | None = None,
@@ -1669,6 +1670,14 @@ def _run_edit_loop(
                     f"Target annual return for MV (default {target_annual_return}): ", target_annual_return
                 )
         elif choice in ("d", "dividend"):
+            if not consult_dividends:
+                # The same contradiction `--no-dividend-fetch` is refused
+                # for at the command line, reached the other way round.
+                print(
+                    "A dividend floor needs dividend data, and this run was started with "
+                    "--no-dividend-fetch. Restart without that flag to set one."
+                )
+                continue
             new_floor = _prompt_dividend_floor(dividend_floor, portfolio_value, currency)
             # NamedTuple equality is by value, so re-typing the same floor
             # is correctly a no-op and skips the recompute - matching
@@ -1713,7 +1722,7 @@ def _run_edit_loop(
             stats, allocation = compute_weights_and_allocation(
                 candidates, objective, portfolio_value, rebalance_date, db_path,
                 target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
-                dividend_floor=dividend_floor,
+                dividend_floor=dividend_floor, consult_dividends=consult_dividends,
             )
         except ValueError as e:
             # An edit can be individually valid and still leave the optimizer
@@ -1814,6 +1823,18 @@ def main() -> None:
              "USD); a pool in a currency with no default is asked for one. Must trade in the "
              "portfolio's own currency. For --selection user_provided, a benchmark named here "
              "is remembered with the pool.",
+    )
+    parser.add_argument(
+        "--no-dividend-fetch",
+        action="store_true",
+        help="Skip fetching dividend history and leave the dividend figures out of the "
+             "report. In live mode the session snapshot otherwise builds dividends for the "
+             "whole membership universe, which is one more pass over ~500 tickers on top of "
+             "the prices, factors, momentum and returns it already fetches. Refused "
+             "alongside --min-annual-dividend or --min-dividend-yield, which need that data "
+             "to enforce a floor. Historical-date runs read whatever "
+             "'uv run portfolio-build-dividends' put in the shared cache and never fetch, "
+             "so there this flag only suppresses the report's dividend lines.",
     )
     parser.add_argument(
         "--no-benchmark-fetch",
@@ -1936,6 +1957,19 @@ def main() -> None:
         except ValueError as e:
             parser.error(str(e))
 
+    if args.no_dividend_fetch and (
+        args.min_dividend_yield is not None or args.min_annual_dividend is not None
+    ):
+        # Refused here rather than left to the optimizer, which would raise
+        # `DividendYieldUnavailableError` naming every ticker in the pool -
+        # a poor way to discover you typed two incompatible flags, and only
+        # after a live snapshot had been fetched.
+        parser.error(
+            "--no-dividend-fetch cannot be combined with --min-annual-dividend or "
+            "--min-dividend-yield: a dividend floor is enforced against the dividend data "
+            "this flag declines to fetch. Drop the floor, or drop --no-dividend-fetch."
+        )
+
     if args.min_annual_dividend is not None:
         # Checked against --value here, but NOT converted: the conversion's
         # `origin` string needs the pool's currency, which is not settled
@@ -1953,7 +1987,12 @@ def main() -> None:
     benchmark_enabled = args.benchmark != BENCHMARK_DISABLED
     benchmark_override = args.benchmark if benchmark_enabled else None
 
-    with open_pipeline_session(rebalance_date, args.selection, args.db_path) as (session_db_path, mode):
+    with open_pipeline_session(
+        rebalance_date,
+        args.selection,
+        args.db_path,
+        allow_dividend_fetch=not args.no_dividend_fetch,
+    ) as (session_db_path, mode):
         candidates = None
         currency = DEFAULT_CURRENCY
         if args.selection == "user_provided":
@@ -2002,6 +2041,7 @@ def main() -> None:
             candidates=candidates, target_annual_return=args.target_return,
             risk_free_rate=args.risk_free_rate, currency=currency, benchmark=benchmark,
             dividend_floor=dividend_floor,
+            consult_dividends=not args.no_dividend_fetch,
         )
         print_pipeline_result(
             result, risk_free_rate_origin=resolved_rate.origin, portfolio_value=args.value
@@ -2055,6 +2095,7 @@ def main() -> None:
             selection=args.selection, memory_path=args.memory_path,
             target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
             dividend_floor=dividend_floor,
+            consult_dividends=not args.no_dividend_fetch,
             currency=currency, benchmark=benchmark,
             allow_benchmark_fetch=not args.no_benchmark_fetch,
             risk_free_rate_origin=resolved_rate.origin,

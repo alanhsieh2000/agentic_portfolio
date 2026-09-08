@@ -51,6 +51,7 @@ def validate_and_ingest_tickers(
     tickers: list[str],
     as_of: date,
     db_path: str,
+    fetch_dividends: bool = True,
 ) -> tuple[list[str], dict[str, str], dict[str, str]]:
     """Fetch `LOOKBACK_MONTHS` months of prices through `as_of` for
     `tickers`, determine each one's trading currency, merge the results
@@ -67,7 +68,9 @@ def validate_and_ingest_tickers(
 
     Dividend history is fetched on the same pass and stored in the same
     database, so a ticker somebody just typed can immediately carry a
-    minimum-dividend constraint. That fetch is allowed to fail without
+    minimum-dividend constraint. `fetch_dividends=False` (from
+    `--no-dividend-fetch`) skips it, so a run that has declined to report
+    dividend figures does not pay for data it will not read. That fetch is allowed to fail without
     failing the ingestion: a missing yield is reported by name where it
     matters, and losing an otherwise-good ticker over it would be worse.
 
@@ -136,6 +139,10 @@ def validate_and_ingest_tickers(
     # name downstream, whereas raising would turn a working ingestion into a
     # rejected ticker list and lose the prices, returns and currencies this
     # call already stored.
+    if not fetch_dividends:
+        logger.info("skipping dividend history for %s (fetch_dividends=False)", cleaned)
+        return [t for t in cleaned if t not in invalid], invalid, currencies
+
     try:
         build_dividends_for_tickers(
             cleaned,
