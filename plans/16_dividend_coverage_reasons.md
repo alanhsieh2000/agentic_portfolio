@@ -41,6 +41,8 @@ plan makes a gap legible; it does not fill one.
 - [x] (2026-09-08) Tests: 17 in `tests/test_dividends.py`, 2 in `tests/test_cli.py`, 1 in
       `tests/test_holdings_cli.py`. All hermetic - `probe` is injected everywhere, and no
       test reaches `probe_served_window` itself.
+- [x] (2026-09-08) Full suite green in one invocation: `812 passed` in 762.41s across all 21
+      test files.
 - [x] (2026-09-08) Recorded the four in `data/portfolio.duckdb` with
       `uv run portfolio-build-dividends AVB EA EQR LEG`. After it: 521 coverage rows, 4
       unresolved rows (AVB, EA, EQR, LEG), 14,589 dividend rows across 429 payers unchanged,
@@ -220,7 +222,8 @@ Run from the repository root.
     # expect: 4 files, all passed - 88 in test_dividends.py alone
 
     uv run pytest tests/test_*.py -q
-    # expect: 731 passed (709 before this work)
+    # 812 passed, 3 warnings in 762.41s - measured 2026-09-08, all 21 test files in one
+    # invocation. 20 of those 812 are the tests added here.
 
 The data step, a real network fetch, already run against `data/portfolio.duckdb`:
 
