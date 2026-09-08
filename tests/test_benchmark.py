@@ -25,10 +25,13 @@ from src.optimizer.benchmark import (
     BENCHMARK_MIN_MONTHS,
     DEFAULT_BENCHMARKS,
     BenchmarkSource,
+    BenchmarkStats,
     annualized_return_and_volatility,
     benchmark_stats_for_window,
     load_benchmark_returns,
     resolve_benchmark_ticker,
+    DEFAULT_OBJECTIVE_WITHOUT_BENCHMARK,
+    objective_from_benchmark,
 )
 from src.optimizer.portfolio import compute_weights_and_stats
 
@@ -338,3 +341,72 @@ def test_the_benchmark_is_not_shrunk_against_a_pool():
     assert in_matrix != pytest.approx(standalone, rel=1e-3), "fixture must actually provoke shrinkage"
     assert stats.annual_volatility == pytest.approx(standalone, rel=1e-12)
     assert stats.annual_volatility != pytest.approx(in_matrix, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Deriving the objective from the pool's benchmark
+# ---------------------------------------------------------------------------
+
+
+def _bench(**overrides) -> BenchmarkStats:
+    fields = {
+        "ticker": "1321.T", "currency": "JPY", "annual_return": 0.0911,
+        "annual_volatility": 0.1770, "sharpe": 1.1065, "risk_free_rate": 0.02,
+        "window_start": date(2021, 9, 1), "window_end": date(2026, 9, 1),
+        "window_months": 60, "unavailable_reason": None,
+    }
+    return BenchmarkStats(**{**fields, **overrides})
+
+
+def test_an_explicit_objective_wins_over_the_benchmark():
+    """Nothing changes for anyone already passing flags."""
+    resolved = objective_from_benchmark(_bench(), "MSR", None)
+    assert resolved.objective == "MSR"
+    assert resolved.target_annual_return is None
+    assert resolved.origin == "--objective"
+
+
+def test_an_explicit_objective_of_mv_keeps_its_own_target():
+    resolved = objective_from_benchmark(_bench(), "MV", 0.07)
+    assert (resolved.objective, resolved.target_annual_return) == ("MV", 0.07)
+
+
+def test_a_target_return_without_an_objective_implies_mv():
+    """The only reading available: no other objective consumes a target."""
+    resolved = objective_from_benchmark(_bench(), None, 0.07)
+    assert resolved.objective == "MV"
+    assert resolved.target_annual_return == pytest.approx(0.07)
+    assert "--target-return" in resolved.origin
+
+
+def test_a_measurable_benchmark_gives_mv_at_its_own_return():
+    """The point of the feature: match what the benchmark returned, at the
+    least risk that does so.
+    """
+    resolved = objective_from_benchmark(_bench(), None, None)
+    assert resolved.objective == "MV"
+    assert resolved.target_annual_return == pytest.approx(0.0911)
+    assert "1321.T" in resolved.origin
+    assert resolved.clamped_from is None
+
+
+@pytest.mark.parametrize(
+    "benchmark,expected_origin",
+    [
+        (None, "no benchmark for this pool"),
+        (
+            {"annual_return": None, "unavailable_reason": "does not trade in JPY"},
+            "benchmark unavailable: does not trade in JPY",
+        ),
+    ],
+)
+def test_no_usable_benchmark_gives_gmv_and_names_which_reason(benchmark, expected_origin):
+    """GMV is the only objective needing no external input - MV wants a
+    target and MSR a rate to beat - so it is the honest fallback. The reasons
+    are different situations and the report should say which.
+    """
+    stats = None if benchmark is None else _bench(**benchmark)
+    resolved = objective_from_benchmark(stats, None, None)
+    assert resolved.objective == DEFAULT_OBJECTIVE_WITHOUT_BENCHMARK == "GMV"
+    assert resolved.target_annual_return is None
+    assert resolved.origin == expected_origin

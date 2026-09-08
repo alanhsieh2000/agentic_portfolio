@@ -256,3 +256,37 @@ return, which is exactly what the adjusted series provides. That distinction - a
 measuring, raw for transacting - is the lasting lesson, and it was blurred here for four
 plans because every test fixture happened to price the two columns equally, so the choice was
 invisible.
+
+
+## Revision Note: --objective became optional, and a derived target is clamped (2026-09-08)
+
+This plan specified `--objective` as a required argument taking GMV, MV or MSR. It is now
+optional: left out, the objective is derived from the pool's benchmark (MV at the benchmark's
+own expected return) or GMV when there is none. See
+`plans/12_benchmark_per_candidate_pool.md`'s revision note for the reasoning; what belongs
+here is what it does to MV.
+
+A benchmark-derived target is not necessarily reachable. An equity index against a
+bond-and-preferred pool is the ordinary case, and a dividend floor lowers the ceiling
+further. Rather than refuse a default nobody typed, the target is CLAMPED to the most the
+pool can reach.
+
+The consequence is worth stating plainly, because it was measured rather than guessed.
+Minimum variance subject to a return at the maximum has exactly one feasible point - the
+maximum-return portfolio - so a clamp concentrates everything in the pool's best single
+name. On `TLT`/`VZ`/`PFF`/`PFFA`/`BOXX` against an index returning 0.1225:
+
+    MV clamped to the ceiling   VZ 1.0000                     vol 0.2254
+    GMV over the same pool      TLT/VZ/PFF/BOXX diversified   vol 0.0451
+
+Five times the volatility for two points of return, and a 5% dividend floor does not rescue
+it. That is a legitimate answer to what was asked and a poor portfolio to be handed
+silently, so the report names the clamp and prints GMV's own figures for comparison whenever
+one holding exceeds 90%. A target the user typed is never clamped - they are told it cannot
+be met, which `ResolvedObjective.origin` is what distinguishes.
+
+One implementation detail that cost a debugging cycle: clamping to `max(mu)` is REFUSED.
+`efficient_return` compares against its own `_max_return_value`, and the two differ by a
+float's width - a target of 0.0544 was rejected against a stated maximum of 0.0544. The
+clamp therefore uses the solver's own figure, carried on
+`UnreachableTargetReturnError.reachable`, scaled by `1 - CLAMP_EPSILON`.

@@ -35,6 +35,17 @@ from unittest.mock import MagicMock
 import duckdb
 import pandas as pd
 from src.optimizer.dividends import DividendFloorError
+from src.flow.interactive import (
+    CLAMP_EPSILON,
+    CONCENTRATION_THRESHOLD,
+    _concentration_note,
+    _optimize_clamping_an_unreachable_target,
+)
+from src.optimizer.benchmark import ResolvedObjective
+from src.optimizer.portfolio import (
+    UnreachableTargetReturnError,
+    compute_weights_and_stats,
+)
 import pytest
 
 from src.agents.llm_s_schema import ScreeningRule
@@ -978,6 +989,12 @@ def test_run_pipeline_against_reports_an_unsatisfiable_request_and_keeps_the_sca
         }
 
     monkeypatch.setattr("src.flow.interactive.run_scan", scan)
+    # The pipeline now loads the matrix itself, to know the window the
+    # benchmark has to be measured over.
+    monkeypatch.setattr(
+        "src.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
+    )
+    monkeypatch.setattr("src.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
     monkeypatch.setattr(
         "src.flow.interactive.compute_weights_and_allocation",
         MagicMock(side_effect=DividendFloorError("floor 0.0300 is unreachable")),
@@ -1004,6 +1021,10 @@ def test_run_pipeline_against_reports_an_unsatisfiable_request_and_keeps_the_sca
 
 def test_run_pipeline_against_marks_a_satisfiable_run_as_unsatisfiable_none(monkeypatch):
     """So a caller reads one field either way rather than probing for a key."""
+    monkeypatch.setattr(
+        "src.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
+    )
+    monkeypatch.setattr("src.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
     monkeypatch.setattr(
         "src.flow.interactive.run_scan",
         lambda *a, **k: {
@@ -1034,6 +1055,10 @@ def test_run_pipeline_against_still_raises_anything_that_is_not_unsatisfiable(mo
     keep escaping.
     """
     monkeypatch.setattr(
+        "src.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
+    )
+    monkeypatch.setattr("src.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
+    monkeypatch.setattr(
         "src.flow.interactive.run_scan",
         lambda *a, **k: {
             "rule": None, "llm_s_signals": None, "llm_f_signals": None,
@@ -1049,3 +1074,130 @@ def test_run_pipeline_against_still_raises_anything_that_is_not_unsatisfiable(mo
     with pytest.raises(ValueError) as excinfo:
         run_pipeline_against(date(2026, 9, 8), "BOGUS", 100000.0, "llm_s_only", "db.duckdb", "live")
     assert not isinstance(excinfo.value, DividendFloorError)
+
+
+# ---------------------------------------------------------------------------
+# Clamping a derived target the pool cannot reach
+# ---------------------------------------------------------------------------
+
+
+def _income_matrix() -> pd.DataFrame:
+    """Two tickers whose best expected return is well below any equity
+    index's, which is the situation a benchmark-derived target collides
+    with: a bond-and-preferred pool cannot reach what the market returned.
+    """
+    idx = pd.date_range("2021-10-01", periods=40, freq="MS", name="rebalance_date")
+    low = [0.004 + (0.002 if i % 2 == 0 else -0.002) for i in range(40)]
+    lower = [0.001 + (0.03 if i % 3 == 0 else -0.015) for i in range(40)]
+    return pd.DataFrame({"STEADY": low, "SWINGY": lower}, index=idx)
+
+
+def _resolved(target, origin="matching benchmark IDX's return"):
+    return ResolvedObjective("MV", target, origin)
+
+
+def test_a_derived_target_is_clamped_to_what_the_pool_can_reach(monkeypatch, tmp_path):
+    db = str(tmp_path / "s.duckdb")
+    matrix = _income_matrix()
+    ceiling = max(compute_weights_and_stats(matrix, "GMV").expected_returns.values())
+
+    monkeypatch.setattr("src.flow.interactive._require_single_currency", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "src.flow.interactive.load_latest_prices",
+        lambda tickers, **k: pd.Series({t: 100.0 for t in tickers}),
+    )
+    monkeypatch.setattr("src.flow.interactive.allocate_shares", lambda *a, **k: ({}, 0.0))
+    monkeypatch.setattr("src.flow.interactive.load_dividend_figures", lambda *a, **k: ({}, {}, {}, {}))
+
+    stats, _alloc, resolved = _optimize_clamping_an_unreachable_target(
+        ["STEADY", "SWINGY"], _resolved(0.90), 100000.0, date(2026, 9, 8), db,
+        risk_free_rate=0.02, dividend_floor=None, consult_dividends=False,
+        returns_matrix=matrix,
+    )
+
+    assert resolved.clamped_from == pytest.approx(0.90)
+    assert resolved.target_annual_return < ceiling
+    assert resolved.target_annual_return == pytest.approx(ceiling, rel=1e-3)
+    assert stats.portfolio_expected_return == pytest.approx(ceiling, rel=1e-3)
+
+
+def test_clamping_to_the_unscaled_ceiling_would_be_refused(monkeypatch):
+    """Why the clamp scales by `1 - CLAMP_EPSILON` rather than using the
+    ceiling directly: `efficient_return` compares against its own
+    `_max_return_value`, and a ceiling taken from `max(mu)` sits a float's
+    width above it. Measured on real data as a target of 0.0544 refused
+    against a stated maximum of 0.0544.
+    """
+    matrix = _income_matrix()
+    ceiling = max(compute_weights_and_stats(matrix, "GMV").expected_returns.values())
+
+    with pytest.raises(UnreachableTargetReturnError) as excinfo:
+        compute_weights_and_stats(matrix, "MV", target_annual_return=ceiling)
+
+    # And the solver's own figure, scaled, does solve.
+    assert excinfo.value.reachable is not None
+    compute_weights_and_stats(
+        matrix, "MV", target_annual_return=excinfo.value.reachable * (1 - CLAMP_EPSILON)
+    )
+
+
+def test_a_target_the_user_typed_is_never_clamped(monkeypatch, tmp_path):
+    """Silently moving a number somebody chose would be worse than telling
+    them it cannot be met - which `origin` is what distinguishes.
+    """
+    monkeypatch.setattr("src.flow.interactive._require_single_currency", lambda *a, **k: None)
+    monkeypatch.setattr("src.flow.interactive.load_dividend_figures", lambda *a, **k: ({}, {}, {}, {}))
+
+    with pytest.raises(UnreachableTargetReturnError):
+        _optimize_clamping_an_unreachable_target(
+            ["STEADY", "SWINGY"], _resolved(0.90, "--target-return, which only MV consumes"),
+            100000.0, date(2026, 9, 8), str(tmp_path / "s.duckdb"),
+            risk_free_rate=0.02, dividend_floor=None, consult_dividends=False,
+            returns_matrix=_income_matrix(),
+        )
+
+
+def test_the_concentration_note_fires_on_a_clamped_single_holding_result():
+    """The clamp is reachable by typing no flags at all, so a default must
+    never hand somebody one holding silently.
+    """
+    matrix = _income_matrix()
+    ceiling = max(compute_weights_and_stats(matrix, "GMV").expected_returns.values())
+    stats = compute_weights_and_stats(
+        matrix, "MV", target_annual_return=ceiling * (1 - CLAMP_EPSILON)
+    )
+
+    note = _concentration_note(ResolvedObjective('MV', ceiling, 'derived', clamped_from=0.90), stats, matrix, 0.02)
+    assert note is not None
+    assert "sits at the pool's ceiling" in note
+    assert "GMV over the same pool returns" in note
+
+
+def test_the_concentration_note_is_silent_without_a_clamp():
+    matrix = _income_matrix()
+    stats = compute_weights_and_stats(matrix, "GMV")
+    assert _concentration_note(_resolved(None), stats, matrix, 0.02) is None
+
+
+def test_the_concentration_note_is_silent_for_a_diversified_clamped_result():
+    """Even a clamped target is fine when the result still spreads the money
+    - the note is about concentration, not about clamping.
+
+    Needs a fixture whose GMV is genuinely diversified: `_income_matrix`'s
+    near-riskless STEADY makes its own GMV 98% one holding, so three
+    tickers of comparable variance are used here instead.
+    """
+    idx = pd.date_range("2021-10-01", periods=40, freq="MS", name="rebalance_date")
+    matrix = pd.DataFrame(
+        {
+            "A": [0.01 + (0.04 if i % 2 == 0 else -0.04) for i in range(40)],
+            "B": [0.01 + (0.04 if i % 3 == 0 else -0.02) for i in range(40)],
+            "C": [0.01 + (0.04 if i % 5 == 0 else -0.01) for i in range(40)],
+        },
+        index=idx,
+    )
+    stats = compute_weights_and_stats(matrix, "GMV")
+    assert max(stats.weights.values()) <= CONCENTRATION_THRESHOLD, stats.weights
+
+    resolved = ResolvedObjective("MV", 0.03, "derived", clamped_from=0.9)
+    assert _concentration_note(resolved, stats, matrix, 0.02) is None

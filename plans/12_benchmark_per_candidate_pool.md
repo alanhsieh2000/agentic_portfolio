@@ -596,3 +596,34 @@ plus a trailing `benchmark: BenchmarkStats | None = None` on `print_weights_and_
 Two of this plan's designs were reused rather than merely referenced, and the resemblance is deliberate. The rate's precedence — this run's `--risk-free-rate`, then what the currency remembered, then the configured default — is `resolve_benchmark_ticker`'s override-then-saved-then-default shape, and `resolve_risk_free_rate` is likewise a pure function taking `saved` as a parameter rather than reading a file. And the rate is written only after the run has actually produced a report, which is this plan's `_settle_benchmark` gate (`... and source.unavailable_reason is None`, writing only a benchmark that resolved) applied to a different value.
 
 One design was deliberately NOT reused: there is no per-currency table of default rates to match `DEFAULT_BENCHMARKS`. That constant's own docstring argues `SPY` is defensible because it is the uncontested stand-in for "the US market"; a policy rate moves several times a year, so a table of them compiled into source would rot silently, which is exactly why a rate must be remembered from the user instead. The rule that constant states about `memory/candidates.json` — that a default is never written to the file, only an explicit choice, so improving the default later still reaches everything that never chose — does carry over verbatim.
+
+
+## Revision Note: the benchmark now chooses the objective too (2026-09-08)
+
+This plan introduced the benchmark as a reporting-only comparison - three figures printed
+beside the portfolio's own so the two could be read together, with the benchmark explicitly
+"never a holding". It now also DETERMINES the objective when none is given, which is a
+larger role than this plan gave it and worth recording.
+
+`--objective` was `required=True`. It is now optional, and left out the objective becomes MV
+targeting the benchmark's own expected return - matching what the benchmark returned at the
+least risk that does so, which is arguably what measuring against one was always for. With
+no usable benchmark it falls back to GMV, the only objective needing no external input. The
+report names the provenance either way, following this plan's own precedent that a derived
+figure must say what it derived it from.
+
+The ordering looked circular and was not. This plan calls
+`benchmark_stats_for_window` with `stats.returns_window_start`/`_end`, which come out of the
+optimization - but that window is the returns matrix's own date index, and the index comes
+from `_load_window_dates` reading the `returns` table's months for the as-of date. So it
+depends on the DATABASE, not on the candidates and not on any optimization, and is knowable
+first. The benchmark is now measured once, before the optimizer, and reused for both the
+derivation and the report - which removed a duplicate call rather than adding one.
+
+Two consequences worth knowing. Because the window is database-derived it does not move when
+the candidate list is edited, so the derived objective is resolved once per session and holds
+until `[o]` or `[t]` changes it deliberately - an objective that shifted silently under an
+edit would be worse than one that persists. And a benchmark can out-return everything in the
+pool, so the derived target is clamped to the reachable ceiling; see
+`plans/05_optimizer_and_allocation.md`'s revision note of the same date for what that costs
+and why the report warns about it.

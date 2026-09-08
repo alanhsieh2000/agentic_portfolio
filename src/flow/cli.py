@@ -392,6 +392,7 @@ def print_weights_and_allocation(
     benchmark: BenchmarkStats | None = None,
     risk_free_rate_origin: str | None = None,
     portfolio_value: float | None = None,
+    resolved_objective=None,
 ) -> None:
     """Human-readable rendering of one `compute_weights_and_allocation`
     result, including the figures the optimizer decided from.
@@ -486,7 +487,17 @@ def print_weights_and_allocation(
         stats.dividend_yield_floor, stats.dividend_floor_origin, stats.portfolio_dividend_yield
     ))
     if objective == "MV":
-        print(f"Target annual return: {stats.target_annual_return:.4f}")
+        clamped = getattr(resolved_objective, "clamped_from", None)
+        # Both numbers, never one silently substituted for the other: a
+        # target that was lowered to fit the pool is a different claim from
+        # one that was asked for.
+        detail = (
+            f" (clamped down from {float(clamped):.4f}, which no portfolio of these "
+            "candidates can reach)"
+            if clamped is not None
+            else ""
+        )
+        print(f"Target annual return: {stats.target_annual_return:.4f}{detail}")
     else:
         print(f"Target annual return: n/a (objective is {objective}, not MV)")
 
@@ -954,8 +965,10 @@ def print_pipeline_result(
     failure, since the reason is a statement about numbers on the command
     line and the candidate list is what makes it actionable.
     """
+    resolved = result.get("resolved_objective")
+    origin = f" ({resolved.origin})" if resolved is not None else ""
     print(f"Mode: {result['mode']}  Rebalance date: {result['rebalance_date']}  "
-          f"Objective: {result['objective']}  Selection: {result['selection']}")
+          f"Objective: {result['objective']}{origin}  Selection: {result['selection']}")
 
     rule = result["rule"]
     if rule is not None:
@@ -984,8 +997,11 @@ def print_pipeline_result(
     print_weights_and_allocation(
         result["stats"], result["allocation"], result["objective"], result["currency"],
         benchmark=result.get("benchmark"), risk_free_rate_origin=risk_free_rate_origin,
-        portfolio_value=portfolio_value,
+        portfolio_value=portfolio_value, resolved_objective=resolved,
     )
+    note = result.get("concentration_note")
+    if note is not None:
+        print(note)
 
 
 def _print_add_outcome(
@@ -1792,7 +1808,16 @@ def _run_edit_loop(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run plans/06_interactive_flow.md's interactive pipeline.")
     parser.add_argument("--date", required=True, help="Rebalance date, YYYY-MM-DD, or 'today' for live mode.")
-    parser.add_argument("--objective", required=True, choices=VALID_OBJECTIVES)
+    parser.add_argument(
+        "--objective",
+        default=None,
+        choices=VALID_OBJECTIVES,
+        help="Which portfolio to solve for. Left out, it is derived from the pool: MV "
+             "targeting the benchmark's own expected return when that benchmark can be "
+             "measured - matching what it returned, at the least risk that does so - and "
+             "GMV when there is no benchmark return to aim at. The report always says which "
+             "it chose and why. Giving --target-return without --objective implies MV.",
+    )
     parser.add_argument(
         "--value",
         required=True,
@@ -1805,7 +1830,7 @@ def main() -> None:
     parser.add_argument(
         "--target-return",
         type=float,
-        default=DEFAULT_TARGET_ANNUAL_RETURN,
+        default=None,
         help="Annual return --objective MV optimizes toward; ignored by GMV and MSR.",
     )
     parser.add_argument(
@@ -2134,10 +2159,38 @@ def main() -> None:
                 risk_free_rate_origin=resolved_rate.origin,
             )
 
+        # The RESOLVED objective and target, not the raw flags: those may be
+        # `None` because the pool derived them, and the loop has to continue
+        # from what the report actually showed. Resolution happens once per
+        # session - the returns window is database-derived and stable - so an
+        # edit changes the pool, never silently the objective.
+        # Read defensively: `run_pipeline_against` populates this, but a
+        # programmatic caller assembling its own result dict should not have
+        # to, and falling back to the reported objective is always correct -
+        # it is the resolved one.
+        resolved = result.get("resolved_objective")
+        loop_objective = (
+            resolved.objective
+            if resolved is not None
+            else (result.get("objective") or args.objective)
+        )
+        # Fall back to the FLAG before the default: a `--target-return` the
+        # user typed must reach the edit loop even when the result carries no
+        # resolved objective, or a rate that applied to the initial run would
+        # silently revert on the first edit - the bug plan 10 fixed for the
+        # risk-free rate, in a new place.
+        if resolved is not None and resolved.target_annual_return is not None:
+            loop_target = resolved.target_annual_return
+        elif args.target_return is not None:
+            loop_target = args.target_return
+        else:
+            loop_target = DEFAULT_TARGET_ANNUAL_RETURN
         edited_report = _run_edit_loop(
-            result["scan_detail"]["candidates"], args.objective, args.value, rebalance_date, session_db_path,
+            result["scan_detail"]["candidates"], loop_objective, args.value, rebalance_date,
+            session_db_path,
             selection=args.selection, memory_path=args.memory_path,
-            target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
+            target_annual_return=loop_target,
+            risk_free_rate=args.risk_free_rate,
             dividend_floor=dividend_floor,
             consult_dividends=not args.no_dividend_fetch,
             currency=currency, benchmark=benchmark,

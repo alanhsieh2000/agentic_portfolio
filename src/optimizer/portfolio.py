@@ -441,6 +441,15 @@ class UnreachableTargetReturnError(UnsatisfiableRequestError):
     """`--target-return` is above the best return any portfolio of these
     candidates can produce.
 
+    `reachable` carries that best return as a number, not only inside the
+    message, so a caller can act on it rather than parse prose. It is what
+    `src/optimizer/benchmark.py`'s objective resolution clamps a
+    benchmark-derived target down to - and it is the solver's OWN
+    `_max_return_value` rather than `max(mu)`, which matters: those differ
+    by a float's width, and a target set from the latter is refused by the
+    very check that produced this error. `None` when the solver did not
+    reach the point of computing it.
+
     Its own type, rather than PyPortfolioOpt's bare `ValueError`, because
     that library's message - "target_return must be lower than the maximum
     possible return" - names neither the flag that caused it nor the value
@@ -449,6 +458,9 @@ class UnreachableTargetReturnError(UnsatisfiableRequestError):
     what lowered the ceiling, since there the remedy includes relaxing the
     floor.
     """
+
+    reachable: float | None = None
+    best_ticker: str | None = None
 
 
 class RiskFreeRateTooHighError(UnsatisfiableRequestError):
@@ -484,17 +496,22 @@ def _unreachable_target_return(
     reachable = getattr(ef, "_max_return_value", None)
     best = str(mu.idxmax()) if len(mu) else "none"
     if reachable is None:
-        return UnreachableTargetReturnError(
+        error = UnreachableTargetReturnError(
             f"--target-return {float(target_annual_return):.4f} is unreachable for this "
             f"pool, whose best single candidate is {best} at {float(mu.max()):.4f}. Lower "
             "--target-return, add a higher-returning candidate, or switch to GMV or MSR."
         )
-    return UnreachableTargetReturnError(
+        error.reachable = None
+        return error
+    error = UnreachableTargetReturnError(
         f"--target-return {float(target_annual_return):.4f} is unreachable for this pool: "
         f"the highest annual return any portfolio of these candidates can reach is "
         f"{float(reachable):.4f}, from {best}. Lower --target-return to at most "
         f"{float(reachable):.4f}, add a higher-returning candidate, or switch to GMV or MSR."
     )
+    error.reachable = float(reachable)
+    error.best_ticker = best
+    return error
 
 
 def _risk_free_rate_too_high(mu: pd.Series, risk_free_rate: float) -> RiskFreeRateTooHighError:

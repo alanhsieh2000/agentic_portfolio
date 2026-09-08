@@ -339,3 +339,93 @@ def benchmark_stats_for_window(
         window_months=len(window),
         unavailable_reason=None,
     )
+
+
+DEFAULT_OBJECTIVE_WITHOUT_BENCHMARK = "GMV"
+"""What to optimize when no benchmark return is available to aim at.
+
+Minimum variance is the one objective that needs no external input: MV
+requires a target return and MSR requires a risk-free rate to beat, while
+GMV is fully determined by the covariance matrix alone. So it is the only
+honest choice when the pool has nothing to be measured against.
+"""
+
+
+class ResolvedObjective(NamedTuple):
+    """Which objective a run optimizes, and where that came from.
+
+    `objective` and `target_annual_return` are what the optimizer consumes;
+    `target_annual_return` is meaningful only for MV, as everywhere else in
+    this project. `origin` is a phrase fit to print in parentheses after the
+    objective, following the convention `format_risk_free_rate` established
+    for a rate and `DividendFloor.origin` follows for a dividend floor: a
+    figure this project DERIVED must say what it derived it from, or a
+    reader cannot tell a deliberate choice from a default.
+
+    `clamped_from` records the target originally asked for when it had to be
+    lowered to something the pool can actually reach, and is `None` when no
+    clamping happened. It exists so the report can name both numbers rather
+    than silently substituting one for the other.
+    """
+
+    objective: str
+    target_annual_return: float | None
+    origin: str
+    clamped_from: float | None = None
+
+
+def objective_from_benchmark(
+    benchmark: BenchmarkStats | None,
+    explicit_objective: str | None,
+    explicit_target: float | None,
+) -> ResolvedObjective:
+    """Which objective to optimize, given what the user asked for and what
+    the pool's benchmark turned out to be.
+
+    The idea: a pool with a benchmark has an obvious goal - match what that
+    benchmark returned, taking as little risk as possible to do it - and
+    that is exactly MV with the benchmark's own expected return as its
+    target. A pool with no usable benchmark has no return to aim at, so
+    there is nothing to do but minimize variance.
+
+    Precedence, highest first, so that nothing changes for anyone already
+    passing flags:
+
+    1. An explicit `--objective` wins outright.
+    2. An explicit `--target-return` with no objective implies MV. It is the
+       only reading available, since no other objective consumes a target.
+    3. A benchmark whose return could be measured gives MV at that return.
+    4. Otherwise GMV, and `origin` names WHICH of the several reasons
+       applied - no benchmark configured for this currency, one explicitly
+       disabled, or one that could not be measured. Those are different
+       situations and `BenchmarkStats.unavailable_reason` already tells them
+       apart, so the report should too.
+
+    Pure, no I/O. Clamping an unreachable benchmark target is NOT done here:
+    that needs a solve to discover the pool's ceiling, so it belongs to the
+    caller (see `src/flow/interactive.py`), which reports it back through
+    `clamped_from`.
+    """
+    if explicit_objective is not None:
+        target = explicit_target if explicit_objective == "MV" else None
+        return ResolvedObjective(explicit_objective, target, "--objective")
+
+    if explicit_target is not None:
+        return ResolvedObjective(
+            "MV", float(explicit_target), "--target-return, which only MV consumes"
+        )
+
+    if benchmark is not None and benchmark.annual_return is not None:
+        return ResolvedObjective(
+            "MV",
+            float(benchmark.annual_return),
+            f"matching benchmark {benchmark.ticker}'s {benchmark.annual_return:.4f} return",
+        )
+
+    if benchmark is None:
+        reason = "no benchmark for this pool"
+    elif benchmark.unavailable_reason:
+        reason = f"benchmark unavailable: {benchmark.unavailable_reason}"
+    else:
+        reason = "no benchmark return to aim at"
+    return ResolvedObjective(DEFAULT_OBJECTIVE_WITHOUT_BENCHMARK, None, reason)

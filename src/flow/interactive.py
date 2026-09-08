@@ -68,6 +68,9 @@ from src.dataset.holdings_cache import (
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 from src.flow.live import build_live_snapshot, build_scratch_snapshot
 from src.optimizer.benchmark import (
+    BenchmarkStats,
+    ResolvedObjective,
+    objective_from_benchmark,
     BENCHMARK_MIN_MONTHS,
     BenchmarkSource,
     benchmark_stats_for_window,
@@ -88,6 +91,7 @@ from src.optimizer.dividends import DividendFloor, DividendFloorError
 from src.optimizer.portfolio import (
     DEFAULT_TARGET_ANNUAL_RETURN,
     PortfolioStats,
+    UnreachableTargetReturnError,
     allocate_shares,
     compute_weights_and_stats,
     load_latest_prices,
@@ -96,6 +100,15 @@ from src.optimizer.portfolio import (
 from src.scanner.candidate_scanner import scan_with_detail
 
 logger = logging.getLogger(__name__)
+
+CLAMP_EPSILON = 1e-6
+"""How far below a pool's reachable ceiling a clamped target is set.
+
+Needed because `efficient_return` refuses a target that is not strictly
+below its own computed maximum, and the two differ by float noise.
+1e-6 relative is far smaller than any figure this project prints - it
+moves a 5% target by five parts per billion - while being orders of
+magnitude above the float noise it exists to clear."""
 
 VALID_SELECTIONS = ("llm_s_only", "llm_f_only", "llm_s_and_f", "user_provided")
 
@@ -758,6 +771,7 @@ def compute_weights_and_allocation(
     risk_free_rate: float = settings.risk_free_rate,
     dividend_floor: DividendFloor | None = None,
     consult_dividends: bool = True,
+    returns_matrix: pd.DataFrame | None = None,
 ) -> tuple[PortfolioStats, tuple[dict[str, int], float]]:
     """`compute_weights_and_stats` + `allocate_shares` for `candidates` as of
     `rebalance_date`, reading `db_path` - the part of the pipeline an
@@ -780,7 +794,12 @@ def compute_weights_and_allocation(
     cheap query that finds a single implicit US-dollar group.
     """
     _require_single_currency(candidates, db_path)
-    returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
+    # Accepted pre-loaded so `run_pipeline_against`, which had to load it
+    # anyway to know the benchmark's window, does not pay for the same read
+    # twice. Left `None` - which is what the edit loop does - it loads its
+    # own, so the loop keeps recomputing against the current candidates.
+    if returns_matrix is None:
+        returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
 
     # Re-read on every call, deliberately never carried by the edit loop:
     # `[a]dd` can introduce a ticker nobody has a yield for yet, and a loop
@@ -881,16 +900,154 @@ def run_scan(
     }
 
 
+def _benchmark_over_matrix(
+    benchmark: BenchmarkSource | None,
+    returns_matrix: pd.DataFrame,
+    risk_free_rate: float,
+) -> BenchmarkStats | None:
+    """The benchmark measured over the window `returns_matrix` covers, or
+    `None` when there is no benchmark or no window.
+
+    Split out because that window is needed twice - once to derive the
+    objective and once for the report - and measuring it twice would invite
+    the two answers drifting apart. An empty matrix (no candidate has any
+    history) has no window to measure over, which is a real state for a pool
+    of freshly-listed tickers.
+    """
+    if benchmark is None or returns_matrix.empty or len(returns_matrix.index) == 0:
+        return None
+    index = returns_matrix.index
+    return benchmark_stats_for_window(
+        benchmark, index.min().date(), index.max().date(), risk_free_rate
+    )
+
+
+CONCENTRATION_THRESHOLD = 0.9
+"""Weight in a single holding above which a clamped result is called out.
+
+Not tuned: 0.9 is simply "almost all of it in one name", which is the
+condition worth naming. The note it triggers is informational, so the exact
+cutoff changes what gets mentioned rather than what gets computed.
+"""
+
+
+def _concentration_note(
+    resolved: ResolvedObjective,
+    stats: PortfolioStats,
+    returns_matrix: pd.DataFrame,
+    risk_free_rate: float,
+) -> str | None:
+    """A warning that a clamped target has produced a one-holding portfolio,
+    with GMV's own figures for comparison - or `None` when nothing was
+    clamped or the result is diversified.
+
+    This exists because the clamp is now reachable by typing NO FLAGS AT
+    ALL. Minimum variance subject to a return at the pool's maximum has
+    exactly one feasible portfolio, which is the maximum-return portfolio,
+    so a benchmark that out-returns the pool produces near-total
+    concentration in its best single name. Measured on a bond-and-preferred
+    pool: 99.9% in one ticker at 0.2252 volatility, against GMV's four
+    holdings at 0.0451 - five times the risk for two points of return.
+
+    That is a legitimate answer to what was asked and a poor portfolio to be
+    handed silently, so the report states it and quotes the alternative. The
+    comparison costs one extra solve and only when the note fires.
+    """
+    if resolved.clamped_from is None or not stats.weights:
+        return None
+
+    top, weight = max(stats.weights.items(), key=lambda kv: kv[1])
+    if weight <= CONCENTRATION_THRESHOLD:
+        return None
+
+    try:
+        gmv = compute_weights_and_stats(returns_matrix, "GMV", risk_free_rate=risk_free_rate)
+    except Exception:  # noqa: BLE001 - a comparison must never break a report
+        logger.debug("could not compute a GMV comparison", exc_info=True)
+        return (
+            f"  Note: this target sits at the pool's ceiling, so the result is "
+            f"{weight:.0%} {top} - minimum variance at the maximum return has only one "
+            "feasible portfolio. Pass --objective GMV for a diversified alternative."
+        )
+
+    return (
+        f"  Note: this target sits at the pool's ceiling, so the result is {weight:.0%} "
+        f"{top} - minimum variance at the maximum return has only one feasible portfolio. "
+        f"GMV over the same pool returns {gmv.portfolio_expected_return:.4f} at "
+        f"{gmv.portfolio_volatility:.4f} volatility, against {stats.portfolio_volatility:.4f} "
+        "here."
+    )
+
+
+def _optimize_clamping_an_unreachable_target(
+    pool: list[str],
+    resolved: ResolvedObjective,
+    portfolio_value: float,
+    rebalance_date: date,
+    db_path: str,
+    risk_free_rate: float,
+    dividend_floor: DividendFloor | None,
+    consult_dividends: bool,
+    returns_matrix: pd.DataFrame | None = None,
+) -> tuple[PortfolioStats, tuple[dict[str, int], float], ResolvedObjective]:
+    """`compute_weights_and_allocation`, retried once at the pool's own
+    ceiling when a DERIVED target turns out to be unreachable.
+
+    A benchmark can easily out-return everything in the pool - an equity
+    index against a bond-and-preferred pool is the obvious case, and a
+    dividend floor lowers the reachable ceiling further - so a target taken
+    from a benchmark cannot be assumed attainable. Rather than refuse a
+    default nobody typed, the target is lowered to the most the pool can
+    actually reach and the report says both numbers.
+
+    The ceiling comes from `UnreachableTargetReturnError.reachable`, which
+    is the solver's own `_max_return_value`. That distinction is not
+    cosmetic: a ceiling computed as `max(mu)` sits a float's width ABOVE it
+    and is refused by the very check that produced the error - verified, a
+    target of 0.0544 rejected against a stated maximum of 0.0544. It is
+    then scaled by `(1 - CLAMP_EPSILON)` to clear the strict comparison.
+
+    Only a DERIVED target is clamped. A target the user typed is theirs, and
+    silently moving it would be worse than telling them it cannot be met -
+    which is what `origin` distinguishes, and why this retries once rather
+    than looping.
+    """
+    def solve(target: float | None) -> tuple[PortfolioStats, tuple[dict[str, int], float]]:
+        return compute_weights_and_allocation(
+            pool, resolved.objective, portfolio_value, rebalance_date, db_path,
+            target_annual_return=target if target is not None else DEFAULT_TARGET_ANNUAL_RETURN,
+            risk_free_rate=risk_free_rate, dividend_floor=dividend_floor,
+            consult_dividends=consult_dividends, returns_matrix=returns_matrix,
+        )
+
+    try:
+        stats, allocation = solve(resolved.target_annual_return)
+    except UnreachableTargetReturnError as e:
+        if resolved.origin.startswith("--") or e.reachable is None:
+            raise
+        clamped = float(e.reachable) * (1 - CLAMP_EPSILON)
+        logger.info(
+            "clamping the derived target from %s to %s, the most this pool can reach",
+            resolved.target_annual_return, clamped,
+        )
+        resolved = resolved._replace(
+            target_annual_return=clamped, clamped_from=resolved.target_annual_return
+        )
+        stats, allocation = solve(clamped)
+
+    return stats, allocation, resolved
+
+
 def run_pipeline_against(
     rebalance_date: date,
-    objective: str,
+    objective: str | None,
     portfolio_value: float,
     selection: str,
     db_path: str,
     mode: str,
     rule: ScreeningRule | None = None,
     candidates: list[str] | None = None,
-    target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
+    target_annual_return: float | None = None,
     risk_free_rate: float = settings.risk_free_rate,
     currency: str = DEFAULT_CURRENCY,
     benchmark: BenchmarkSource | None = None,
@@ -929,22 +1086,34 @@ def run_pipeline_against(
     without re-screening. Every other exception propagates unchanged.
     """
     scan = run_scan(rebalance_date, selection, db_path, rule=rule, candidates=candidates)
+    pool = scan["scan_detail"]["candidates"]
+
+    # The returns matrix is loaded HERE rather than inside
+    # `compute_weights_and_allocation`, because its date index is the window
+    # the benchmark has to be measured over, and the benchmark's return is
+    # what the objective may be derived from. That is a reordering, not a
+    # circularity: the window comes from `_load_window_dates`, which reads
+    # the `returns` table's own months for this as-of date, so it depends on
+    # the database rather than on the candidates or on any optimization.
+    returns_matrix = load_returns_matrix(pool, as_of=rebalance_date, db_path=db_path)
+    benchmark_stats = _benchmark_over_matrix(benchmark, returns_matrix, risk_free_rate)
+
+    resolved = objective_from_benchmark(benchmark_stats, objective, target_annual_return)
 
     base = {
         "mode": mode,
         "rebalance_date": rebalance_date,
-        "objective": objective,
+        "objective": resolved.objective,
         "selection": selection,
         **scan,
         "currency": currency,
     }
 
     try:
-        stats, allocation = compute_weights_and_allocation(
-            scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date,
-            db_path,
-            target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
-            dividend_floor=dividend_floor, consult_dividends=consult_dividends,
+        stats, allocation, resolved = _optimize_clamping_an_unreachable_target(
+            pool, resolved, portfolio_value, rebalance_date, db_path,
+            risk_free_rate=risk_free_rate, dividend_floor=dividend_floor,
+            consult_dividends=consult_dividends, returns_matrix=returns_matrix,
         )
     except UnsatisfiableRequestError as e:
         # RETURNED, not raised, and only for this one narrow type. `run_scan`
@@ -972,6 +1141,8 @@ def run_pipeline_against(
             # with nothing to compare against.
             "benchmark": None,
             "unsatisfiable": e,
+            "resolved_objective": resolved,
+            "concentration_note": None,
         }
 
     return {
@@ -979,10 +1150,16 @@ def run_pipeline_against(
         "weights": stats.weights,
         "allocation": allocation,
         "stats": stats,
-        "benchmark": benchmark_stats_for_window(
-            benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
-        ),
+        # The benchmark measured before the optimization, not after: it is
+        # the same window either way (the matrix index is what both derive
+        # from), so computing it once removes a duplicate rather than
+        # changing an answer.
+        "benchmark": benchmark_stats,
         "unsatisfiable": None,
+        "resolved_objective": resolved,
+        "concentration_note": _concentration_note(
+            resolved, stats, returns_matrix, risk_free_rate
+        ),
     }
 
 

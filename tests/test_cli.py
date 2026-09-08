@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
+from src.optimizer.benchmark import ResolvedObjective
 import pytest
 
 from src.flow.cli import (
@@ -408,7 +409,8 @@ def _stats(**overrides) -> PortfolioStats:
 
 
 
-def _render(stats, allocation=None, objective="GMV", currency="USD", portfolio_value=None) -> str:
+def _render(stats, allocation=None, objective="GMV", currency="USD", portfolio_value=None,
+            resolved_objective=None) -> str:
     """`print_weights_and_allocation` captured as a string, so a test can
     assert on the lines it printed.
     """
@@ -423,6 +425,7 @@ def _render(stats, allocation=None, objective="GMV", currency="USD", portfolio_v
             objective,
             currency,
             portfolio_value=portfolio_value,
+            resolved_objective=resolved_objective,
         )
     return buffer.getvalue()
 
@@ -858,7 +861,18 @@ def test_main_threads_the_target_return_argument_into_the_pipeline_and_the_edit_
     assert edit_spy.call_args.kwargs["target_annual_return"] == 0.09
 
 
-def test_main_target_return_defaults_when_the_argument_is_omitted(monkeypatch):
+def test_main_passes_no_target_return_when_the_argument_is_omitted(monkeypatch):
+    """`None`, not the configured default.
+
+    This assertion was `== DEFAULT_TARGET_ANNUAL_RETURN` until the objective
+    became derivable from the pool's benchmark. That derivation has to be
+    able to tell "no target was asked for" from "a target equal to the
+    default was asked for", because the first lets the benchmark supply one
+    and the second is an explicit choice that implies MV. Sending the
+    default down eagerly would have made every run look like the latter.
+    `DEFAULT_TARGET_ANNUAL_RETURN` still applies wherever nothing else
+    determines a target - see `_run_edit_loop`'s own default.
+    """
     pipeline_spy, _edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
         "sys.argv", ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000"]
@@ -866,7 +880,7 @@ def test_main_target_return_defaults_when_the_argument_is_omitted(monkeypatch):
 
     main()
 
-    assert pipeline_spy.call_args.kwargs["target_annual_return"] == DEFAULT_TARGET_ANNUAL_RETURN
+    assert pipeline_spy.call_args.kwargs["target_annual_return"] is None
 
 
 def test_main_threads_the_risk_free_rate_argument_into_the_pipeline_and_the_edit_loop(monkeypatch):
@@ -2625,3 +2639,99 @@ def test_run_edit_loop_reports_whether_it_printed_a_report(monkeypatch, stub_opt
 
     _script(monkeypatch, "o", "MSR", "f")
     assert _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "s.duckdb") is True
+
+
+# ==========================================================================
+# --objective is optional and derived
+# ==========================================================================
+
+
+def test_main_no_longer_requires_an_objective(monkeypatch):
+    """The pool implies one, so the flag stops being mandatory. This asserts
+    argparse itself accepts the omission - the derivation is tested where it
+    lives.
+    """
+    seen: dict = {}
+
+    @contextlib.contextmanager
+    def session(*_a, **_k):
+        yield "session.duckdb", "live"
+
+    def pipeline(rebalance_date, objective, *_a, **kwargs):
+        seen["objective"] = objective
+        seen["target"] = kwargs.get("target_annual_return")
+        return {
+            "mode": "live", "rebalance_date": REBALANCE_DATE, "objective": "GMV",
+            "selection": "llm_s_only", "rule": None,
+            "llm_s_signals": None, "llm_f_signals": None,
+            "scan_detail": {"branch": "b", "buy_s_size": 1, "buy_f_size": 0,
+                            "intersection_size": 0, "union_size": 1, "candidates": ["AAA"]},
+            "weights": {"AAA": 1.0}, "allocation": ({}, 0.0), "stats": _stats(),
+            "currency": "USD", "benchmark": None, "unsatisfiable": None,
+            "resolved_objective": ResolvedObjective("GMV", None, "no benchmark for this pool"),
+            "concentration_note": None,
+        }
+
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr("src.flow.cli.run_pipeline_against", pipeline)
+    monkeypatch.setattr("src.flow.cli._run_edit_loop", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "today", "--value", "100000", "--benchmark", "none",
+         "--no-holdings"],
+    )
+
+    main()  # no SystemExit from argparse
+
+    # Passed through as None so the pool can derive it.
+    assert seen["objective"] is None
+    assert seen["target"] is None
+
+
+def test_print_pipeline_result_names_where_the_objective_came_from(capsys):
+    """A figure this project derived has to say what it derived it from -
+    the convention the risk-free rate's provenance established.
+    """
+    result = _unsatisfiable_result(None)
+    result["unsatisfiable"] = None
+    result["stats"] = _stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1},
+                             volatility={"AAA": 0.2})
+    result["allocation"] = ({"AAA": 10}, 0.0)
+    result["resolved_objective"] = ResolvedObjective(
+        "MV", 0.0911, "matching benchmark 1321.T's 0.0911 return"
+    )
+    result["concentration_note"] = None
+
+    print_pipeline_result(result, portfolio_value=100000.0)
+
+    assert "Objective: MV (matching benchmark 1321.T's 0.0911 return)" in capsys.readouterr().out
+
+
+def test_print_weights_and_allocation_names_both_numbers_for_a_clamped_target():
+    """A target lowered to fit the pool is a different claim from one that
+    was asked for, so neither number is silently substituted.
+    """
+    out = _render(
+        _stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1}, volatility={"AAA": 0.2},
+               target_annual_return=0.0544),
+        objective="MV",
+        resolved_objective=ResolvedObjective("MV", 0.0544, "derived", clamped_from=0.1225),
+    )
+    assert (
+        "Target annual return: 0.0544 (clamped down from 0.1225, which no portfolio of "
+        "these candidates can reach)"
+    ) in out
+
+
+def test_print_pipeline_result_prints_the_concentration_note(capsys):
+    result = _unsatisfiable_result(None)
+    result["unsatisfiable"] = None
+    result["stats"] = _stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1},
+                             volatility={"AAA": 0.2})
+    result["allocation"] = ({"AAA": 10}, 0.0)
+    result["resolved_objective"] = ResolvedObjective("MV", 0.05, "derived", clamped_from=0.12)
+    result["concentration_note"] = "  Note: this target sits at the pool's ceiling"
+
+    print_pipeline_result(result, portfolio_value=100000.0)
+
+    assert "Note: this target sits at the pool's ceiling" in capsys.readouterr().out
