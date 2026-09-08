@@ -569,6 +569,7 @@ class PortfolioStats(NamedTuple):
     dividend_floor_origin: str | None = None
     dividend_yields_missing: tuple[str, ...] = ()
     dividend_weight_covered: float | None = None
+    dividend_splits: dict | None = None
 
 
 def _dividend_stats_fields(
@@ -578,6 +579,7 @@ def _dividend_stats_fields(
     dividend_floor: DividendFloor | None,
     dividend_yields: dict[str, float] | None,
     dividends_per_share: dict[str, float] | None,
+    dividend_splits: dict | None = None,
 ) -> dict[str, object]:
     """The dividend half of a `PortfolioStats`, computed in exactly one
     place so the reported figure and the enforced constraint cannot drift
@@ -611,6 +613,7 @@ def _dividend_stats_fields(
         "dividend_yields_missing": missing,
         "dividend_yield_floor": None if dividend_floor is None else float(dividend_floor.yield_floor),
         "dividend_floor_origin": None if dividend_floor is None else dividend_floor.origin,
+        "dividend_splits": dict(dividend_splits or {}),
     }
 
     if not missing:
@@ -634,6 +637,7 @@ def compute_weights_and_stats(
     dividend_floor: DividendFloor | None = None,
     dividend_yields: dict[str, float] | None = None,
     dividends_per_share: dict[str, float] | None = None,
+    dividend_splits: dict | None = None,
 ) -> PortfolioStats:
     """`compute_weights`'s result plus the estimates behind it, for a caller
     that reports why a portfolio looks the way it does rather than only what
@@ -675,7 +679,7 @@ def compute_weights_and_stats(
         _validate_efficient_return_result(weights, ef, target_annual_return)
 
     dividend_fields = _dividend_stats_fields(
-        ef, mu, weights, dividend_floor, dividend_yields, dividends_per_share
+        ef, mu, weights, dividend_floor, dividend_yields, dividends_per_share, dividend_splits
     )
     if dividend_floor is not None:
         _validate_dividend_floor_result(dividend_fields, dividend_floor)

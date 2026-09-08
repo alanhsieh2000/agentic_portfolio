@@ -45,8 +45,11 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
+
+import pandas as pd
 
 from src.dataset.ticker_currency import DEFAULT_CURRENCY
 
@@ -154,6 +157,121 @@ def load_portfolio(
     that portfolio has never been saved (or holds nothing).
     """
     return load_all_portfolios(path).get(currency, {})
+
+
+def portfolio_updated_at(
+    path: str = DEFAULT_PORTFOLIO_PATH, currency: str = DEFAULT_CURRENCY
+) -> datetime | None:
+    """When `currency`'s portfolio at `path` was last written, or `None` when
+    it has never been saved or carries no timestamp.
+
+    `load_portfolio` deliberately returns only the positions, since that is
+    all a measurement needs. This exists for the one question the positions
+    cannot answer: whether they are still describing the same shares. A
+    stock split multiplies a holding without anybody trading, so a share
+    count recorded before a split is simply wrong afterwards - and the only
+    thing that can date the count is this timestamp.
+
+    `None` is returned rather than a sentinel date because "we do not know
+    when this was written" and "this was written long ago" call for
+    different behavior: see `stale_share_counts`, which stays silent on the
+    first rather than guessing.
+    """
+    raw = _load_raw_portfolios(path).get(currency)
+    if not raw:
+        return None
+    stamp = raw.get("updated_at")
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(str(stamp))
+    except ValueError:
+        # Hand-editable file: an unparseable timestamp is treated as absent
+        # rather than raised, because a bad date must not stop somebody
+        # seeing what they own.
+        return None
+
+
+class StaleShareCount(NamedTuple):
+    """One holding whose stored share count predates a split, and therefore
+    probably understates what is actually held.
+
+    `ratio` is the cumulative product of every split since the count was
+    written, and `likely_shares` is `stored_shares * ratio` - a suggestion
+    to be confirmed, never applied. `ex_date` is the earliest offending
+    split, which is the one that dates the problem.
+    """
+
+    ticker: str
+    stored_shares: float
+    ratio: float
+    likely_shares: float
+    ex_date: date
+
+
+def stale_share_counts(
+    positions: dict[str, float],
+    updated_at: datetime | None,
+    splits: dict[str, "pd.Series"],
+) -> dict[str, StaleShareCount]:
+    """Which of `positions` were recorded before a split, as
+    `{ticker: StaleShareCount}` - empty in the ordinary case where nothing
+    split since the portfolio was written.
+
+    Why this is needed at all: `memory/portfolio.json` stores raw share
+    counts with no split awareness. Record 1,000 shares, have the stock
+    split 4:1, never run `set` again, and the file still says 1,000 while
+    the holding is 4,000 - understating the total value, every weight and
+    every dividend figure by fourfold, with nothing anywhere to notice. The
+    figures stay perfectly self-consistent, which is what makes it
+    dangerous.
+
+    `splits` maps a ticker to its split history as a date-indexed Series,
+    the shape `src/dataset/fundamentals.py`'s `cumulative_split_ratio_after`
+    already takes; `src/dataset/dividends.py`'s `split_series_by_ticker`
+    builds it. That function is reused rather than reimplemented, so a
+    ticker that never split costs a 1.0 and no special case.
+
+    Two limits, stated rather than papered over. `updated_at` is recorded
+    per CURRENCY and reflects the LAST edit to that portfolio, so a
+    portfolio touched after a split is taken as current for all of its
+    tickers - which means setting A in November, B in January and a
+    December split leaves A's staleness invisible. The check can therefore
+    MISS a stale count but can never invent one, and that asymmetry is
+    deliberate: telling somebody to quadruple a holding that is already
+    right would be a far worse failure than staying quiet. Per-ticker
+    timestamps would close the gap and are a `memory/portfolio.json` format
+    change, not attempted here. And an absent `updated_at` yields nothing
+    at all, for the same reason - an undated count cannot be judged.
+
+    Pure, no I/O.
+    """
+    from src.dataset.fundamentals import cumulative_split_ratio_after
+
+    if updated_at is None or not positions or not splits:
+        return {}
+
+    stale: dict[str, StaleShareCount] = {}
+    for ticker, shares in positions.items():
+        series = splits.get(ticker)
+        if series is None or series.empty:
+            continue
+        ratio = cumulative_split_ratio_after(series, updated_at)
+        if ratio == 1.0:
+            continue
+        after = [
+            ts for ts in series.index
+            if pd.Timestamp(ts).tz_localize(None).normalize()
+            > pd.Timestamp(updated_at).tz_localize(None).normalize()
+        ]
+        stale[ticker] = StaleShareCount(
+            ticker=ticker,
+            stored_shares=float(shares),
+            ratio=float(ratio),
+            likely_shares=float(shares) * float(ratio),
+            ex_date=min(pd.Timestamp(ts).date() for ts in after),
+        )
+    return stale
 
 
 def save_portfolio(

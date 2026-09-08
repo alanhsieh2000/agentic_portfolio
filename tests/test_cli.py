@@ -32,6 +32,8 @@ from src.flow.cli import (
     _settle_benchmark,
     _settle_dividend_floor,
     format_benchmark,
+    format_split_restatement,
+    format_stale_share_counts,
     main,
     print_weights_and_allocation,
 )
@@ -2227,3 +2229,149 @@ def test_settle_dividend_floor_keeps_an_explicit_zero_as_a_floor():
 def test_settle_dividend_floor_refuses_both_flags_rather_than_reconciling_them():
     with pytest.raises(ValueError, match="two spellings of one"):
         _settle_dividend_floor(3000.0, 0.03, 100000.0, "USD")
+
+
+# ==========================================================================
+# Split restatement and the stale share-count warning
+# ==========================================================================
+
+
+def _split_context(
+    ex_date=date(2025, 12, 29), ratio=4.0, payments=((date(2025, 9, 29), 5.5), (date(2026, 3, 30), 5.5))
+):
+    from src.dataset.dividends import SplitContext
+
+    return SplitContext(splits=[(ex_date, ratio)], payments=list(payments))
+
+
+def test_format_split_restatement_reconciles_the_announced_amount():
+    """The line that answers "why does the report say 5.5 when the company
+    announced 22?" — using only stored data and the split ratio.
+    """
+    line = format_split_restatement(
+        {"9984.T": _split_context()}, {"9984.T": 11.0}, "JPY"
+    )
+    assert "Per-share amounts are on each ticker's CURRENT share basis." in line
+    assert "9984.T split 4:1 on 2025-12-29" in line
+    assert "2025-09-29 payment of ¥22.00 JPY as announced" in line
+    assert "counts as ¥5.50 JPY per current share" in line
+
+
+def test_format_split_restatement_is_none_when_nothing_split():
+    """So the overwhelming majority of reports are byte-identical to before
+    this feature existed.
+    """
+    assert format_split_restatement({}, {"KO": 1.94}, "USD") is None
+    assert format_split_restatement(None, None, "USD") is None
+
+
+def test_format_split_restatement_names_only_a_payment_the_split_restated():
+    """A window whose only payment came AFTER the split has nothing to
+    reconcile, so the sentence stops at the split itself rather than
+    claiming a restatement that did not happen.
+    """
+    line = format_split_restatement(
+        {"9984.T": _split_context(payments=((date(2026, 3, 30), 5.5),))},
+        {"9984.T": 5.5},
+        "JPY",
+    )
+    assert "9984.T split 4:1 on 2025-12-29" in line
+    assert "as announced" not in line
+
+
+def test_format_split_restatement_covers_two_splits_in_one_window():
+    from src.dataset.dividends import SplitContext
+
+    line = format_split_restatement(
+        {
+            "X": SplitContext(
+                splits=[(date(2026, 1, 5), 2.0), (date(2026, 6, 5), 3.0)],
+                payments=[(date(2025, 12, 1), 6.0)],
+            )
+        },
+        {"X": 6.0},
+        "USD",
+    )
+    assert "X split 2:1 on 2026-01-05 and 3:1 on 2026-06-05" in line
+    assert "$36.00 USD as announced" in line
+
+
+def test_print_weights_and_allocation_explains_a_split_in_the_window():
+    stats = _dividend_stats(dividend_splits={"T": _split_context()})
+    out = _render(stats, portfolio_value=100000.0)
+    assert "CURRENT share basis" in out
+
+
+def test_print_weights_and_allocation_omits_the_split_line_when_nothing_split():
+    out = _render(_dividend_stats(), portfolio_value=100000.0)
+    assert "CURRENT share basis" not in out
+
+
+def test_format_stale_share_counts_warns_and_prints_a_runnable_command(tmp_path):
+    """The suggested command has to work verbatim: a share count with
+    thousands separators would not parse, so a suggestion that has to be
+    edited first is no suggestion at all.
+    """
+    from src.dataset.dividends import write_dividends_tables, coverage_frame
+    from src.flow.user_portfolio import save_portfolio
+
+    portfolio = str(tmp_path / "p.json")
+    save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
+    # Backdate the save to before the split.
+    raw = json.loads(Path(portfolio).read_text())
+    raw["portfolios"]["JPY"]["updated_at"] = "2025-11-02T00:00:00+00:00"
+    Path(portfolio).write_text(json.dumps(raw))
+
+    db = str(tmp_path / "cache.duckdb")
+    write_dividends_tables(
+        pd.DataFrame(columns=["ex_date", "ticker", "amount"]),
+        coverage_frame(["9984.T"], set(), "2021-01-01", "2026-09-08"),
+        db,
+        splits_df=pd.DataFrame(
+            {"ex_date": pd.to_datetime(["2025-12-29"]), "ticker": ["9984.T"], "ratio": [4.0]}
+        ),
+    )
+
+    warning = format_stale_share_counts(portfolio, "JPY", {"9984.T": 1000.0}, db)
+    assert "9984.T split 4:1 on 2025-12-29" in warning
+    assert "last updated (2025-11-02)" in warning
+    assert "understate every figure below by 4x" in warning
+    assert "uv run portfolio-holdings set 9984.T 4000" in warning
+    assert "4,000 now" in warning  # readable in prose
+    assert "set 9984.T 4,000" not in warning  # but never in the command
+
+
+def test_format_stale_share_counts_is_silent_when_the_count_postdates_the_split(tmp_path):
+    from src.dataset.dividends import write_dividends_tables, coverage_frame
+    from src.flow.user_portfolio import save_portfolio
+
+    portfolio = str(tmp_path / "p.json")
+    save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
+
+    db = str(tmp_path / "cache.duckdb")
+    write_dividends_tables(
+        pd.DataFrame(columns=["ex_date", "ticker", "amount"]),
+        coverage_frame(["9984.T"], set(), "2021-01-01", "2026-09-08"),
+        db,
+        splits_df=pd.DataFrame(
+            {"ex_date": pd.to_datetime(["2025-12-29"]), "ticker": ["9984.T"], "ratio": [4.0]}
+        ),
+    )
+    assert format_stale_share_counts(portfolio, "JPY", {"9984.T": 1000.0}, db) is None
+
+
+def test_format_stale_share_counts_is_silent_without_a_splits_table(tmp_path):
+    """A database predating the splits table must change no existing
+    output.
+    """
+    from src.flow.user_portfolio import save_portfolio
+
+    portfolio = str(tmp_path / "p.json")
+    save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
+    assert format_stale_share_counts(
+        portfolio, "JPY", {"9984.T": 1000.0}, str(tmp_path / "absent.duckdb")
+    ) is None
+
+
+def test_format_stale_share_counts_is_silent_for_an_empty_portfolio(tmp_path):
+    assert format_stale_share_counts(str(tmp_path / "p.json"), "JPY", {}, "x.duckdb") is None

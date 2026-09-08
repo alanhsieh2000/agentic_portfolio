@@ -18,6 +18,11 @@ import pytest
 
 from src.dataset.dividends import (
     DIVIDENDS_LONG_COLUMNS,
+    SPLITS_LONG_COLUMNS,
+    announced_amount,
+    has_splits_table,
+    reshape_splits_long,
+    split_series_by_ticker,
     DividendFieldMissingError,
     apply_dividend_multipliers,
     coverage_frame,
@@ -433,7 +438,9 @@ def test_load_dividend_figures_reports_a_pre_existing_database_as_unavailable(tm
     con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
     con.execute("INSERT INTO prices VALUES ('2024-04-29', 'AAPL', 173.50, 171.78)")
     con.close()
-    yields, per_share, unavailable = load_dividend_figures(["AAPL"], dt.date(2024, 4, 29), str(db))
+    yields, per_share, unavailable, _splits = load_dividend_figures(
+        ["AAPL"], dt.date(2024, 4, 29), str(db)
+    )
     assert yields == {}
     assert per_share == {}
     assert "no dividend data has been fetched" in unavailable["AAPL"]
@@ -453,7 +460,7 @@ def test_load_dividend_figures_divides_by_the_raw_close_not_the_adjusted_close(t
     write_dividends_tables(
         _rows("AAPL", 2.00), coverage_frame(["AAPL"], set(), "2023-05-01", "2024-04-29"), str(db)
     )
-    yields, _per_share, _unavailable = load_dividend_figures(
+    yields, _per_share, _unavailable, _splits = load_dividend_figures(
         ["AAPL"], dt.date(2024, 4, 29), str(db)
     )
     assert yields["AAPL"] == pytest.approx(0.01)
@@ -660,3 +667,179 @@ def test_dividend_figures_falls_back_to_cash_over_value_without_per_holding_yiel
     figures = dividend_figures({"T": 100.0}, {"T": 2000.0}, {"T": 1.11})
     assert figures.yields == {}
     assert figures.dividend_yield == pytest.approx(111.0 / 2000.0)
+
+
+# --------------------------------------------------------------------------
+# Stock splits, and the restatement they explain
+# --------------------------------------------------------------------------
+
+
+def test_reshape_splits_long_keeps_only_the_rows_that_carry_a_split():
+    """yfinance zero-fills `Stock Splits` on every trading day, and a NaN
+    appears wherever another ticker in the batch introduced a date this one
+    has no data for. Neither is a split.
+    """
+    raw = _raw_actions_fixture()
+    raw[("Stock Splits", "PAYER")] = [0.0, 4.0, 0.0]
+    raw[("Stock Splits", "NAN_ROW")] = [float("nan"), 0.0, 0.0]
+    long_df = reshape_splits_long(raw, IDENTITY)
+    assert list(long_df.columns) == SPLITS_LONG_COLUMNS
+    assert len(long_df) == 1
+    assert long_df.iloc[0]["ticker"] == "PAYER"
+    assert long_df.iloc[0]["ratio"] == 4.0
+
+
+def test_reshape_splits_long_gives_a_never_split_ticker_no_rows():
+    long_df = reshape_splits_long(_raw_actions_fixture(), IDENTITY)
+    assert long_df.empty
+    assert list(long_df.columns) == SPLITS_LONG_COLUMNS
+
+
+def test_reshape_splits_long_tolerates_a_batch_with_no_splits_column():
+    """Unlike a missing `Dividends` column, this is not a broken contract:
+    splits are explanatory, so their absence costs a sentence rather than a
+    number, and a wholly-failed batch legitimately has no such column.
+    """
+    raw = _raw_actions_fixture().drop(columns=["Stock Splits"], level=0)
+    result = reshape_splits_long(raw, IDENTITY)
+    assert result.empty
+    assert list(result.columns) == SPLITS_LONG_COLUMNS
+
+
+def test_announced_amount_recovers_the_declared_figure_across_a_split():
+    """The real 9984.T case: SoftBank declared 22 yen for its 2025-09-29
+    ex-date, split 4:1 on 2025-12-29, and Yahoo therefore reports that
+    payment as 5.5 on the current share basis. Multiplying back by the
+    cumulative ratio recovers the 22 a reader would find in the company's
+    announcement - which is the whole point of the report line this feeds.
+    """
+    splits = pd.Series([4.0], index=pd.to_datetime(["2025-12-29"]))
+    assert announced_amount(5.5, dt.date(2025, 9, 29), splits) == pytest.approx(22.0)
+    # A payment after the split needs no restatement.
+    assert announced_amount(5.5, dt.date(2026, 3, 30), splits) == pytest.approx(5.5)
+
+
+def test_announced_amount_is_a_no_op_for_a_ticker_that_never_split():
+    assert announced_amount(1.11, dt.date(2026, 3, 30), None) == pytest.approx(1.11)
+    assert announced_amount(1.11, dt.date(2026, 3, 30), pd.Series(dtype=float)) == pytest.approx(1.11)
+
+
+def test_upsert_dividends_tables_replaces_only_the_named_tickers_splits(tmp_path):
+    db = tmp_path / "d.duckdb"
+    splits = pd.DataFrame(
+        {
+            "ex_date": pd.to_datetime(["2025-12-29", "2024-06-10"]),
+            "ticker": ["9984.T", "NVDA"],
+            "ratio": [4.0, 10.0],
+        }
+    )
+    write_dividends_tables(
+        _rows("9984.T"),
+        coverage_frame(["9984.T", "NVDA"], set(), "2021-01-01", "2026-09-08"),
+        str(db),
+        splits_df=splits,
+    )
+    upsert_dividends_tables(
+        _rows("9984.T"),
+        coverage_frame(["9984.T"], set(), "2021-01-01", "2026-09-08"),
+        ["9984.T"],
+        str(db),
+        splits_df=pd.DataFrame(columns=SPLITS_LONG_COLUMNS),
+    )
+    stored = _read(db, "splits")
+    assert stored["ticker"].tolist() == ["NVDA"]
+
+
+def test_write_dividends_tables_creates_an_empty_splits_table_when_given_none(tmp_path):
+    """So no reader ever has to tell "this ticker never split" apart from
+    "this database predates the splits table".
+    """
+    db = tmp_path / "d.duckdb"
+    write_dividends_tables(
+        _rows(), coverage_frame(["AAPL"], set(), "2024-01-01", "2024-12-31"), str(db)
+    )
+    assert _read(db, "splits").empty
+    assert has_splits_table(str(db)) is True
+
+
+def test_has_splits_table_is_false_before_the_migration_and_for_a_missing_file(tmp_path):
+    db = tmp_path / "old.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE dividends (ex_date DATE, ticker VARCHAR, amount DOUBLE)")
+    con.close()
+    assert has_splits_table(str(db)) is False
+
+    absent = tmp_path / "absent.duckdb"
+    assert has_splits_table(str(absent)) is False
+    assert not absent.exists()
+
+
+def test_load_dividend_figures_reports_a_split_inside_the_window(tmp_path):
+    """End to end over the real 9984.T numbers: two stored payments of 5.5
+    and a 4:1 split between them, which the report needs paired together to
+    explain why 22 became 5.5.
+    """
+    db = tmp_path / "h.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+    con.execute("INSERT INTO prices VALUES ('2026-09-08', '9984.T', 6620.0, 6620.0)")
+    con.close()
+    dividends = pd.DataFrame(
+        {
+            "ex_date": pd.to_datetime(["2025-09-29", "2026-03-30"]),
+            "ticker": ["9984.T", "9984.T"],
+            "amount": [5.5, 5.5],
+        }
+    )
+    splits = pd.DataFrame(
+        {"ex_date": pd.to_datetime(["2025-12-29"]), "ticker": ["9984.T"], "ratio": [4.0]}
+    )
+    write_dividends_tables(
+        dividends,
+        coverage_frame(["9984.T"], set(), "2021-01-01", "2026-09-13"),
+        str(db),
+        splits_df=splits,
+    )
+
+    yields, per_share, _unavailable, in_window = load_dividend_figures(
+        ["9984.T"], dt.date(2026, 9, 8), str(db)
+    )
+    assert per_share["9984.T"] == pytest.approx(11.0)
+    assert yields["9984.T"] == pytest.approx(11.0 / 6620.0)
+
+    context = in_window["9984.T"]
+    assert context.splits == [(dt.date(2025, 12, 29), 4.0)]
+    assert context.payments == [(dt.date(2025, 9, 29), 5.5), (dt.date(2026, 3, 30), 5.5)]
+
+
+def test_load_dividend_figures_reports_no_splits_for_a_ticker_that_never_split(tmp_path):
+    db = tmp_path / "h.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+    con.execute("INSERT INTO prices VALUES ('2026-09-08', 'KO', 60.68, 60.68)")
+    con.close()
+    write_dividends_tables(
+        _rows("KO", 0.485),
+        coverage_frame(["KO"], set(), "2024-01-01", "2026-09-13"),
+        str(db),
+    )
+    _y, _p, _u, in_window = load_dividend_figures(["KO"], dt.date(2026, 9, 8), str(db))
+    assert in_window == {}
+
+
+def test_load_dividend_figures_ignores_a_split_after_the_as_of_date(tmp_path):
+    db = tmp_path / "h.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+    con.execute("INSERT INTO prices VALUES ('2026-03-01', 'X', 100.0, 100.0)")
+    con.close()
+    write_dividends_tables(
+        _rows("X", 1.0),
+        coverage_frame(["X"], set(), "2024-01-01", "2026-09-13"),
+        str(db),
+        splits_df=pd.DataFrame(
+            {"ex_date": pd.to_datetime(["2026-08-01"]), "ticker": ["X"], "ratio": [2.0]}
+        ),
+    )
+    _y, _p, _u, in_window = load_dividend_figures(["X"], dt.date(2026, 3, 1), str(db))
+    assert in_window == {}

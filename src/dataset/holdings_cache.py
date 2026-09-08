@@ -53,6 +53,7 @@ from datetime import date
 import duckdb
 import pandas as pd
 
+from src.dataset.dividends import has_splits_table
 from src.dataset.membership import compute_rebalance_dates
 from src.dataset.ticker_ingestion import validate_and_ingest_tickers
 
@@ -131,10 +132,24 @@ def stale_tickers(
     are current all month, but the PRICES behind `Total value` are not, so a
     person who wants today's total has to be able to say so.
 
+    A cache with no `splits` table reports EVERY ticker stale, whatever its
+    monthly returns say. That table arrived after this cache did, and the
+    reports that read it explain why a dividend was restated by a split - so
+    without it a report is silently missing an explanation it should be
+    giving, and a cache written last month would keep it missing until the
+    month turned. The check is on the table, never on rows: a ticker that
+    never split holds no rows, so counting rows could not tell a
+    pre-migration cache from a correct one. It is one-time and self-healing,
+    since a single refresh creates the table for good, and it stays derived
+    from the data rather than from a version number.
+
     Sorted, so a refresh fetches in a deterministic order and a test can
     assert on the list.
     """
     if force:
+        return sorted(tickers)
+
+    if not has_splits_table(cache_path):
         return sorted(tickers)
 
     expected = latest_expected_rebalance_date(as_of)

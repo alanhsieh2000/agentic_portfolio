@@ -1088,3 +1088,68 @@ What did not change across any of those passes: the four decisions settled with 
 before implementation - two flags, a trailing twelve-month estimator, the scope, and refusal
 over fallback - and the constraint's own shape, which the numeric spike had already proven
 before a line of it was written.
+
+
+## Revision Note: splits made visible, and stale share counts caught (2026-09-08)
+
+A user reported 9984.T's expected dividend as ¥11,000/yr on 1,000 shares when the announced
+dividends were ¥22 (2025-09-29) and ¥5.5 (2026-03-30), apparently ¥27,500, and asked whether
+it was a bug.
+
+It was not. 9984.T split 4:1 on 2025-12-29, and Yahoo Finance restates every dividend onto
+the current share basis, so the ¥22 is stored as ¥5.5 and every payment back to 2021 reads
+¥5.5 for the same reason. The trailing twelve months is ¥11 per current share, and ¥11 ×
+1,000 = ¥11,000 - which is exactly the cash a holder of 1,000 current shares received: 250
+shares × ¥22 before the split plus 1,000 × ¥5.5 after. The ¥27,500 expectation adds a
+pre-split dividend to a post-split share count. This vindicates `Surprises & Discoveries`
+entry 5, which established from NVDA's 10:1 split that Yahoo already split-adjusts dividends
+and that this plan should therefore apply no correction of its own; 9984.T is the second
+independent confirmation, and the first from a non-US listing.
+
+But the report could not be reconciled against reality, and that WAS a defect. It printed
+¥11,000 and never mentioned the split or the restatement, so anyone comparing it with an
+announcement would reasonably conclude it was broken - exactly what happened. A dividend
+figure had been given without its methodology, the same failure the returns window and the
+risk-free rate's provenance already exist to prevent.
+
+Worse, the investigation exposed a latent correctness bug this plan had not considered:
+`memory/portfolio.json` holds raw share counts with no split awareness, so a count recorded
+before a split silently understates the position, and therefore the total value, every
+weight and every dividend figure, by the split factor - while leaving the report internally
+consistent, which is what makes it dangerous. The reporting user's portfolio was written
+after the split and so was correct, but only by luck; had they recorded it in November, the
+figure would have been wrong by exactly the fourfold factor they suspected.
+
+Three changes followed, all additive. A `splits` table now stores the `Stock Splits` column
+that `actions=True` was already downloading and `reshape_dividends_long` was discarding, so
+it costs no extra network call. `load_dividend_figures` returns a `SplitContext` for any
+ticker that split inside the trailing window - the splits and the payments they restated -
+and both reports print a sentence naming the split and reconciling the announced amount
+against the stored one, derived via the pre-existing
+`src/dataset/fundamentals.py:cumulative_split_ratio_after` rather than hardcoded. And
+`stale_share_counts` compares each portfolio's own `updated_at` against the splits since,
+warning above the figures it affects and printing the exact `set` command that would fix it,
+without ever writing to the file.
+
+Three things worth recording for whoever comes next. The check on cache staleness had to be
+extended (`src/dataset/holdings_cache.py`) or the feature would never have activated on an
+existing cache, and it asks whether the `splits` TABLE exists rather than whether a ticker
+has split rows - the identical trap `dividend_coverage` was built to avoid, since a ticker
+that never split holds no rows either. That guard then broke seven existing tests whose
+fixtures build caches with no `splits` table; the fix was to give the fixtures the table, so
+they keep exercising the monthly rule while one new test builds a pre-migration cache
+deliberately. And `dividend_figures` was calling `list()` on the new `SplitContext`, which
+flattened the NamedTuple into `[splits, payments]` and destroyed the field names - caught
+only by running the real command, which is the third time in this feature's history that an
+end-to-end run found what the unit tests could not.
+
+Verified: `uv run pytest tests/test_*.py` -> `743 passed` in 404.57s, up from 709. Both
+reports were exercised against live data - `portfolio-holdings show` and
+`uv run portfolio --selection user_provided` each print the reconciling sentence for
+9984.T - and the guard was checked both ways: silent on the real portfolio (written
+2026-09-06, after the split) and warning on a copy backdated to 2025-11-02, whose suggested
+`uv run portfolio-holdings set 9984.T 4000` was then run to confirm it parses verbatim.
+
+One item from this plan's `Progress` list is now resolved by other means: `data/holdings.duckdb`
+has been backfilled, since the splits migration forces a refresh on next use. The
+`allocate_shares` `adj_close` issue remains open and untouched.

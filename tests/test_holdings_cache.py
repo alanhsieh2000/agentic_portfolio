@@ -28,10 +28,21 @@ from src.dataset.holdings_cache import (
 )
 
 
-def _make_cache(cache_path: str, newest: dict[str, str], currency: str = "USD") -> None:
+def _make_cache(
+    cache_path: str,
+    newest: dict[str, str],
+    currency: str = "USD",
+    with_splits: bool = True,
+) -> None:
     """A cache holding one monthly return per ticker, dated `newest[ticker]`,
     plus a `ticker_currency` row so a fresh ticker's currency is readable
     without a fetch.
+
+    `with_splits` creates the (empty) `splits` table, which is what a cache
+    written by the current code always has. It defaults to True so these
+    tests exercise the monthly staleness rule rather than the one-time
+    migration; pass False to build a pre-migration cache and test that
+    migration explicitly.
     """
     con = duckdb.connect(cache_path)
     try:
@@ -50,6 +61,8 @@ def _make_cache(cache_path: str, newest: dict[str, str], currency: str = "USD") 
             "INSERT INTO ticker_currency VALUES (?, ?, ?, ?)",
             [(t, currency, currency, 1.0) for t in newest],
         )
+        if with_splits:
+            con.execute("CREATE TABLE splits (ex_date DATE, ticker VARCHAR, ratio DOUBLE)")
     finally:
         con.close()
 
@@ -261,3 +274,34 @@ def test_asking_about_no_tickers_costs_nothing(tmp_path, monkeypatch):
     assert refresh_holdings_cache([], date(2026, 9, 25), cache) == ([], {}, {})
     assert fetched == []
     assert not (tmp_path / "holdings.duckdb").exists()
+
+
+def test_a_cache_without_a_splits_table_reports_every_ticker_stale(tmp_path):
+    """The one-time migration. The `splits` table arrived after this cache
+    did, and the reports that read it explain why a dividend was restated by
+    a split - so without it a report is silently missing an explanation, and
+    the monthly rule would keep it missing until the month turned.
+    """
+    cache = str(tmp_path / "h.duckdb")
+    _make_cache(cache, {"SPY": "2026-09-01", "T": "2026-09-01"}, with_splits=False)
+    assert stale_tickers(["SPY", "T"], date(2026, 9, 25), cache) == ["SPY", "T"]
+
+
+def test_a_cache_with_a_splits_table_falls_back_to_the_monthly_rule(tmp_path):
+    """The check must be one-time: once the table exists, a fresh ticker
+    stays fresh, or the cache would refetch on every single run - exactly
+    the failure the monthly rule was designed to avoid.
+    """
+    cache = str(tmp_path / "h.duckdb")
+    _make_cache(cache, {"SPY": "2026-09-01", "T": "2026-09-01"})
+    assert stale_tickers(["SPY", "T"], date(2026, 9, 25), cache) == []
+
+
+def test_a_never_split_ticker_is_not_stale_merely_for_having_no_split_rows(tmp_path):
+    """The check asks about the TABLE, never about rows: a ticker that never
+    split holds none, so counting rows could not tell a pre-migration cache
+    from a perfectly correct one.
+    """
+    cache = str(tmp_path / "h.duckdb")
+    _make_cache(cache, {"KO": "2026-09-01"})
+    assert stale_tickers(["KO"], date(2026, 9, 25), cache) == []

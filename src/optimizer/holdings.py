@@ -363,6 +363,7 @@ def holdings_stats(
     dividends_per_share: dict[str, float] | None = None,
     dividend_unavailable: dict[str, str] | None = None,
     dividend_yields: dict[str, float] | None = None,
+    dividend_splits: dict | None = None,
 ) -> HoldingsStats:
     """Measure `positions` as of `as_of` against the prices and monthly
     returns already stored in `db_path`.
@@ -417,7 +418,12 @@ def holdings_stats(
     # return figures below for having too little history to estimate a
     # covariance from. See `HoldingsStats.dividends`.
     dividends = dividend_figures(
-        positions, market_values, dividends_per_share, dividend_unavailable, dividend_yields
+        positions,
+        market_values,
+        dividends_per_share,
+        dividend_unavailable,
+        dividend_yields,
+        dividend_splits,
     )
 
     # A holding must clear BOTH bars to be measured: enough history to

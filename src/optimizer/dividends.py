@@ -31,6 +31,7 @@ report says so.
 from __future__ import annotations
 
 import math
+from datetime import date
 from collections.abc import Sequence
 from typing import NamedTuple
 
@@ -365,6 +366,15 @@ class DividendFigures(NamedTuple):
     yield over 99.9% of a portfolio and a 2.4% yield over 60% of it are
     different claims, and only one of them is worth acting on.
 
+    `splits_in_window` names, per ticker, the `(ex_date, ratio)` splits that
+    fall inside the same trailing window the dividends were summed over. It
+    is almost always empty, and it is carried so a report can explain a
+    per-share figure that Yahoo Finance restated: a payment made before a
+    split is reported divided down by it, so the stored amount is not the
+    amount anybody announced. Without this the report prints a number a
+    reader cannot reconcile against a company announcement and reasonably
+    concludes is wrong.
+
     `yields` carries each holding's own trailing yield as the dividend layer
     computed it - cash per share over the RAW market close - and it exists so
     the same ticker never reports two different yields in two places. The
@@ -400,9 +410,10 @@ class DividendFigures(NamedTuple):
     value_covered: float | None
     unavailable: dict[str, str]
     yields: dict[str, float] = {}
+    splits_in_window: dict[str, list[tuple[date, float]]] = {}
 
 
-NO_DIVIDEND_FIGURES = DividendFigures({}, {}, None, None, None, {}, {})
+NO_DIVIDEND_FIGURES = DividendFigures({}, {}, None, None, None, {}, {}, {})
 """The "dividends were not consulted" shape, shared and never mutated."""
 
 
@@ -412,6 +423,7 @@ def dividend_figures(
     dividends_per_share: dict[str, float] | None,
     unavailable: dict[str, str] | None = None,
     yields: dict[str, float] | None = None,
+    splits_in_window: dict[str, list[tuple[date, float]]] | None = None,
 ) -> DividendFigures:
     """Build a `DividendFigures` for `positions` priced at `market_values`.
 
@@ -446,6 +458,13 @@ def dividend_figures(
         covered_value += float(market_values[ticker])
 
     held_yields = {t: float(v) for t, v in (yields or {}).items() if t in annual}
+    # Restricted to holdings that actually contribute a dividend figure, so
+    # the report never explains a restatement for a ticker whose numbers it
+    # is not showing.
+    # Kept as the record it is, NOT list()-ed: `SplitContext` is a
+    # NamedTuple, so list() would flatten it into [splits, payments] and
+    # silently destroy the field names every reader uses.
+    held_splits = {t: v for t, v in (splits_in_window or {}).items() if t in annual}
 
     if not annual or covered_value <= 0:
         return DividendFigures(
@@ -456,6 +475,7 @@ def dividend_figures(
             value_covered=None,
             unavailable=reasons,
             yields=held_yields,
+            splits_in_window=held_splits,
         )
 
     total = float(sum(annual.values()))
@@ -489,4 +509,5 @@ def dividend_figures(
         value_covered=covered_value,
         unavailable=reasons,
         yields=held_yields,
+        splits_in_window=held_splits,
     )

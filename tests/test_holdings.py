@@ -61,11 +61,18 @@ def _make_db(db_path: str, series: list[pd.Series], prices: dict[str, float]) ->
     """A fixture database holding `returns` rows for each series and one
     `prices` row per ticker in `prices`, on a date every test's `as_of`
     is after.
+
+    Also creates the empty `splits` table that any database written by the
+    current code has. Without it, `stale_tickers`' one-time migration check
+    would treat a freshly-built fixture cache as pre-migration and refetch,
+    which is a property of the fixture's vintage rather than of anything
+    these tests mean to exercise.
     """
     con = duckdb.connect(db_path)
     try:
         con.execute("CREATE TABLE returns (rebalance_date DATE, ticker VARCHAR, monthly_return DOUBLE)")
         con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+        con.execute("CREATE TABLE splits (ex_date DATE, ticker VARCHAR, ratio DOUBLE)")
         for one in series:
             con.executemany(
                 "INSERT INTO returns VALUES (?, ?, ?)",

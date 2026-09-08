@@ -10,12 +10,16 @@ per AGENTS.md.
 import json
 from pathlib import Path
 
+import pandas as pd
+from datetime import date, datetime, timezone
 import pytest
 
 from src.flow.user_portfolio import (
     load_all_portfolios,
     load_portfolio,
     save_portfolio,
+    portfolio_updated_at,
+    stale_share_counts,
 )
 
 
@@ -157,3 +161,103 @@ def test_load_portfolio_defaults_to_usd(tmp_path):
     path = str(tmp_path / "portfolio.json")
     save_portfolio({"SPY": 1000}, path=path, currency="USD")
     assert load_portfolio(path) == {"SPY": 1000.0}
+
+
+# --- split-stale share counts -----------------------------------------------
+
+
+def _splits(ticker: str = "9984.T", ex_date: str = "2025-12-29", ratio: float = 4.0):
+    return {ticker: pd.Series([ratio], index=pd.to_datetime([ex_date]))}
+
+
+def test_portfolio_updated_at_reads_the_saved_timestamp(tmp_path):
+    path = str(tmp_path / "p.json")
+    save_portfolio({"9984.T": 1000.0}, path=path, currency="JPY")
+    stamp = portfolio_updated_at(path, "JPY")
+    assert stamp is not None
+    assert stamp.tzinfo is not None
+
+
+def test_portfolio_updated_at_is_none_for_an_unsaved_currency(tmp_path):
+    path = str(tmp_path / "p.json")
+    save_portfolio({"SPY": 10.0}, path=path, currency="USD")
+    assert portfolio_updated_at(path, "JPY") is None
+
+
+def test_portfolio_updated_at_is_none_for_a_missing_file(tmp_path):
+    assert portfolio_updated_at(str(tmp_path / "absent.json"), "USD") is None
+
+
+def test_portfolio_updated_at_treats_an_unparseable_timestamp_as_absent(tmp_path):
+    """The file is hand-editable, and a bad date must not stop somebody
+    seeing what they own.
+    """
+    path = tmp_path / "p.json"
+    path.write_text(json.dumps({
+        "portfolios": {"JPY": {"positions": {"9984.T": 1000.0}, "updated_at": "not a date"}}
+    }))
+    assert portfolio_updated_at(str(path), "JPY") is None
+
+
+def test_stale_share_counts_flags_a_count_recorded_before_a_split():
+    """The real 9984.T case: 1,000 shares recorded in November, a 4:1 split
+    in December, so the position is 4,000 and every figure derived from
+    1,000 understates it fourfold.
+    """
+    stale = stale_share_counts(
+        {"9984.T": 1000.0},
+        datetime(2025, 11, 2, tzinfo=timezone.utc),
+        _splits(),
+    )
+    entry = stale["9984.T"]
+    assert entry.ratio == 4.0
+    assert entry.stored_shares == 1000.0
+    assert entry.likely_shares == 4000.0
+    assert entry.ex_date == date(2025, 12, 29)
+
+
+def test_stale_share_counts_is_silent_when_the_count_postdates_the_split():
+    """The user's actual portfolio: written 2026-09-06, well after the
+    2025-12-29 split, so the stored count is already post-split and warning
+    would be actively wrong.
+    """
+    assert stale_share_counts(
+        {"9984.T": 1000.0}, datetime(2026, 9, 6, tzinfo=timezone.utc), _splits()
+    ) == {}
+
+
+def test_stale_share_counts_is_silent_without_a_timestamp():
+    """An undated count cannot be judged, and guessing would risk telling
+    somebody to quadruple a holding that is already right.
+    """
+    assert stale_share_counts({"9984.T": 1000.0}, None, _splits()) == {}
+
+
+def test_stale_share_counts_is_silent_for_a_ticker_that_never_split():
+    assert stale_share_counts(
+        {"KO": 200.0}, datetime(2025, 11, 2, tzinfo=timezone.utc), _splits()
+    ) == {}
+    assert stale_share_counts(
+        {"KO": 200.0}, datetime(2025, 11, 2, tzinfo=timezone.utc), {}
+    ) == {}
+
+
+def test_stale_share_counts_compounds_two_splits_since_the_count_was_written():
+    stale = stale_share_counts(
+        {"X": 100.0},
+        datetime(2024, 1, 1, tzinfo=timezone.utc),
+        {"X": pd.Series([2.0, 3.0], index=pd.to_datetime(["2024-06-01", "2025-06-01"]))},
+    )
+    assert stale["X"].ratio == pytest.approx(6.0)
+    assert stale["X"].likely_shares == pytest.approx(600.0)
+    # The EARLIEST offending split is the one that dates the problem.
+    assert stale["X"].ex_date == date(2024, 6, 1)
+
+
+def test_stale_share_counts_flags_only_the_affected_ticker():
+    stale = stale_share_counts(
+        {"9984.T": 1000.0, "8035.T": 100.0},
+        datetime(2025, 11, 2, tzinfo=timezone.utc),
+        _splits(),
+    )
+    assert set(stale) == {"9984.T"}

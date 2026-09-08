@@ -1,6 +1,15 @@
-"""Per-ex-date cash dividend history, and the trailing dividend yield derived
-from it, for the minimum expected-dividend constraint in
-`src/optimizer/portfolio.py`.
+"""Per-ex-date corporate actions - cash dividends and stock splits - and the
+trailing dividend yield derived from them, for the minimum expected-dividend
+constraint in `src/optimizer/portfolio.py`.
+
+The module is named for dividends but owns splits too, because one
+`yf.download(..., actions=True)` call returns both and separating them would
+mean fetching the same bytes twice. A ticker's splits are needed for two
+things the dividends alone cannot express: restating a stored per-share
+amount back to the figure that was actually ANNOUNCED at the time (see
+`announced_amount`), and noticing that a share count somebody recorded
+before a split is no longer the number of shares they hold (see
+`src/flow/user_portfolio.py`'s `stale_share_counts`).
 
 Why this module exists at all. Every expected return this project estimates
 comes from the `returns` table, which is built from `adj_close` - Yahoo
@@ -62,6 +71,7 @@ import logging
 import time
 from datetime import date
 from pathlib import Path
+from typing import NamedTuple
 
 import duckdb
 import pandas as pd
@@ -79,6 +89,27 @@ into these names, so an empty frame must still carry them rather than being
 column-less. The same discipline `src/optimizer/portfolio.py`'s
 `RETURNS_LONG_COLUMNS` follows.
 """
+
+class SplitContext(NamedTuple):
+    """Everything a report needs to explain one ticker's restated dividends:
+    the splits inside the trailing window, and the payments they restated.
+
+    Built only for a ticker that actually split inside the window, so this
+    is absent for almost every ticker. `payments` carries the STORED amounts
+    - already on the current share basis - paired with their ex-dates, which
+    is what lets `announced_amount` turn a real one back into the figure the
+    company declared. Deriving a per-payment amount by dividing the trailing
+    total would be wrong for any payer whose dividend changed during the
+    window, which is exactly the payer most likely to have split.
+    """
+
+    splits: list[tuple[date, float]]
+    payments: list[tuple[date, float]]
+
+
+SPLITS_LONG_COLUMNS = ["ex_date", "ticker", "ratio"]
+"""The column shape every `reshape_splits_long` result has, empty ones
+included, for the same reason `DIVIDENDS_LONG_COLUMNS` is pinned."""
 
 COVERAGE_COLUMNS = ["ticker", "fetch_start", "fetch_end"]
 """The column shape of every `dividend_coverage` frame, empty ones included,
@@ -212,6 +243,64 @@ def reshape_dividends_long(raw: pd.DataFrame, symbol_to_ticker: dict[str, str]) 
     )
 
 
+def reshape_splits_long(raw: pd.DataFrame, symbol_to_ticker: dict[str, str]) -> pd.DataFrame:
+    """Reshape yfinance's `actions=True` split block into long format,
+    keeping only the rows that carry an actual split.
+
+    The exact counterpart of `reshape_dividends_long`, and drops the same
+    two kinds of non-row for the same reasons: yfinance zero-fills the
+    `Stock Splits` column on every trading day, so keeping zeros would store
+    ~250 rows a year to express one event, and a NaN appears wherever
+    another ticker in the batch introduced a date this one has no data for.
+    Neither is a split.
+
+    A missing `Stock Splits` column is NOT an error here, unlike a missing
+    `Dividends` column in `reshape_dividends_long`. That one is the field
+    every derived yield depends on, so its absence means the contract
+    changed and silence would produce a table of zero dividends. Splits are
+    explanatory: without them a report loses a sentence, not a number, and a
+    batch of tickers that have simply never split legitimately has nothing
+    to say. So this degrades to an empty frame and logs it.
+
+    Returns columns ['ex_date', 'ticker', 'ratio'], no I/O. Ratios are
+    stored exactly as reported and are deliberately NOT scaled by any
+    currency multiplier: a split ratio is a pure number, denominated in
+    nothing.
+    """
+    if raw.empty:
+        return pd.DataFrame(columns=SPLITS_LONG_COLUMNS)
+
+    top_level = set(raw.columns.get_level_values(0))
+    if "Stock Splits" not in top_level:
+        logger.info(
+            "no 'Stock Splits' column in this batch (top-level fields %s); "
+            "recording no splits",
+            sorted(top_level),
+        )
+        return pd.DataFrame(columns=SPLITS_LONG_COLUMNS)
+
+    long = raw["Stock Splits"].stack().reset_index()
+    long.columns = ["ex_date", "symbol", "ratio"]
+    long = long[long["ratio"].notna() & (long["ratio"] != 0)]
+
+    long["ticker"] = long["symbol"].map(symbol_to_ticker)
+    unmapped = long["ticker"].isna()
+    if unmapped.any():
+        logger.warning(
+            "dropping %d split rows with unmapped symbols: %s",
+            int(unmapped.sum()),
+            sorted(long.loc[unmapped, "symbol"].unique()),
+        )
+        long = long[~unmapped]
+
+    long["ex_date"] = pd.to_datetime(long["ex_date"]).dt.normalize()
+    return (
+        long[SPLITS_LONG_COLUMNS]
+        .sort_values(["ticker", "ex_date"])
+        .reset_index(drop=True)
+    )
+
+
 def apply_dividend_multipliers(
     long_dividends: pd.DataFrame, multipliers: dict[str, float]
 ) -> pd.DataFrame:
@@ -241,11 +330,18 @@ def write_dividends_tables(
     dividends_df: pd.DataFrame,
     coverage_df: pd.DataFrame,
     db_path: str = settings.db_path,
+    splits_df: pd.DataFrame | None = None,
 ) -> None:
-    """Write `dividends_df` to table `dividends` and `coverage_df` to table
-    `dividend_coverage` in the DuckDB file at `db_path`, creating the parent
-    directory if needed. Drops any pre-existing tables first, so re-running
-    this is always safe.
+    """Write `dividends_df` to table `dividends`, `splits_df` to table
+    `splits`, and `coverage_df` to table `dividend_coverage` in the DuckDB
+    file at `db_path`, creating the parent directory if needed. Drops any
+    pre-existing tables first, so re-running this is always safe.
+
+    All three land together because one fetch produces all three, and a
+    dividend stored without the split that restated it cannot be explained
+    to a reader. `splits_df=None` writes an empty `splits` table rather than
+    skipping it, so the table always exists once this has run and no reader
+    has to distinguish "no splits" from "no table".
     """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(db_path)
@@ -260,6 +356,18 @@ def write_dividends_tables(
             "FROM dividends_df"
         )
         con.unregister("dividends_df")
+
+        splits = splits_df if splits_df is not None else pd.DataFrame(columns=SPLITS_LONG_COLUMNS)
+        con.register("splits_df", splits)
+        con.execute("DROP TABLE IF EXISTS splits")
+        con.execute(
+            "CREATE TABLE splits AS "
+            "SELECT ex_date::DATE AS ex_date, "
+            "ticker::VARCHAR AS ticker, "
+            "ratio::DOUBLE AS ratio "
+            "FROM splits_df"
+        )
+        con.unregister("splits_df")
 
         con.register("coverage_df", coverage_df)
         con.execute("DROP TABLE IF EXISTS dividend_coverage")
@@ -280,6 +388,7 @@ def upsert_dividends_tables(
     coverage_df: pd.DataFrame,
     tickers: list[str],
     db_path: str = settings.db_path,
+    splits_df: pd.DataFrame | None = None,
 ) -> None:
     """Merge `dividends_df`/`coverage_df` into the
     `dividends`/`dividend_coverage` tables at `db_path`, replacing only the
@@ -297,6 +406,12 @@ def upsert_dividends_tables(
 
     Re-running with the same inputs is therefore idempotent rather than
     duplicating rows.
+
+    `splits_df` is merged the same way and for the same reason: a ticker
+    that has never split contributes no rows, so only the requested-ticker
+    list can clear a stale one. `None` clears the named tickers' splits
+    without inserting any, which is the correct outcome for a caller that
+    genuinely fetched no split data.
     """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(db_path)
@@ -306,12 +421,17 @@ def upsert_dividends_tables(
             "(ex_date DATE, ticker VARCHAR, amount DOUBLE)"
         )
         con.execute(
+            "CREATE TABLE IF NOT EXISTS splits "
+            "(ex_date DATE, ticker VARCHAR, ratio DOUBLE)"
+        )
+        con.execute(
             "CREATE TABLE IF NOT EXISTS dividend_coverage "
             "(ticker VARCHAR, fetch_start DATE, fetch_end DATE)"
         )
         if tickers:
             placeholders = ", ".join(["?"] * len(tickers))
             con.execute(f"DELETE FROM dividends WHERE ticker IN ({placeholders})", tickers)
+            con.execute(f"DELETE FROM splits WHERE ticker IN ({placeholders})", tickers)
             con.execute(
                 f"DELETE FROM dividend_coverage WHERE ticker IN ({placeholders})", tickers
             )
@@ -322,6 +442,14 @@ def upsert_dividends_tables(
             "FROM dividends_df"
         )
         con.unregister("dividends_df")
+
+        splits = splits_df if splits_df is not None else pd.DataFrame(columns=SPLITS_LONG_COLUMNS)
+        con.register("splits_df", splits)
+        con.execute(
+            "INSERT INTO splits SELECT ex_date::DATE, ticker::VARCHAR, ratio::DOUBLE "
+            "FROM splits_df"
+        )
+        con.unregister("splits_df")
 
         con.register("coverage_df", coverage_df)
         con.execute(
@@ -377,6 +505,120 @@ def load_dividends_long(
         con.close()
     df["ex_date"] = pd.to_datetime(df["ex_date"])
     return df
+
+
+def load_splits_long(
+    tickers: list[str],
+    db_path: str = settings.db_path,
+    after: date | None = None,
+) -> pd.DataFrame:
+    """Long-format rows (['ex_date', 'ticker', 'ratio']) from the `splits`
+    table for `tickers`, optionally restricted to `ex_date > after`.
+
+    Read-only, and a missing file or missing `splits` table reports an empty
+    frame rather than raising - a database built before this table existed
+    must still be readable, losing an explanatory sentence rather than
+    failing a report that would otherwise have worked. Same discipline as
+    `load_dividends_long`.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=SPLITS_LONG_COLUMNS)
+
+    placeholders = ", ".join(["?"] * len(tickers))
+    clauses = [f"ticker IN ({placeholders})"]
+    params: list[object] = list(tickers)
+    if after is not None:
+        clauses.append("ex_date > ?")
+        params.append(pd.Timestamp(after).date())
+
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+    except duckdb.IOException:
+        return pd.DataFrame(columns=SPLITS_LONG_COLUMNS)
+    try:
+        df = con.execute(
+            f"SELECT ex_date, ticker, ratio FROM splits WHERE {' AND '.join(clauses)} "
+            "ORDER BY ticker, ex_date",
+            params,
+        ).fetchdf()
+    except duckdb.CatalogException:
+        return pd.DataFrame(columns=SPLITS_LONG_COLUMNS)
+    finally:
+        con.close()
+    df["ex_date"] = pd.to_datetime(df["ex_date"])
+    return df
+
+
+def has_splits_table(db_path: str) -> bool:
+    """Whether `db_path` has a `splits` table at all.
+
+    Deliberately asks about the TABLE and never about rows. A ticker that
+    has never split contributes no split rows, so "no rows for this ticker"
+    cannot distinguish a database that predates this table from one that has
+    it and correctly holds nothing - the same trap `dividend_coverage` exists
+    to avoid for dividends. Table existence is a fact about the database's
+    vintage, which is exactly the question a one-time migration needs
+    answered.
+
+    Read-only, and a missing file reports `False` rather than raising or
+    creating one.
+    """
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+    except duckdb.IOException:
+        return False
+    try:
+        con.execute("SELECT 1 FROM splits LIMIT 1")
+        return True
+    except duckdb.CatalogException:
+        return False
+    finally:
+        con.close()
+
+
+def split_series_by_ticker(long_df: pd.DataFrame) -> dict[str, pd.Series]:
+    """`{ticker: Series(ratio, indexed by ex_date)}` from a
+    `load_splits_long` frame.
+
+    Exists so that `src/dataset/fundamentals.py`'s
+    `cumulative_split_ratio_after` - which this project has used for share-count
+    correction since plan 1 and which takes exactly that shape - can be reused
+    verbatim rather than reimplemented over a DataFrame. Pure, no I/O.
+    """
+    if long_df.empty:
+        return {}
+    return {
+        str(ticker): group.set_index("ex_date")["ratio"].astype(float)
+        for ticker, group in long_df.groupby("ticker")
+    }
+
+
+def announced_amount(stored_amount: float, ex_date: date, splits: pd.Series | None) -> float:
+    """The per-share dividend as it was ANNOUNCED on `ex_date`, recovered
+    from the `stored_amount` that Yahoo Finance restated onto the current
+    share basis.
+
+    Yahoo reports every dividend on the ticker's present share basis, so a
+    payment made before a split is divided down by every split since. This
+    multiplies it back, which is the one thing that lets a report quote the
+    figure a reader would find in a company announcement and reconcile it
+    against the figure the optimizer used.
+
+    Worked example, verified against real data: 9984.T split 4:1 on
+    2025-12-29 and its 2025-09-29 payment is stored as 5.5, so the
+    cumulative ratio after that ex-date is 4.0 and the announced amount was
+    22.0 - exactly what was declared. The 2026-03-30 payment, after the
+    split, has a ratio of 1.0 and is unchanged at 5.5.
+
+    Reuses `cumulative_split_ratio_after` (src/dataset/fundamentals.py),
+    which returns 1.0 for a ticker that never split, so this is a no-op in
+    the common case. Pure, no I/O.
+    """
+    from src.dataset.fundamentals import cumulative_split_ratio_after
+
+    if splits is None or splits.empty:
+        return float(stored_amount)
+    return float(stored_amount) * cumulative_split_ratio_after(splits, ex_date)
 
 
 def fetched_dividend_tickers(raw: pd.DataFrame, symbol_to_ticker: dict[str, str]) -> set[str]:
@@ -662,6 +904,9 @@ def build_dividends_for_tickers(
     raw = fetch_dividend_history(list(symbol_map.values()), start=start, end=end)
     long_dividends = reshape_dividends_long(raw, symbol_to_ticker)
     long_dividends = apply_dividend_multipliers(long_dividends, multipliers or {})
+    # Deliberately NOT put through `apply_dividend_multipliers`: a split
+    # ratio is a pure number, not an amount denominated in a currency.
+    long_splits = reshape_splits_long(raw, symbol_to_ticker)
 
     # Coverage is what the fetch actually returned, minus anything the
     # caller already knows is unusable (an unresolved price fetch, or a
@@ -678,6 +923,7 @@ def build_dividends_for_tickers(
         coverage_frame(cleaned, set(cleaned) - fetched, start, end),
         cleaned,
         db_path,
+        splits_df=long_splits,
     )
     return long_dividends
 
@@ -835,10 +1081,19 @@ def load_dividend_figures(
     as_of: date,
     db_path: str,
     lookback_months: int = settings.dividend_lookback_months,
-) -> tuple[dict[str, float], dict[str, float], dict[str, str]]:
+) -> tuple[dict[str, float], dict[str, float], dict[str, str], dict[str, list[tuple[date, float]]]]:
     """The one function a consumer needs:
-    `(yields, dividends_per_share, unavailable)` for `tickers` as of
-    `as_of`, read from `db_path`.
+    `(yields, dividends_per_share, unavailable, splits_in_window)` for
+    `tickers` as of `as_of`, read from `db_path`.
+
+    `splits_in_window` maps a ticker to a `SplitContext` when - and only
+    when - that ticker split inside the same trailing window the dividends
+    were summed over, so it is empty for the overwhelming majority of
+    tickers. It is returned here
+    rather than left to a second query because a report that shows a
+    restated per-share amount has to be able to explain it, and the window
+    it must explain is the one this function just used - handing that back is
+    cheaper and less error-prone than asking a caller to reconstruct it.
 
     `yields` maps a ticker to its trailing annual dividend yield, and a key
     is present ONLY when that yield can be relied on - a confirmed non-payer
@@ -856,17 +1111,33 @@ def load_dividend_figures(
     of a crash or a confident zero.
     """
     if not tickers:
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
+    window_start = pd.Timestamp(as_of) - pd.DateOffset(months=lookback_months)
     known = tickers_with_dividend_data(tickers, db_path)
-    long_df = load_dividends_long(
-        tickers,
-        pd.Timestamp(as_of) - pd.DateOffset(months=lookback_months),
-        as_of,
-        db_path,
-    )
+    long_df = load_dividends_long(tickers, window_start, as_of, db_path)
     per_share = trailing_dividends_per_share(long_df, tickers, as_of, lookback_months)
     prices = load_latest_close(tickers, as_of, db_path)
     yields, unavailable = trailing_dividend_yields(per_share, prices, known)
     available_per_share = {t: per_share[t] for t in yields}
-    return yields, available_per_share, unavailable
+
+    splits_long = load_splits_long(tickers, db_path, after=window_start.date())
+    splits_by_ticker: dict[str, list[tuple[date, float]]] = {}
+    for _, row in splits_long.iterrows():
+        ex_date = pd.Timestamp(row["ex_date"]).date()
+        if ex_date > as_of:
+            continue
+        splits_by_ticker.setdefault(str(row["ticker"]), []).append((ex_date, float(row["ratio"])))
+
+    in_window: dict[str, SplitContext] = {}
+    for ticker, events in splits_by_ticker.items():
+        rows = long_df[long_df["ticker"] == ticker] if not long_df.empty else long_df
+        payments = [
+            (pd.Timestamp(r["ex_date"]).date(), float(r["amount"]))
+            for _, r in rows.iterrows()
+        ] if not rows.empty else []
+        in_window[ticker] = SplitContext(
+            splits=sorted(events), payments=sorted(payments)
+        )
+
+    return yields, available_per_share, unavailable, in_window

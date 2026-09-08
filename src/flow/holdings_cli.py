@@ -82,6 +82,7 @@ from src.config.settings import settings
 from src.dataset.ticker_currency import DEFAULT_CURRENCY, partition_by_currency
 from src.flow.cli import (
     format_dividend_delta,
+    format_stale_share_counts,
     format_holdings_delta,
     parse_date,
     print_user_portfolio,
@@ -195,6 +196,14 @@ def _report(currency: str, args) -> None:
     `_remember_rate`'s job, called at most once per invocation.
     """
     resolved = _resolve_rate(currency, args)
+    # Printed before the report because a share count a split has multiplied
+    # makes every figure below uniformly wrong while leaving them
+    # self-consistent, so a caveat underneath would come too late.
+    stale = format_stale_share_counts(
+        args.path, currency, load_portfolio(args.path, currency), args.holdings_cache_path
+    )
+    if stale is not None:
+        print(stale)
     print_user_portfolio(
         prepare_holdings(
             load_portfolio(args.path, currency),
@@ -560,6 +569,14 @@ def _run_whatif(args) -> None:
             return None if window == DEFAULT_LOOKBACK_MONTHS else f"{window} requested"
 
         baseline = measure(baseline_positions)
+        # On the baseline only: the hypothetical variants below are the
+        # user's own inventions, so repeating a warning about the SAVED
+        # counts after every edit would be noise.
+        stale = format_stale_share_counts(
+            args.path, currency, baseline_positions, args.holdings_cache_path
+        )
+        if stale is not None:
+            print(stale)
         print_user_portfolio(
             baseline, args.path, risk_free_rate_origin=origin, window_origin=window_note()
         )

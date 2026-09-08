@@ -493,9 +493,12 @@ def _holdings_stats_excluding(
     # report a portfolio as paying nothing. Read from `db_path`, which for
     # these callers is the holdings cache or a throwaway session database -
     # never the shared universe cache.
-    dividends_per_share, dividend_unavailable, dividend_yields = _load_holdings_dividends(
-        list(measurable), rebalance_date, db_path
-    )
+    (
+        dividends_per_share,
+        dividend_unavailable,
+        dividend_yields,
+        dividend_splits,
+    ) = _load_holdings_dividends(list(measurable), rebalance_date, db_path)
 
     stats = holdings_stats(
         measurable,
@@ -507,15 +510,17 @@ def _holdings_stats_excluding(
         dividends_per_share=dividends_per_share,
         dividend_unavailable=dividend_unavailable,
         dividend_yields=dividend_yields,
+        dividend_splits=dividend_splits,
     )
     return stats._replace(positions=positions, excluded={**excluded, **stats.excluded})
 
 
 def _load_holdings_dividends(
     tickers: list[str], as_of: date, db_path: str
-) -> tuple[dict[str, float], dict[str, str], dict[str, float]]:
-    """`(dividends_per_share, unavailable, yields)` for `tickers` from
-    `db_path`, degrading to "nothing known" rather than raising.
+) -> tuple[dict[str, float], dict[str, str], dict[str, float], dict]:
+    """`(dividends_per_share, unavailable, yields, splits_in_window)` for
+    `tickers` from `db_path`, degrading to "nothing known" rather than
+    raising.
 
     A holdings report must never fail because of dividends. The rest of it -
     what is owned, what it is worth, its return and Sharpe ratio - is useful
@@ -526,11 +531,11 @@ def _load_holdings_dividends(
     then says out loud.
     """
     try:
-        yields, per_share, unavailable = load_dividend_figures(tickers, as_of, db_path)
-        return per_share, unavailable, yields
+        yields, per_share, unavailable, splits = load_dividend_figures(tickers, as_of, db_path)
+        return per_share, unavailable, yields, splits
     except Exception as e:  # noqa: BLE001 - duckdb raises assorted types here
         logger.warning("could not read dividend history for %s: %s", sorted(tickers), e)
-        return {}, {t: f"dividend history could not be read: {e}" for t in tickers}, {}
+        return {}, {t: f"dividend history could not be read: {e}" for t in tickers}, {}, {}
 
 
 def _resolve_holdings(
@@ -712,7 +717,7 @@ def _explain_dropped_dividend_payers(
         dropped = [t for t in candidates if t not in returns_matrix.columns]
         if not dropped:
             return error
-        yields, _per_share, _unavailable = load_dividend_figures(dropped, as_of, db_path)
+        yields, _per_share, _unavailable, _splits = load_dividend_figures(dropped, as_of, db_path)
         if not yields:
             return error
         best = max(yields, key=lambda t: yields[t])
@@ -763,7 +768,7 @@ def compute_weights_and_allocation(
     # `[a]dd` can introduce a ticker nobody has a yield for yet, and a loop
     # holding a static dict would either refuse that ticker forever or
     # silently omit it from the income figures.
-    yields, per_share, _unavailable = load_dividend_figures(
+    yields, per_share, _unavailable, splits_in_window = load_dividend_figures(
         list(returns_matrix.columns), rebalance_date, db_path
     )
     try:
@@ -775,6 +780,7 @@ def compute_weights_and_allocation(
             dividend_floor=dividend_floor,
             dividend_yields=yields,
             dividends_per_share=per_share,
+            dividend_splits=splits_in_window,
         )
     except DividendFloorError as e:
         raise _explain_dropped_dividend_payers(

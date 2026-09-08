@@ -58,6 +58,8 @@ question behind it) from the command line so the run can be scripted.
 from __future__ import annotations
 
 import argparse
+
+import pandas as pd
 from datetime import date
 
 from src.config.settings import settings
@@ -192,6 +194,99 @@ def format_signed_money(amount: float, currency: str = DEFAULT_CURRENCY) -> str:
     scanning a column of deltas expects to find it.
     """
     return f"{'+' if amount >= 0 else '-'}{format_money(abs(amount), currency)}"
+
+
+def format_dividend_coverage(covered: float | None, missing: tuple[str, ...]) -> str:
+    """The indented caveat under a portfolio dividend yield that does not
+    describe the whole portfolio.
+
+    Printed only when some ticker's yield is unknown, and it names both the
+    share of weight the figure covers and the tickers left out. The
+    alternative - quietly diluting the yield toward zero by treating an
+    unknown as a zero - would report a number that is not the answer to any
+    question. This is the rule `src/optimizer/holdings.py` already applies
+    to a holding it cannot measure: shrink the denominator and say so,
+    rather than withhold a correct answer about the rest.
+    """
+    names = ", ".join(missing)
+    verb = "has" if len(missing) == 1 else "have"
+    tail = "it is left out" if len(missing) == 1 else "they are left out"
+    share = f"{covered:.4f}" if covered is not None else "an unknown share"
+    return f"  covers {share} of the weight; {names} {verb} no trailing dividend data, so {tail}"
+
+
+def format_split_restatement(
+    splits_in_window: dict | None,
+    dividends_per_share: dict[str, float] | None = None,
+    currency: str = DEFAULT_CURRENCY,
+) -> str | None:
+    """The indented sentence explaining that a per-share dividend figure has
+    been restated by a stock split, or `None` when nothing in the window
+    split and there is therefore nothing to explain.
+
+    This line exists because of a real confusion it costs nothing to
+    prevent. Yahoo Finance reports every dividend on a ticker's CURRENT
+    share basis, so a payment made before a split is divided down by it:
+    9984.T declared 22 yen per share for its 2025-09-29 ex-date, split 4:1
+    on 2025-12-29, and that payment is therefore stored - correctly - as
+    5.5. A reader comparing the report against the company's own
+    announcement sees 5.5 where they expected 22 and concludes the report is
+    broken. It is not; it was simply silent about the one fact that
+    reconciles the two.
+
+    Both figures in the sentence are DERIVED rather than stored: the
+    per-share amount is the one the trailing sum actually used, and the
+    announced amount is that same row multiplied back by the cumulative
+    split ratio (`src/dataset/dividends.py`'s `announced_amount`). The
+    payment named is a real row rather than a total divided by a count,
+    which matters because a payer that changed its dividend mid-window - the
+    payer most likely to have split - would make any such average wrong.
+
+    Printed only when a split really falls inside the window, so the
+    overwhelming majority of reports are byte-identical to before.
+    Takes `dict[str, SplitContext]`; `dividends_per_share` is accepted but
+    unused, kept so the two dividend formatters take the same shape of
+    argument at their call sites.
+    """
+    if not splits_in_window:
+        return None
+
+    from src.dataset.dividends import announced_amount
+
+    parts: list[str] = []
+    for ticker in sorted(splits_in_window):
+        context = splits_in_window[ticker]
+        events = sorted(context.splits)
+        if not events:
+            continue
+        ratios = " and ".join(f"{ratio:g}:1 on {ex_date}" for ex_date, ratio in events)
+        sentence = f"{ticker} split {ratios}"
+
+        # Name a payment the reader may well be holding an announcement for:
+        # the earliest in the window, which every split since has restated.
+        payments = sorted(context.payments)
+        series = pd.Series(
+            [ratio for _ex, ratio in events],
+            index=pd.to_datetime([ex for ex, _r in events]),
+        )
+        for ex_date, stored in payments:
+            announced = announced_amount(stored, ex_date, series)
+            if abs(announced - stored) > 1e-9:
+                sentence += (
+                    f", so its {ex_date} payment of "
+                    f"{format_money(announced, currency)} as announced counts as "
+                    f"{format_money(stored, currency)} per current share"
+                )
+                break
+        parts.append(sentence)
+
+    if not parts:
+        return None
+    return (
+        "  Per-share amounts are on each ticker's CURRENT share basis. "
+        + "; ".join(parts)
+        + "."
+    )
 
 
 def format_dividend_floor(
@@ -379,16 +474,14 @@ def print_weights_and_allocation(
         )
         print(f"Portfolio dividend yield: {stats.portfolio_dividend_yield:.4f}{income}")
         if stats.dividend_yields_missing:
-            print(
-                f"  covers {stats.dividend_weight_covered:.4f} of the weight; "
-                f"{', '.join(stats.dividend_yields_missing)} "
-                f"{'has' if len(stats.dividend_yields_missing) == 1 else 'have'} no trailing "
-                "dividend data and are left out"
-                if len(stats.dividend_yields_missing) != 1
-                else f"  covers {stats.dividend_weight_covered:.4f} of the weight; "
-                     f"{stats.dividend_yields_missing[0]} has no trailing dividend data and is "
-                     "left out"
-            )
+            print(format_dividend_coverage(
+                stats.dividend_weight_covered, stats.dividend_yields_missing
+            ))
+        restated = format_split_restatement(
+            stats.dividend_splits, stats.dividends_per_share, currency
+        )
+        if restated is not None:
+            print(restated)
     print(format_dividend_floor(
         stats.dividend_yield_floor, stats.dividend_floor_origin, stats.portfolio_dividend_yield
     ))
@@ -580,6 +673,76 @@ def format_dividend_delta(baseline: HoldingsStats, hypothetical: HoldingsStats) 
     )
 
 
+def _as_argument(shares: float) -> str:
+    """A share count as a command-line ARGUMENT: `'4000'`, `'0.5432'` - no
+    thousands separators, which `format_share_count` adds for reading and
+    which would make a suggested command fail to parse.
+    """
+    if float(shares).is_integer():
+        return str(int(shares))
+    return f"{shares:.4f}".rstrip("0").rstrip(".")
+
+
+def format_stale_share_counts(
+    path: str,
+    currency: str,
+    positions: dict[str, float],
+    db_path: str,
+) -> str | None:
+    """A warning naming every holding whose stored share count predates a
+    split, or `None` when there is nothing to warn about.
+
+    Printed ABOVE the report, because it qualifies every figure below it -
+    the same position the `Portfolio currency` line occupies, and for the
+    same reason. A share count that a split has multiplied leaves the whole
+    report internally consistent and uniformly wrong, so a caveat printed
+    underneath would be read after the numbers it invalidates.
+
+    Never writes anything. The suggested count is `stored * ratio`, which is
+    right only if nothing else changed, and a split is exactly the kind of
+    event around which people also buy and sell - so the command to apply it
+    is printed for the reader to run deliberately rather than executed on
+    their behalf. `memory/portfolio.json` is theirs.
+
+    Reads the timestamp from `path` and the splits from `db_path`, so a
+    database with no `splits` table (or a portfolio with no `updated_at`)
+    yields `None` and changes no existing output.
+    """
+    from src.dataset.dividends import load_splits_long, split_series_by_ticker
+    from src.flow.user_portfolio import portfolio_updated_at, stale_share_counts
+
+    if not positions:
+        return None
+
+    updated_at = portfolio_updated_at(path, currency)
+    if updated_at is None:
+        return None
+
+    splits = split_series_by_ticker(load_splits_long(sorted(positions), db_path))
+    stale = stale_share_counts(positions, updated_at, splits)
+    if not stale:
+        return None
+
+    lines = [""]
+    for ticker in sorted(stale):
+        entry = stale[ticker]
+        lines.append(
+            f"WARNING: {ticker} split {entry.ratio:g}:1 on {entry.ex_date}, after this "
+            f"portfolio was last updated ({updated_at.date()}). The stored "
+            f"{format_share_count(entry.stored_shares)} shares is likely a pre-split count "
+            f"and the position is probably {format_share_count(entry.likely_shares)} now, "
+            f"which would understate every figure below by {entry.ratio:g}x. To confirm it:"
+        )
+        # A bare number, NOT `format_share_count`: that adds thousands
+        # separators for readability, and `set 9984.T 4,000` is not a command
+        # anybody can run. A suggestion that has to be edited before it works
+        # is worse than no suggestion.
+        lines.append(
+            f"  uv run portfolio-holdings set {ticker} {_as_argument(entry.likely_shares)}"
+        )
+    return "\n".join(lines)
+
+
 def print_user_portfolio(
     holdings: HoldingsStats,
     path: str,
@@ -677,6 +840,11 @@ def print_user_portfolio(
     dividend_total = format_holdings_dividend_total(holdings, currency)
     if dividend_total is not None:
         print(dividend_total)
+        restated = format_split_restatement(
+            holdings.dividends.splits_in_window, holdings.dividends.dividends_per_share, currency
+        )
+        if restated is not None:
+            print(restated)
 
     if holdings.unavailable_reason is not None:
         print(f"Figures: n/a - {holdings.unavailable_reason}")
@@ -1862,6 +2030,14 @@ def main() -> None:
         # would imply a relationship between the edit and the holdings that
         # does not exist.
         if not args.no_holdings:
+            stale = format_stale_share_counts(
+                args.holdings_path,
+                currency,
+                load_portfolio(args.holdings_path, currency),
+                args.holdings_cache_path,
+            )
+            if stale is not None:
+                print(stale)
             print_user_portfolio(
                 prepare_holdings(
                     load_portfolio(args.holdings_path, currency),
