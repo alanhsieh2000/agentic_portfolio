@@ -17,8 +17,12 @@ import pandas as pd
 import pytest
 
 from src.dataset.dividends import (
+    DIVIDEND_UNRESOLVED_COLUMNS,
     DIVIDENDS_LONG_COLUMNS,
     SPLITS_LONG_COLUMNS,
+    dividend_unresolved_reasons,
+    unresolved_frame,
+    unresolved_frame_from_caller,
     announced_amount,
     has_splits_table,
     reshape_splits_long,
@@ -843,3 +847,270 @@ def test_load_dividend_figures_ignores_a_split_after_the_as_of_date(tmp_path):
     )
     _y, _p, _u, in_window = load_dividend_figures(["X"], dt.date(2026, 3, 1), str(db))
     assert in_window == {}
+
+
+# ---------------------------------------------------------------------------
+# `dividend_unresolved`: why a ticker has no coverage
+#
+# The table exists because "no dividend data has been fetched for it" was
+# true of every uncovered ticker and useful for none. AVB, EA, EQR and LEG
+# have no coverage in the shipped database because Yahoo no longer serves
+# their 2015-2024 window at all - so the build the old sentence recommends
+# can never succeed, and following it costs a full 525-ticker fetch. These
+# tests pin the distinction between that case and a transient miss, and
+# never touch the network: `probe` is injected everywhere.
+# ---------------------------------------------------------------------------
+
+_WINDOW = ("2015-01-01", "2024-04-30")
+
+
+def _probe(mapping):
+    """A `probe_served_window` stand-in reading from `mapping`."""
+    return lambda symbol: mapping.get(symbol)
+
+
+def test_unresolved_frame_names_a_window_the_source_no_longer_serves():
+    """The AVB/EA/EQR/LEG case, reproduced: the symbol resolves, but the
+    only history Yahoo serves for it postdates the requested window
+    entirely. Re-running the build cannot fix that, and the reason has to
+    say so rather than advise it.
+    """
+    frame = unresolved_frame(
+        ["AVB"],
+        {"AVB": "AVB"},
+        *_WINDOW,
+        probe=_probe({"AVB": (dt.date(2026, 7, 17), dt.date(2026, 8, 24))}),
+    )
+    reason = frame.set_index("ticker")["reason"]["AVB"]
+    assert "no longer serves" in reason
+    assert "2026-07-17..2026-08-24" in reason
+    assert "2015-01-01..2024-04-30" in reason
+    assert "cannot fix this" in reason
+    # The advice that does not work must not appear.
+    assert "may fix it" not in reason
+
+
+def test_unresolved_frame_calls_a_miss_transient_when_the_served_range_overlaps():
+    """The opposite verdict, and the reason the probe is worth its network
+    call: a ticker Yahoo does serve over the requested window failed for
+    some other reason, and re-running really may fix it.
+    """
+    frame = unresolved_frame(
+        ["BOXX"],
+        {"BOXX": "BOXX"},
+        *_WINDOW,
+        probe=_probe({"BOXX": (dt.date(2014, 1, 2), dt.date(2026, 9, 4))}),
+    )
+    reason = frame.set_index("ticker")["reason"]["BOXX"]
+    assert "transient" in reason
+    assert "may fix it" in reason
+    assert "no longer serves" not in reason
+
+
+def test_unresolved_frame_admits_it_does_not_know_when_the_probe_finds_nothing():
+    """A symbol Yahoo serves nothing at all for - a typo, or a ticker that
+    never existed. Claiming either verdict would be a guess, so the reason
+    says the question is open.
+    """
+    frame = unresolved_frame(["BOGUS"], {"BOGUS": "BOGUS"}, *_WINDOW, probe=_probe({}))
+    reason = frame.set_index("ticker")["reason"]["BOGUS"]
+    assert "not known whether" in reason
+    assert "cannot fix this" not in reason
+
+
+def test_unresolved_frame_probes_the_yfinance_symbol_not_the_project_ticker():
+    """A non-US ticker is fetched under its yfinance symbol, so that is what
+    a probe of "what does the source serve" has to ask about - asking about
+    the project's own ticker string would probe a symbol nobody fetched.
+    """
+    seen = []
+
+    def probe(symbol):
+        seen.append(symbol)
+        return None
+
+    unresolved_frame(["8035.T"], {"8035.T": "8035.T"}, *_WINDOW, probe=probe)
+    assert seen == ["8035.T"]
+
+
+def test_unresolved_frame_is_empty_and_typed_for_a_fetch_that_missed_nothing():
+    frame = unresolved_frame([], {}, *_WINDOW, probe=_probe({}))
+    assert frame.empty
+    assert list(frame.columns) == DIVIDEND_UNRESOLVED_COLUMNS
+
+
+def test_a_caller_refused_ticker_still_gets_a_row():
+    """`build_dividends_for_tickers`' `unresolved` argument names tickers
+    whose prices or currency already failed. They are not probed - the fetch
+    was never going to work - but they still need a row, because a ticker
+    with neither a coverage row nor an unresolved row is the silent gap.
+    """
+    frame = unresolved_frame_from_caller(["BOGUS"])
+    assert frame["ticker"].tolist() == ["BOGUS"]
+    assert "already known to be unusable" in frame["reason"][0]
+
+
+def test_write_dividends_tables_always_creates_the_unresolved_table(tmp_path):
+    """Same discipline as `splits`: the table exists once a build has run,
+    so no reader has to distinguish "everything resolved" from "no table".
+    """
+    db = tmp_path / "d.duckdb"
+    write_dividends_tables(
+        _rows(), coverage_frame(["AAPL"], set(), *_WINDOW), str(db)
+    )
+    assert _read(db, "dividend_unresolved").empty
+
+
+def test_upsert_clears_an_unresolved_row_when_the_ticker_starts_resolving(tmp_path):
+    """The keyed delete is what makes a recorded reason self-correcting. A
+    transient failure leaves a row saying so; the next fetch that ASKS about
+    that ticker must clear it rather than leave a stale explanation sitting
+    beside good coverage.
+    """
+    db = tmp_path / "d.duckdb"
+    upsert_dividends_tables(
+        pd.DataFrame(columns=DIVIDENDS_LONG_COLUMNS),
+        coverage_frame(["AAPL"], {"AAPL"}, *_WINDOW),
+        ["AAPL"],
+        str(db),
+        unresolved_df=unresolved_frame(
+            ["AAPL"], {"AAPL": "AAPL"}, *_WINDOW, probe=_probe({})
+        ),
+    )
+    assert _read(db, "dividend_unresolved")["ticker"].tolist() == ["AAPL"]
+
+    upsert_dividends_tables(
+        _rows("AAPL"), coverage_frame(["AAPL"], set(), *_WINDOW), ["AAPL"], str(db)
+    )
+    assert _read(db, "dividend_unresolved").empty
+    assert _read(db, "dividend_coverage")["ticker"].tolist() == ["AAPL"]
+
+
+def test_a_ticker_never_holds_coverage_and_an_unresolved_row_at_once(tmp_path):
+    """The invariant that makes either table answerable on its own:
+    `coverage_frame` and `unresolved_frame` split one requested list, and
+    one upsert deletes from both before inserting.
+    """
+    db = tmp_path / "d.duckdb"
+    upsert_dividends_tables(
+        _rows("AAPL"),
+        coverage_frame(["AAPL", "AVB"], {"AVB"}, *_WINDOW),
+        ["AAPL", "AVB"],
+        str(db),
+        unresolved_df=unresolved_frame(
+            ["AVB"],
+            {"AVB": "AVB"},
+            *_WINDOW,
+            probe=_probe({"AVB": (dt.date(2026, 7, 17), dt.date(2026, 8, 24))}),
+        ),
+    )
+    covered = set(_read(db, "dividend_coverage")["ticker"])
+    unresolved = set(_read(db, "dividend_unresolved")["ticker"])
+    assert covered == {"AAPL"}
+    assert unresolved == {"AVB"}
+    assert covered & unresolved == set()
+
+
+def test_dividend_unresolved_reasons_is_empty_for_a_database_without_the_table(tmp_path):
+    """An older cache degrades to the generic sentence instead of raising -
+    the same rule `tickers_with_dividend_data` follows.
+    """
+    db = tmp_path / "old.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+    con.close()
+    assert dividend_unresolved_reasons(["AVB"], str(db)) == {}
+
+
+def test_dividend_unresolved_reasons_does_not_create_a_missing_database(tmp_path):
+    db = tmp_path / "absent.duckdb"
+    assert dividend_unresolved_reasons(["AVB"], str(db)) == {}
+    assert not db.exists()
+
+
+def test_trailing_dividend_yields_prefers_a_recorded_reason():
+    """The recorded reason replaces the generic sentence - and the ticker is
+    still ABSENT from `yields`. A reason explains a missing yield; it never
+    supplies one.
+    """
+    yields, unavailable = trailing_dividend_yields(
+        {"AVB": 0.0},
+        pd.Series({"AVB": 191.02}),
+        set(),
+        {"AVB": "yfinance no longer serves this ticker's history"},
+    )
+    assert "AVB" not in yields
+    assert unavailable["AVB"] == "yfinance no longer serves this ticker's history"
+
+
+def test_trailing_dividend_yields_falls_back_to_the_generic_sentence():
+    yields, unavailable = trailing_dividend_yields(
+        {"AVB": 0.0}, pd.Series({"AVB": 191.02}), set(), {"OTHER": "some reason"}
+    )
+    assert "AVB" not in yields
+    assert "no dividend data has been fetched" in unavailable["AVB"]
+
+
+def test_load_dividend_figures_reports_the_recorded_reason(tmp_path):
+    """End to end: a ticker with prices, no coverage and a recorded reason
+    reports that reason - which is what the AVB/EA/EQR/LEG rows in
+    `data/portfolio.duckdb` will do once they are recorded.
+    """
+    db = tmp_path / "p.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+    con.execute("INSERT INTO prices VALUES ('2024-04-29', 'AVB', 191.02, 160.00)")
+    con.close()
+    upsert_dividends_tables(
+        pd.DataFrame(columns=DIVIDENDS_LONG_COLUMNS),
+        coverage_frame(["AVB"], {"AVB"}, *_WINDOW),
+        ["AVB"],
+        str(db),
+        unresolved_df=unresolved_frame(
+            ["AVB"],
+            {"AVB": "AVB"},
+            *_WINDOW,
+            probe=_probe({"AVB": (dt.date(2026, 7, 17), dt.date(2026, 8, 24))}),
+        ),
+    )
+    yields, per_share, unavailable, _splits = load_dividend_figures(
+        ["AVB"], dt.date(2024, 4, 29), str(db)
+    )
+    assert yields == {}
+    assert per_share == {}
+    assert "no longer serves" in unavailable["AVB"]
+    assert "2026-07-17..2026-08-24" in unavailable["AVB"]
+
+
+def test_dividend_yield_vector_quotes_a_recorded_reason_instead_of_advising_a_rebuild():
+    """The refusal a floored pool containing LEG produces. "Build its
+    dividend history" is the one thing that cannot work here, so with a
+    reason for every missing ticker it is replaced by the reasons.
+    """
+    with pytest.raises(DividendYieldUnavailableError) as excinfo:
+        dividend_yield_vector(
+            {"T": 0.0653},
+            ["T", "LEG"],
+            {"LEG": "yfinance no longer serves this ticker's history for 2015-01-01..2024-04-30"},
+        )
+    message = str(excinfo.value)
+    assert "no longer serves" in message
+    assert "build its dividend history" not in message
+    assert "Remove it from the pool" in message
+
+
+def test_dividend_yield_vector_keeps_the_rebuild_advice_when_a_reason_is_missing():
+    """Partial explanation keeps the advice, because it is still actionable
+    for the ticker that has no recorded reason.
+    """
+    with pytest.raises(DividendYieldUnavailableError) as excinfo:
+        dividend_yield_vector(
+            {"T": 0.0653}, ["T", "LEG", "NEW"], {"LEG": "yfinance no longer serves it"}
+        )
+    assert "build its dividend history" in str(excinfo.value)
+
+
+def test_dividend_yield_vector_without_reasons_is_unchanged():
+    with pytest.raises(DividendYieldUnavailableError) as excinfo:
+        dividend_yield_vector({"T": 0.0653}, ["T", "LEG"])
+    assert "build its dividend history" in str(excinfo.value)

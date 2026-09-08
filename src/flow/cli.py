@@ -196,7 +196,11 @@ def format_signed_money(amount: float, currency: str = DEFAULT_CURRENCY) -> str:
     return f"{'+' if amount >= 0 else '-'}{format_money(abs(amount), currency)}"
 
 
-def format_dividend_coverage(covered: float | None, missing: tuple[str, ...]) -> str:
+def format_dividend_coverage(
+    covered: float | None,
+    missing: tuple[str, ...],
+    reasons: dict[str, str] | None = None,
+) -> str:
     """The indented caveat under a portfolio dividend yield that does not
     describe the whole portfolio.
 
@@ -212,7 +216,15 @@ def format_dividend_coverage(covered: float | None, missing: tuple[str, ...]) ->
     verb = "has" if len(missing) == 1 else "have"
     tail = "it is left out" if len(missing) == 1 else "they are left out"
     share = f"{covered:.4f}" if covered is not None else "an unknown share"
-    return f"  covers {share} of the weight; {names} {verb} no trailing dividend data, so {tail}"
+    line = (
+        f"  covers {share} of the weight; {names} {verb} no trailing dividend data, so {tail}"
+    )
+    # The reason goes on its own indented line per ticker rather than into
+    # the sentence above: these sentences name dates and ranges, and one of
+    # them inlined would push this line past anything readable in a
+    # terminal - while two of them would make it unparseable.
+    detail = [f"    {t}: {reasons[t]}" for t in missing if (reasons or {}).get(t)]
+    return "\n".join([line, *detail]) if detail else line
 
 
 def format_split_restatement(
@@ -369,7 +381,13 @@ def print_dividend_section(
     print("\nDividend yield / annual income (trailing 12 months):")
     for ticker in held:
         if ticker not in stats.dividend_yields:
-            print(f"  {ticker}: yield n/a - no trailing dividend data")
+            # The dividend layer's own sentence when there is one. "No
+            # trailing dividend data" is true of every case and actionable
+            # in none of them; "yfinance no longer serves this ticker's
+            # history for 2015-01-01..2024-04-30" tells the reader whether
+            # to rebuild, re-run, or stop trying.
+            reason = (stats.dividend_unavailable or {}).get(ticker, "no trailing dividend data")
+            print(f"  {ticker}: yield n/a - {reason}")
             continue
         ticker_yield = stats.dividend_yields[ticker]
         note = "  (pays no dividend)" if ticker_yield == 0.0 else ""
@@ -476,7 +494,9 @@ def print_weights_and_allocation(
         print(f"Portfolio dividend yield: {stats.portfolio_dividend_yield:.4f}{income}")
         if stats.dividend_yields_missing:
             print(format_dividend_coverage(
-                stats.dividend_weight_covered, stats.dividend_yields_missing
+                stats.dividend_weight_covered,
+                stats.dividend_yields_missing,
+                stats.dividend_unavailable,
             ))
         restated = format_split_restatement(
             stats.dividend_splits, stats.dividends_per_share, currency
@@ -633,6 +653,7 @@ def format_holdings_dividend_total(holdings: HoldingsStats, currency: str) -> st
 
     total_value = holdings.total_value
     covered = figures.value_covered
+    detail = ""
     if total_value and covered is not None and abs(covered - total_value) > 0.005:
         gap = sorted(figures.unavailable)
         base = (
@@ -640,11 +661,18 @@ def format_holdings_dividend_total(holdings: HoldingsStats, currency: str) -> st
             f"{format_money(total_value, currency)} total; "
             f"{', '.join(gap)} {'has' if len(gap) == 1 else 'have'} no trailing dividend data"
         )
+        # Each holding's reason on its own line BELOW the figure, never
+        # inside its parenthetical: for a holding this is the difference
+        # between "run --refresh-holdings" and "this income figure will
+        # never be complete", and these sentences name dates and ranges
+        # that would push the figure line past anything readable in a
+        # terminal. The same shape `format_dividend_coverage` uses.
+        detail = "".join(f"\n  {t}: {figures.unavailable[t]}" for t in gap)
     else:
         base = f"on the full {format_money(covered or 0.0, currency)} total"
     return (
         f"Trailing annual dividends: {format_money(figures.total_annual_dividends, currency)}  "
-        f"Dividend yield: {figures.dividend_yield:.4f} ({base})"
+        f"Dividend yield: {figures.dividend_yield:.4f} ({base}){detail}"
     )
 
 

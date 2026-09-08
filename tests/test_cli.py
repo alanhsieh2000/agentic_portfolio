@@ -1984,6 +1984,51 @@ def test_print_weights_and_allocation_names_a_non_payer_separately_from_missing_
     assert "GROWTH: yield=0.0000" not in out
 
 
+def test_print_weights_and_allocation_gives_the_recorded_reason_for_a_missing_yield():
+    """The generic sentence is true of every uncovered ticker and
+    actionable for none of them. The dividend layer's own sentence says whether to
+    rebuild, re-run, or stop trying - which for LEG, whose 2015-2024 window
+    Yahoo no longer serves, is the only useful thing the report can say.
+    """
+    reason = (
+        "yfinance no longer serves this ticker's history for the requested "
+        "2015-01-01..2024-04-30 window: the only range it serves for LEG is "
+        "2026-07-17..2026-08-27"
+    )
+    missing = _dividend_stats(
+        weights={"T": 0.7, "LEG": 0.3},
+        expected_returns={"T": 0.08, "LEG": 0.05},
+        volatility={"T": 0.20, "LEG": 0.30},
+        dividend_yields={"T": 0.0397},
+        dividends_per_share={"T": 1.11},
+        dividend_yields_missing=("LEG",),
+        dividend_weight_covered=0.7,
+        dividend_unavailable={"LEG": reason},
+    )
+    out = _render(missing, portfolio_value=100000.0)
+    assert f"LEG: yield n/a - {reason}" in out
+    # The coverage caveat carries it too, on its own line rather than
+    # inlined into a sentence already three figures wide.
+    assert "covers 0.7000 of the weight; LEG has no trailing dividend data" in out
+    assert f"    LEG: {reason}" in out
+
+
+def test_print_weights_and_allocation_falls_back_when_no_reason_was_recorded():
+    """A database built before `dividend_unresolved` existed records no
+    reason, and the report degrades to the generic sentence rather than
+    printing an empty one.
+    """
+    missing = _dividend_stats(
+        dividend_yields={"T": 0.0397},
+        dividends_per_share={"T": 1.11},
+        dividend_yields_missing=("GROWTH",),
+        dividend_weight_covered=0.7,
+        dividend_unavailable={},
+    )
+    out = _render(missing, portfolio_value=100000.0)
+    assert "GROWTH: yield n/a - no trailing dividend data" in out
+
+
 def test_print_weights_and_allocation_states_the_covered_weight_when_a_yield_is_missing():
     missing = _dividend_stats(
         dividend_yields={"T": 0.0397},

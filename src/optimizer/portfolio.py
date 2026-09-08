@@ -332,6 +332,7 @@ def _fit_efficient_frontier(
     risk_free_rate: float,
     dividend_floor: DividendFloor | None = None,
     dividend_yields: dict[str, float] | None = None,
+    dividend_unavailable: dict[str, str] | None = None,
 ) -> tuple[EfficientFrontier, pd.Series, pd.DataFrame]:
     """Estimate `mu`/`cov_matrix` from `returns_matrix` and solve `objective`,
     returning the fitted `EfficientFrontier` alongside both estimates.
@@ -369,7 +370,11 @@ def _fit_efficient_frontier(
                 "the caller must supply both or neither"
             )
         tickers = list(mu.index)
-        yields_vector = dividend_yield_vector(dividend_yields, tickers)
+        # The reasons go in so the refusal can name the real one. Without
+        # them `dividend_yield_vector` can only advise building the missing
+        # history, which for a window the source no longer serves is advice
+        # that costs a full fetch and changes nothing.
+        yields_vector = dividend_yield_vector(dividend_yields, tickers, dividend_unavailable)
         check_dividend_floor_feasible(dividend_floor, yields_vector, tickers)
 
         vector, floor = yields_vector, float(dividend_floor.yield_floor)
@@ -648,6 +653,17 @@ class PortfolioStats(NamedTuple):
     `target_annual_return` is populated regardless of objective but is
     meaningful only for MV, the one objective defined by it.
 
+    `dividend_unavailable` carries the dividend layer's own sentence for
+    each ticker whose yield could not be determined, straight from
+    `src/dataset/dividends.py`'s `load_dividend_figures`. It is echoed
+    rather than derived because only that layer knows WHY - a window Yahoo
+    no longer serves reads differently from a missing price, and
+    `dividend_yields_missing` can only say which tickers, never which
+    cause. A report that prints `yield n/a` should be able to finish the
+    sentence. `None` and `{}` mean different things here, exactly as they do
+    for `dividend_yields`: `None` is "dividends were not consulted for this
+    run", `{}` is "consulted, and every ticker's yield came through".
+
     `returns_window_start`, `returns_window_end`, and `returns_window_months`
     describe the actual trailing window of monthly returns read from the
     `returns` table for this optimization - derived from the returns
@@ -677,6 +693,7 @@ class PortfolioStats(NamedTuple):
     dividend_yields_missing: tuple[str, ...] = ()
     dividend_weight_covered: float | None = None
     dividend_splits: dict | None = None
+    dividend_unavailable: dict[str, str] | None = None
 
 
 def _dividend_stats_fields(
@@ -687,6 +704,7 @@ def _dividend_stats_fields(
     dividend_yields: dict[str, float] | None,
     dividends_per_share: dict[str, float] | None,
     dividend_splits: dict | None = None,
+    dividend_unavailable: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """The dividend half of a `PortfolioStats`, computed in exactly one
     place so the reported figure and the enforced constraint cannot drift
@@ -718,6 +736,12 @@ def _dividend_stats_fields(
         "dividend_yields": {t: float(v) for t, v in dividend_yields.items()},
         "dividends_per_share": dict(dividends_per_share or {}),
         "dividend_yields_missing": missing,
+        # Narrowed to the tickers actually missing a yield: a reason for a
+        # ticker whose yield came through would be a sentence explaining
+        # nothing, and the report has no place to print it.
+        "dividend_unavailable": {
+            t: r for t, r in (dividend_unavailable or {}).items() if t in missing
+        },
         "dividend_yield_floor": None if dividend_floor is None else float(dividend_floor.yield_floor),
         "dividend_floor_origin": None if dividend_floor is None else dividend_floor.origin,
         "dividend_splits": dict(dividend_splits or {}),
@@ -745,6 +769,7 @@ def compute_weights_and_stats(
     dividend_yields: dict[str, float] | None = None,
     dividends_per_share: dict[str, float] | None = None,
     dividend_splits: dict | None = None,
+    dividend_unavailable: dict[str, str] | None = None,
 ) -> PortfolioStats:
     """`compute_weights`'s result plus the estimates behind it, for a caller
     that reports why a portfolio looks the way it does rather than only what
@@ -779,6 +804,7 @@ def compute_weights_and_stats(
         risk_free_rate,
         dividend_floor=dividend_floor,
         dividend_yields=dividend_yields,
+        dividend_unavailable=dividend_unavailable,
     )
     weights = dict(ef.clean_weights())
 
@@ -786,7 +812,14 @@ def compute_weights_and_stats(
         _validate_efficient_return_result(weights, ef, target_annual_return)
 
     dividend_fields = _dividend_stats_fields(
-        ef, mu, weights, dividend_floor, dividend_yields, dividends_per_share, dividend_splits
+        ef,
+        mu,
+        weights,
+        dividend_floor,
+        dividend_yields,
+        dividends_per_share,
+        dividend_splits,
+        dividend_unavailable,
     )
     if dividend_floor is not None:
         _validate_dividend_floor_result(dividend_fields, dividend_floor)

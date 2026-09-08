@@ -20,14 +20,27 @@ number of dollars a year is asking about the cash part specifically, and
 answering that needs the actual per-share amounts, which no other table in
 this project holds. `close - adj_close` encodes the dividends cumulatively
 (see `reconcile_trailing_yield` below, which exploits exactly that as a
-correctness check), but only as a back-adjustment factor, never as the
-"$0.485 per share on 2024-03-14" a cash figure has to be built from.
+correctness check).
+
+That encoding is in fact invertible - with `f = adj_close / close`, the
+payment at an ex-date is `close_prev * (1 - f_prev / f)`, which reproduces
+this project's stored amounts for KO, T, XOM and AAPL to within 5e-5 across
+149 payments (`plans/16_dividend_coverage_reasons.md` records the run). It
+is deliberately NOT a source of dividend data here. Every amount this
+module stores comes from the fetch, so a stored payment is always a
+reported payment, and no consumer has to ask which of two provenances a
+figure carries. Where a fetch cannot cover a ticker, this module records
+that it could not - see `unresolved_frame` - rather than inferring an
+amount from prices.
 
 Three layers, the same discipline every other module in `src/dataset/`
-follows: `_fetch_batch` is the ONLY function here that performs network
-I/O, `reshape_dividends_long` and `trailing_dividend_yields` are pure, and
+follows: `_fetch_batch` and `probe_served_window` are the only functions
+here that perform network I/O, `reshape_dividends_long` and
+`trailing_dividend_yields` are pure, and
 `write_dividends_tables`/`upsert_dividends_tables` are the only ones that
-touch DuckDB.
+touch DuckDB. `_fetch_batch` does the fetching; `probe_served_window` runs
+only for a ticker that fetch could not cover, and only to explain why -
+see `unresolved_frame`.
 
 This module deliberately does NOT reuse `src/dataset/prices.py`'s
 `_fetch_batch` by turning on its `actions=True` argument, even though that
@@ -68,7 +81,9 @@ never enables.
 from __future__ import annotations
 
 import logging
+import sys
 import time
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import NamedTuple
@@ -117,6 +132,15 @@ for the same reason `DIVIDENDS_LONG_COLUMNS` is pinned: the INSERT names
 these columns and an empty frame must still satisfy it.
 """
 
+DIVIDEND_UNRESOLVED_COLUMNS = ["ticker", "reason"]
+"""The column shape of every `dividend_unresolved` frame, empty ones
+included, pinned for the same reason `COVERAGE_COLUMNS` is.
+
+Deliberately the same two columns `src/dataset/prices.py` writes to
+`unresolved_tickers`, because this table answers the same question for
+dividends that one answers for prices - see `unresolved_frame`.
+"""
+
 
 class DividendFieldMissingError(RuntimeError):
     """Raised when a yfinance batch's returned columns don't include
@@ -150,6 +174,53 @@ def _fetch_batch(symbols: list[str], start: str, end: str) -> pd.DataFrame:
         threads=True,
         progress=False,
     )
+
+
+def probe_served_window(symbol: str) -> tuple[date, date] | None:
+    """The full date range yfinance currently serves ANY price history for
+    `symbol`, as `(first, last)`, or `None` when it serves none at all.
+
+    The second and last network call in this module, and it runs only for a
+    ticker `_fetch_batch` failed to cover - four calls on the run that
+    discovered this, not 525. Its whole purpose is to separate the two
+    causes of a missing dividend column, which `yf.download` cannot
+    distinguish on its own and which have OPPOSITE fixes: a batch that was
+    rate-limited or transiently failed is fixed by re-running the build,
+    while a symbol whose historical window Yahoo no longer serves will never
+    be fixed by re-running anything. Telling a user to rebuild in the second
+    case is worse than saying nothing, because it reads as a fix.
+
+    `period="max"` rather than the requested window, because the requested
+    window is exactly what came back empty - the question here is what
+    Yahoo has, not whether it has what was asked for. AVB, EA, EQR and LEG
+    answer this probe with a few weeks of 2026 against a request for
+    2015-2024; MSFT answers it with 10,199 rows back to 1986.
+
+    Every failure is swallowed and reported as `None`. This runs inside an
+    explanation path, and losing a build to a secondary network problem
+    while trying to word a warning better would be strictly worse than the
+    vaguer warning - the same discipline `src/flow/interactive.py`'s
+    `_explain_dropped_dividend_payers` follows.
+    """
+    try:
+        raw = yf.download(
+            [symbol],
+            period="max",
+            auto_adjust=False,
+            actions=False,
+            group_by="column",
+            threads=False,
+            progress=False,
+        )
+    except Exception:  # noqa: BLE001 - a probe must never break a build
+        logger.debug("could not probe the served window for %s", symbol, exc_info=True)
+        return None
+
+    if raw is None or raw.empty:
+        return None
+
+    index = pd.to_datetime(raw.index)
+    return index.min().date(), index.max().date()
 
 
 def fetch_dividend_history(
@@ -331,17 +402,20 @@ def write_dividends_tables(
     coverage_df: pd.DataFrame,
     db_path: str = settings.db_path,
     splits_df: pd.DataFrame | None = None,
+    unresolved_df: pd.DataFrame | None = None,
 ) -> None:
     """Write `dividends_df` to table `dividends`, `splits_df` to table
-    `splits`, and `coverage_df` to table `dividend_coverage` in the DuckDB
-    file at `db_path`, creating the parent directory if needed. Drops any
+    `splits`, `coverage_df` to table `dividend_coverage` and
+    `unresolved_df` to table `dividend_unresolved` in the DuckDB file at
+    `db_path`, creating the parent directory if needed. Drops any
     pre-existing tables first, so re-running this is always safe.
 
-    All three land together because one fetch produces all three, and a
+    All four land together because one fetch produces all four, and a
     dividend stored without the split that restated it cannot be explained
-    to a reader. `splits_df=None` writes an empty `splits` table rather than
-    skipping it, so the table always exists once this has run and no reader
-    has to distinguish "no splits" from "no table".
+    to a reader. `splits_df=None` and `unresolved_df=None` write EMPTY
+    tables rather than skipping them, so every table exists once this has
+    run and no reader has to distinguish "no splits" from "no table", or
+    "every ticker resolved" from "nobody recorded whether they did".
     """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(db_path)
@@ -379,6 +453,20 @@ def write_dividends_tables(
             "FROM coverage_df"
         )
         con.unregister("coverage_df")
+
+        unresolved = (
+            unresolved_df
+            if unresolved_df is not None
+            else pd.DataFrame(columns=DIVIDEND_UNRESOLVED_COLUMNS)
+        )
+        con.register("unresolved_df", unresolved)
+        con.execute("DROP TABLE IF EXISTS dividend_unresolved")
+        con.execute(
+            "CREATE TABLE dividend_unresolved AS "
+            "SELECT ticker::VARCHAR AS ticker, reason::VARCHAR AS reason "
+            "FROM unresolved_df"
+        )
+        con.unregister("unresolved_df")
     finally:
         con.close()
 
@@ -389,6 +477,7 @@ def upsert_dividends_tables(
     tickers: list[str],
     db_path: str = settings.db_path,
     splits_df: pd.DataFrame | None = None,
+    unresolved_df: pd.DataFrame | None = None,
 ) -> None:
     """Merge `dividends_df`/`coverage_df` into the
     `dividends`/`dividend_coverage` tables at `db_path`, replacing only the
@@ -412,6 +501,15 @@ def upsert_dividends_tables(
     list can clear a stale one. `None` clears the named tickers' splits
     without inserting any, which is the correct outcome for a caller that
     genuinely fetched no split data.
+
+    `unresolved_df` is merged the same way, and there the keyed delete is
+    what makes a recorded reason self-correcting: a ticker whose fetch
+    failed once carries a row saying so, and the next successful fetch that
+    ASKS about it clears that row rather than leaving a stale explanation
+    beside perfectly good coverage. A ticker can never hold rows in
+    `dividend_coverage` and `dividend_unresolved` at once, because one
+    pass deletes from both and `coverage_frame`/`unresolved_frame` split
+    the requested list between them.
     """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(db_path)
@@ -428,12 +526,18 @@ def upsert_dividends_tables(
             "CREATE TABLE IF NOT EXISTS dividend_coverage "
             "(ticker VARCHAR, fetch_start DATE, fetch_end DATE)"
         )
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS dividend_unresolved (ticker VARCHAR, reason VARCHAR)"
+        )
         if tickers:
             placeholders = ", ".join(["?"] * len(tickers))
             con.execute(f"DELETE FROM dividends WHERE ticker IN ({placeholders})", tickers)
             con.execute(f"DELETE FROM splits WHERE ticker IN ({placeholders})", tickers)
             con.execute(
                 f"DELETE FROM dividend_coverage WHERE ticker IN ({placeholders})", tickers
+            )
+            con.execute(
+                f"DELETE FROM dividend_unresolved WHERE ticker IN ({placeholders})", tickers
             )
 
         con.register("dividends_df", dividends_df)
@@ -457,6 +561,18 @@ def upsert_dividends_tables(
             "fetch_start::DATE, fetch_end::DATE FROM coverage_df"
         )
         con.unregister("coverage_df")
+
+        unresolved = (
+            unresolved_df
+            if unresolved_df is not None
+            else pd.DataFrame(columns=DIVIDEND_UNRESOLVED_COLUMNS)
+        )
+        con.register("unresolved_df", unresolved)
+        con.execute(
+            "INSERT INTO dividend_unresolved SELECT ticker::VARCHAR, reason::VARCHAR "
+            "FROM unresolved_df"
+        )
+        con.unregister("unresolved_df")
     finally:
         con.close()
 
@@ -673,6 +789,146 @@ def coverage_frame(
     )
 
 
+def unresolved_frame(
+    missing: list[str],
+    symbol_map: dict[str, str],
+    start: str | date,
+    end: str | date,
+    probe: Callable[[str], tuple[date, date] | None] = probe_served_window,
+) -> pd.DataFrame:
+    """The `dividend_unresolved` rows to record for one fetch: one row per
+    requested ticker the fetch returned no dividend column for, each
+    carrying a reason that says whether re-running can help.
+
+    The counterpart of `coverage_frame`, and between them every requested
+    ticker lands in exactly one of the two tables. This is the same job
+    `unresolved_tickers` does for prices, with one addition that turned out
+    to matter: the reason distinguishes a TRANSIENT miss from a window
+    Yahoo no longer serves, by probing what it does serve and comparing.
+    `src/dataset/prices.py` cannot make that distinction and says so in its
+    own deliberately generic reason; here the distinction is cheap, because
+    only the handful of tickers that already failed get probed.
+
+    Why it is worth the calls. Every message this project printed for an
+    uncovered ticker told the user to build its dividend history - the
+    `trailing_dividend_yields` sentence, the `dividend_yield_vector`
+    refusal. For AVB, EA, EQR and LEG that advice can never work, and
+    following it costs a full 525-ticker fetch to arrive back where they
+    started. A reason that names the range Yahoo actually serves lets the
+    report say so instead.
+
+    Both reasons quote the REAL dates - the requested window and the served
+    one - rather than a canned sentence, so the claim can be checked
+    against Yahoo by hand. `probe` is injected so tests never touch the
+    network.
+
+    Pure given `probe`; the only I/O is whatever `probe` itself does.
+    """
+    if not missing:
+        return pd.DataFrame(columns=DIVIDEND_UNRESOLVED_COLUMNS)
+
+    requested_start = pd.Timestamp(start).date()
+    requested_end = pd.Timestamp(end).date()
+    reasons = []
+    for ticker in missing:
+        symbol = symbol_map.get(ticker, ticker)
+        served = probe(symbol)
+        window = f"{requested_start}..{requested_end}"
+        if served is None:
+            reasons.append(
+                f"yfinance returned no dividend data for the requested {window} window, and a "
+                f"probe for the range it does serve for {symbol} came back empty too, so it is "
+                "not known whether re-running the dividend build would help."
+            )
+            continue
+        served_start, served_end = served
+        if served_end < requested_start or served_start > requested_end:
+            reasons.append(
+                f"yfinance no longer serves this ticker's history for the requested {window} "
+                f"window: the only range it serves for {symbol} is "
+                f"{served_start}..{served_end}, which does not overlap the request. "
+                "Re-running the dividend build cannot fix this - the data is gone from the "
+                "source, not missing from this database."
+            )
+            continue
+        reasons.append(
+            f"yfinance returned no dividend column for the requested {window} window even "
+            f"though it serves {symbol} over {served_start}..{served_end}, which overlaps the "
+            "request - so this looks like a transient fetch failure and re-running the "
+            "dividend build may fix it."
+        )
+
+    return pd.DataFrame(
+        {
+            "ticker": pd.array(list(missing), dtype=str),
+            "reason": pd.array(reasons, dtype=str),
+        },
+        columns=DIVIDEND_UNRESOLVED_COLUMNS,
+    )
+
+
+def unresolved_frame_from_caller(tickers: list[str]) -> pd.DataFrame:
+    """`dividend_unresolved` rows for tickers the CALLER already knew were
+    unusable before this module fetched anything.
+
+    `build_dividends_for_tickers`' `unresolved` argument carries two of
+    those cases: a ticker whose price fetch failed, and one whose currency
+    could not be classified. Neither is worth a network probe - the fetch
+    was never going to produce a usable dividend for them - but both still
+    need a row, because a ticker with no coverage row and no unresolved row
+    is the silent gap this whole table exists to close.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=DIVIDEND_UNRESOLVED_COLUMNS)
+    reason = (
+        "no dividend coverage was recorded because this ticker was already known to be "
+        "unusable before the dividend fetch ran - its price history did not resolve, or its "
+        "currency could not be classified, so no dividend amount could be stated in a "
+        "known unit."
+    )
+    return pd.DataFrame(
+        {
+            "ticker": pd.array(list(tickers), dtype=str),
+            "reason": pd.array([reason] * len(tickers), dtype=str),
+        },
+        columns=DIVIDEND_UNRESOLVED_COLUMNS,
+    )
+
+
+def dividend_unresolved_reasons(
+    tickers: list[str], db_path: str = settings.db_path
+) -> dict[str, str]:
+    """Why each of `tickers` has no dividend coverage, as
+    `{ticker: reason}`, read from the `dividend_unresolved` table written by
+    `unresolved_frame` - and `{}` for every ticker that has coverage or was
+    never asked about.
+
+    Read-only, and a missing file, a missing table or a database built
+    before this table existed all report `{}` rather than raising, exactly
+    as `tickers_with_dividend_data` does. That degradation is the point: an
+    older cache goes back to the generic "no dividend data has been fetched
+    for it" sentence instead of crashing a report.
+    """
+    if not tickers:
+        return {}
+
+    placeholders = ", ".join(["?"] * len(tickers))
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+    except duckdb.IOException:
+        return {}
+    try:
+        rows = con.execute(
+            f"SELECT ticker, reason FROM dividend_unresolved WHERE ticker IN ({placeholders})",
+            tickers,
+        ).fetchall()
+    except duckdb.CatalogException:
+        return {}
+    finally:
+        con.close()
+    return {str(t): str(r) for t, r in rows if r is not None}
+
+
 def tickers_with_dividend_data(tickers: list[str], db_path: str = settings.db_path) -> set[str]:
     """Which of `tickers` this project has actually FETCHED dividend data
     for, whether or not that fetch found any payment - read from the
@@ -756,6 +1012,7 @@ def trailing_dividend_yields(
     dividends_per_share: dict[str, float],
     prices: pd.Series,
     known_tickers: set[str] | None = None,
+    reasons: dict[str, str] | None = None,
 ) -> tuple[dict[str, float], dict[str, str]]:
     """Annual dividend yield per ticker as
     `({ticker: yield}, {ticker: reason_unavailable})`.
@@ -785,13 +1042,25 @@ def trailing_dividend_yields(
     `known_tickers=None` means "assume every ticker in
     `dividends_per_share` was fetched", which is what a caller working from
     a fixture or an already-verified pool wants.
+
+    `reasons` - from `dividend_unresolved_reasons` - replaces the generic
+    "no dividend data has been fetched for it" for a ticker whose fetch
+    actually failed and was recorded. The generic sentence is not merely
+    vaguer, it is misleading for the case that produced this parameter:
+    AVB, EA, EQR and LEG have no coverage because Yahoo no longer serves
+    their 2015-2024 window at all, so "has been fetched" invites a rebuild
+    that cannot ever help. A ticker with a recorded reason is still ABSENT
+    from `yields` - a reason explains a missing yield, it never supplies
+    one.
     """
     yields: dict[str, float] = {}
     unavailable: dict[str, str] = {}
 
     for ticker, per_share in dividends_per_share.items():
         if known_tickers is not None and ticker not in known_tickers:
-            unavailable[ticker] = "no dividend data has been fetched for it"
+            unavailable[ticker] = (reasons or {}).get(
+                ticker, "no dividend data has been fetched for it"
+            )
             continue
 
         price = prices.get(ticker) if ticker in prices.index else None
@@ -891,9 +1160,17 @@ def build_dividends_for_tickers(
     applied to that ticker's prices, so pence dividends are converted to
     pounds identically. `unresolved` names the tickers the caller already
     knows yfinance could not resolve, which are recorded as having NO
-    dividend coverage - so a typo reports "no dividend data has been
-    fetched for it" rather than the flat zero yield a coverage row would
-    imply. Never raises for a ticker yfinance knows nothing about.
+    dividend coverage - so a typo reports a named gap rather than the flat
+    zero yield a coverage row would imply. Never raises for a ticker
+    yfinance knows nothing about.
+
+    Every requested ticker ends up in exactly one of two tables:
+    `dividend_coverage` if the fetch returned a dividend column for it, and
+    `dividend_unresolved` with a reason if it did not. That reason costs one
+    `probe_served_window` call per missing ticker and is what separates a
+    transient failure from a window Yahoo no longer serves - the difference
+    between "re-run the build" and "re-running cannot help", which is
+    exactly the advice a report was previously giving wrong.
     """
     cleaned = sorted({t.strip().upper() for t in tickers if t.strip()})
     if not cleaned:
@@ -918,12 +1195,24 @@ def build_dividends_for_tickers(
     if missing:
         logger.warning("no dividend data returned for ticker(s): %s", missing)
 
+    # One probe per MISSING ticker, so the recorded reason can say whether
+    # re-running would help. A ticker the caller already knew was
+    # unresolvable is not probed: its fetch was never going to work and the
+    # caller's own reason is the better one.
+    probed = [t for t in missing if t not in (unresolved or set())]
+    unresolved_rows = unresolved_frame(probed, symbol_map, start, end)
+    caller_rows = unresolved_frame_from_caller(
+        [t for t in missing if t in (unresolved or set())]
+    )
+    all_unresolved = pd.concat([unresolved_rows, caller_rows], ignore_index=True)
+
     upsert_dividends_tables(
         long_dividends,
         coverage_frame(cleaned, set(cleaned) - fetched, start, end),
         cleaned,
         db_path,
         splits_df=long_splits,
+        unresolved_df=all_unresolved,
     )
     return long_dividends
 
@@ -1011,8 +1300,37 @@ def main() -> None:
 
     Idempotent: re-running replaces each ticker's rows rather than
     appending, so a repeat costs a fetch but never duplicates a payment.
+
+    With ticker arguments - `uv run portfolio-build-dividends AVB EA EQR
+    LEG` - only those tickers are fetched and upserted, instead of the
+    whole `prices` universe. That form exists because the whole-universe
+    build is six batches and several minutes, while the reason a handful of
+    named tickers has no coverage is a question worth being able to ask
+    cheaply and repeatedly. It prints each recorded reason, so the answer
+    arrives without a follow-up query. The argv shape follows
+    `src/dataset/backfill_snapshot.py`'s.
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    requested = [a.strip().upper() for a in sys.argv[1:] if a.strip()]
+    if requested:
+        multipliers = _stored_price_multipliers(requested, settings.db_path)
+        df = build_dividends_for_tickers(
+            requested,
+            settings.db_path,
+            settings.fetch_start,
+            settings.fetch_end,
+            multipliers,
+        )
+        payers = df["ticker"].nunique() if not df.empty else 0
+        print(
+            f"Wrote {len(df)} dividend row(s) for {payers} paying ticker(s) of "
+            f"{len(requested)} requested ticker(s) to {settings.db_path}."
+        )
+        for ticker, reason in sorted(
+            dividend_unresolved_reasons(requested, settings.db_path).items()
+        ):
+            print(f"  {ticker}: no dividend coverage - {reason}")
+        return
     df = build_dividends()
     payers = df["ticker"].nunique() if not df.empty else 0
     print(f"Wrote {len(df)} dividend row(s) for {payers} paying ticker(s) to {settings.db_path}.")
@@ -1069,13 +1387,16 @@ def load_dividend_figures(
 
     window_start = pd.Timestamp(as_of) - pd.DateOffset(months=lookback_months)
     known = tickers_with_dividend_data(tickers, db_path)
+    # Only consulted for a ticker `known` does not contain, but read in one
+    # query beside it rather than per missing ticker.
+    reasons = dividend_unresolved_reasons(tickers, db_path)
     long_df = load_dividends_long(tickers, window_start, as_of, db_path)
     per_share = trailing_dividends_per_share(long_df, tickers, as_of, lookback_months)
     # The same market price `allocate_shares` and the holdings valuation
     # use, from the one shared loader - so a dividend yield's denominator
     # and the price a share is bought or valued at are provably one number.
     prices = load_latest_close(tickers, as_of, db_path)
-    yields, unavailable = trailing_dividend_yields(per_share, prices, known)
+    yields, unavailable = trailing_dividend_yields(per_share, prices, known, reasons)
     available_per_share = {t: per_share[t] for t in yields}
 
     splits_long = load_splits_long(tickers, db_path, after=window_start.date())

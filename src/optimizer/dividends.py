@@ -217,7 +217,51 @@ def validate_min_annual_dividend(value: object, source: str, portfolio_value: ob
         ) from e
 
 
-def dividend_yield_vector(yields: dict[str, float], tickers: Sequence[str]) -> np.ndarray:
+def unavailable_yield_refusal(
+    missing: Sequence[str], reasons: dict[str, str] | None = None
+) -> DividendYieldUnavailableError:
+    """The refusal to raise when some pool ticker has no trailing dividend
+    yield, worded from whatever is known about WHY.
+
+Split out of `dividend_yield_vector` rather than inlined, because the
+    message now has two forms and the choice between them is a decision
+    worth reading on its own - and because a caller that learns the reasons
+    only after the refusal (the shape `src/flow/interactive.py`'s
+    `_explain_dropped_dividend_payers` takes for the ceiling refusal) can
+    rebuild the same sentence instead of appending to it.
+
+    "Build its dividend history" is included only when it might work. With
+    a recorded reason for EVERY missing ticker the advice is replaced by
+    those reasons, because the case that produced this function - a window
+    Yahoo no longer serves - makes rebuilding futile, and a full-universe
+    fetch is an expensive way to learn nothing. With a reason for only
+    some, the advice stays: it is still actionable for the rest.
+    """
+    names = ", ".join(sorted(missing))
+    preamble = (
+        f"no trailing dividend yield is available for {names}, so a dividend floor cannot be "
+        "applied to a pool containing it - a missing yield is not a zero yield, and treating "
+        "it as one would understate this portfolio's income while quietly forcing weight "
+        "elsewhere. "
+    )
+    known = {t: (reasons or {}).get(t) for t in sorted(missing)}
+    if all(known.values()):
+        detail = " ".join(f"{t}: {r}" for t, r in known.items())
+        return DividendYieldUnavailableError(
+            f"{preamble}{detail} Remove it from the pool, or drop the floor and read the "
+            "reported figures instead."
+        )
+    return DividendYieldUnavailableError(
+        f"{preamble}Remove it from the pool, build its dividend history, or drop the floor and "
+        "read the reported figures instead."
+    )
+
+
+def dividend_yield_vector(
+    yields: dict[str, float],
+    tickers: Sequence[str],
+    reasons: dict[str, str] | None = None,
+) -> np.ndarray:
     """`yields` as a dense float array in `tickers`' exact order.
 
     THE alignment guarantee of this feature, and the reason it is a named
@@ -245,16 +289,20 @@ def dividend_yield_vector(yields: dict[str, float], tickers: Sequence[str]) -> n
     A non-finite yield is refused for the same reason a non-finite floor is:
     a `nan` in this vector produces a constraint cvxpy can neither satisfy
     nor report.
+
+    `reasons` - from `src/dataset/dividends.py`'s
+    `dividend_unresolved_reasons` - is what the refusal says instead of
+    "build its dividend history" when the reason a yield is missing is
+    already recorded. That advice is not always available: for a ticker
+    whose historical window Yahoo no longer serves, building its dividend
+    history is impossible, and telling the user to try costs them a
+    full-universe fetch to learn nothing. A reason is only substituted when
+    EVERY missing ticker has one, since a message that drops the actionable
+    advice while one ticker could still act on it would be a worse message.
     """
     missing = [t for t in tickers if t not in yields]
     if missing:
-        raise DividendYieldUnavailableError(
-            f"no trailing dividend yield is available for {', '.join(sorted(missing))}, so a "
-            "dividend floor cannot be applied to a pool containing it - a missing yield is not "
-            "a zero yield, and treating it as one would understate this portfolio's income "
-            "while quietly forcing weight elsewhere. Remove it from the pool, build its "
-            "dividend history, or drop the floor and read the reported figures instead."
-        )
+        raise unavailable_yield_refusal(missing, reasons)
 
     values = [float(yields[t]) for t in tickers]
     bad = [t for t, v in zip(tickers, values) if not math.isfinite(v)]

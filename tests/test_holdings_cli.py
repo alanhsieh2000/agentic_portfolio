@@ -29,7 +29,13 @@ from src.flow.interactive import HoldingsSession
 from src.flow.rate_memory import load_all_risk_free_rates, load_risk_free_rate
 from src.flow.user_portfolio import load_all_portfolios, load_portfolio
 from src.optimizer.holdings import HoldingsStats, unavailable_holdings
-from src.flow.cli import format_holdings_delta, format_share_count, print_user_portfolio
+from src.flow.cli import (
+    format_holdings_delta,
+    format_holdings_dividend_total,
+    format_share_count,
+    print_user_portfolio,
+)
+from src.optimizer.dividends import dividend_figures
 
 
 def _stub_ingest(monkeypatch, currencies: dict[str, str], invalid: dict[str, str] | None = None):
@@ -332,6 +338,28 @@ def _stats(**overrides) -> HoldingsStats:
         unavailable_reason=None,
     )
     return HoldingsStats(**{**base, **overrides})
+
+
+def test_the_dividend_total_names_why_a_holding_is_missing_from_it():
+    """The income line already shrinks its denominator and names the gap.
+    The reason is what tells the holder whether the gap is fixable: a
+    transient miss clears on `--refresh-holdings`, while a window the
+    source no longer serves means this figure will never be complete.
+    """
+    reason = "yfinance returned no dividend column for 2022-12-28..2026-09-04; transient"
+    figures = dividend_figures(
+        {"SPY": 1000.0, "BOXX": 500.0},
+        {"SPY": 80_000.0, "BOXX": 20_000.0},
+        {"SPY": 1.60},
+        {"BOXX": reason},
+        {"SPY": 0.02},
+    )
+    line = format_holdings_dividend_total(_stats(dividends=figures), "USD")
+    assert "on $80,000.00 USD of the $100,000.00 USD total" in line
+    assert "BOXX has no trailing dividend data" in line
+    # Below the figure, never inside its parenthetical - the reasons name
+    # dates and ranges and would push the figure line off the terminal.
+    assert line.endswith(f"\n  BOXX: {reason}")
 
 
 def test_the_report_states_the_window_and_the_rate_the_figures_came_from(capsys):

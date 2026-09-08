@@ -811,11 +811,12 @@ def compute_weights_and_allocation(
     # `{}` means "consulted, nothing found", which names each ticker's
     # reason and would imply a failed lookup that never happened.
     if consult_dividends:
-        yields, per_share, _unavailable, splits_in_window = load_dividend_figures(
+        yields, per_share, unavailable, splits_in_window = load_dividend_figures(
             list(returns_matrix.columns), rebalance_date, db_path
         )
     else:
         yields = per_share = splits_in_window = None
+        unavailable = None
     try:
         stats = compute_weights_and_stats(
             returns_matrix,
@@ -826,6 +827,7 @@ def compute_weights_and_allocation(
             dividend_yields=yields,
             dividends_per_share=per_share,
             dividend_splits=splits_in_window,
+            dividend_unavailable=unavailable,
         )
     except DividendFloorError as e:
         raise _explain_dropped_dividend_payers(

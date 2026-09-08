@@ -103,8 +103,13 @@ portfolios the optimizer may choose from. That is the trade being made, not a bu
       run caught as missing: a `user_provided` pool runs against a session snapshot
       database, not `data/portfolio.duckdb`, so without this every typed ticker was
       correctly but uselessly refused as having no yield.
-- [ ] Optional follow-up: the four uncovered universe tickers are ones yfinance cannot
-      resolve at all and already appear in `unresolved_tickers`; confirm and leave them.
+- [x] (2026-09-08) Optional follow-up, CONFIRMED WRONG and closed by
+      `plans/16_dividend_coverage_reasons.md`: this item claimed the four uncovered universe
+      tickers "are ones yfinance cannot resolve at all and already appear in
+      `unresolved_tickers`". Both halves are false. The four are AVB, EA, EQR and LEG; none
+      of them is in `unresolved_tickers`, and each has a complete 2,346-row price history.
+      yfinance resolves all four - it just no longer serves their 2015-2024 window. See
+      `Surprises & Discoveries` below.
 - [x] (2026-09-08) FIXED, as its own piece of work: `allocate_shares` priced shares from
       `adj_close` rather than raw `close`, over-allocating by up to 2.87x on a
       historical-window database (18.1% on a real five-name run). `load_latest_prices` now
@@ -333,6 +338,35 @@ portfolios the optimizer may choose from. That is the trade being made, not a bu
   `load_latest_prices` is deliberately left alone - allocation and holdings valuation must
   price against the same column as each other, and for their dates the two agree.
 
+
+- Observation (2026-09-08, while confirming the `Progress` follow-up above): a ticker can
+  have no dividend coverage while resolving perfectly well, and this project had no way to
+  say so. The four uncovered universe tickers are **AVB, EA, EQR and LEG** - obtained as the
+  set difference between `prices`' 525 distinct tickers and `dividend_coverage`'s 521 rows,
+  not from any recorded list.
+
+  What is actually wrong with them: `_fetch_batch(['AVB','EA','EQR','LEG'], '2015-01-01',
+  '2024-04-30')` returns a 0-row frame carrying `Close` columns and no `Dividends` column,
+  with Yahoo answering each symbol `Data doesn't exist for startDate = 1420088400, endDate =
+  1714449600`. Probed over the widest window the same symbols return only a short, already
+  stale recent history - AVB 27 rows, EQR 15, EA 6, LEG 5, every one of them starting
+  2026-07-17 - while MSFT returns 4,194 rows to 2026-09-04. Batch position rules out a
+  batch-level failure: the four sit mid-batch in three different batches (indices 45, 152,
+  168 and 281 of 525, at `price_batch_size` 100). So the symbols resolve, the requested
+  window does not exist at the source, and `fetched_dividend_tickers` recorded no coverage
+  correctly.
+
+  Why it mattered more than a missing row: every message the project printed for them
+  recommended the one action that cannot work. `trailing_dividend_yields` said "no dividend
+  data has been fetched for it" and `dividend_yield_vector`'s refusal said "build its
+  dividend history" - a full 525-ticker fetch that ends exactly where it started. And
+  `dividend_yield_vector` refuses an *entire* floored run when any of the four is in the
+  pool, which for LEG is the worst possible loss: its real trailing yield over the window is
+  0.1004, higher than MO's 0.0885, making it the best payer in the universe.
+
+  Their real figures, recovered from the stored `close`/`adj_close` pair for evidence only -
+  see `plans/16_dividend_coverage_reasons.md` on why that recovery was deliberately NOT
+  turned into stored data: LEG 0.1004, EQR 0.0408, AVB 0.0348, EA 0.0059.
 
 ## Decision Log
 
