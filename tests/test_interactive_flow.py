@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 
 import duckdb
 import pandas as pd
+from src.optimizer.dividends import DividendFloorError
 import pytest
 
 from src.agents.llm_s_schema import ScreeningRule
@@ -949,3 +950,102 @@ def test_compute_weights_and_allocation_can_skip_consulting_dividends(monkeypatc
     figures_spy.assert_not_called()
     assert stats_spy.call_args.kwargs["dividend_yields"] is None
     assert stats_spy.call_args.kwargs["dividends_per_share"] is None
+
+
+# ---------------------------------------------------------------------------
+# An unsatisfiable optimization is reported, not raised
+# ---------------------------------------------------------------------------
+
+
+def test_run_pipeline_against_reports_an_unsatisfiable_request_and_keeps_the_scan(monkeypatch):
+    """Returned rather than raised, because `run_scan` above it has already
+    run the LLM agents and those must not be asked twice. Everything the
+    screening produced has to survive so the caller can offer a corrected
+    retry without paying for it again.
+    """
+    scan_calls: list[int] = []
+
+    def scan(*_a, **_k):
+        scan_calls.append(1)
+        return {
+            "rule": None,
+            "llm_s_signals": None,
+            "llm_f_signals": None,
+            "scan_detail": {
+                "branch": "b", "buy_s_size": 1, "buy_f_size": 0,
+                "intersection_size": 0, "union_size": 1, "candidates": ["AAA", "BBB"],
+            },
+        }
+
+    monkeypatch.setattr("src.flow.interactive.run_scan", scan)
+    monkeypatch.setattr(
+        "src.flow.interactive.compute_weights_and_allocation",
+        MagicMock(side_effect=DividendFloorError("floor 0.0300 is unreachable")),
+    )
+    benchmark_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.benchmark_stats_for_window", benchmark_spy)
+
+    result = run_pipeline_against(
+        date(2026, 9, 8), "MV", 100000.0, "llm_s_only", "db.duckdb", "live"
+    )
+
+    assert isinstance(result["unsatisfiable"], DividendFloorError)
+    # Every figure None together, the discipline BenchmarkStats already uses.
+    assert result["stats"] is None
+    assert result["weights"] is None
+    assert result["allocation"] is None
+    assert result["benchmark"] is None
+    # The expensive part survived, and was paid for exactly once.
+    assert result["scan_detail"]["candidates"] == ["AAA", "BBB"]
+    assert scan_calls == [1]
+    # No benchmark fetched: there is no returns window to narrow it to.
+    benchmark_spy.assert_not_called()
+
+
+def test_run_pipeline_against_marks_a_satisfiable_run_as_unsatisfiable_none(monkeypatch):
+    """So a caller reads one field either way rather than probing for a key."""
+    monkeypatch.setattr(
+        "src.flow.interactive.run_scan",
+        lambda *a, **k: {
+            "rule": None, "llm_s_signals": None, "llm_f_signals": None,
+            "scan_detail": {"branch": "b", "buy_s_size": 1, "buy_f_size": 0,
+                            "intersection_size": 0, "union_size": 1, "candidates": ["AAA"]},
+        },
+    )
+    stats = _stats_stub()
+    stats.returns_window_start = date(2021, 9, 1)
+    stats.returns_window_end = date(2026, 9, 1)
+    monkeypatch.setattr(
+        "src.flow.interactive.compute_weights_and_allocation",
+        lambda *a, **k: (stats, ({}, 0.0)),
+    )
+    monkeypatch.setattr("src.flow.interactive.benchmark_stats_for_window", lambda *a, **k: None)
+
+    result = run_pipeline_against(
+        date(2026, 9, 8), "GMV", 100000.0, "llm_s_only", "db.duckdb", "live"
+    )
+
+    assert result["unsatisfiable"] is None
+    assert result["stats"] is stats
+
+
+def test_run_pipeline_against_still_raises_anything_that_is_not_unsatisfiable(monkeypatch):
+    """The narrow catch must not become a catch-all - a genuine bug has to
+    keep escaping.
+    """
+    monkeypatch.setattr(
+        "src.flow.interactive.run_scan",
+        lambda *a, **k: {
+            "rule": None, "llm_s_signals": None, "llm_f_signals": None,
+            "scan_detail": {"branch": "b", "buy_s_size": 1, "buy_f_size": 0,
+                            "intersection_size": 0, "union_size": 1, "candidates": ["AAA"]},
+        },
+    )
+    monkeypatch.setattr(
+        "src.flow.interactive.compute_weights_and_allocation",
+        MagicMock(side_effect=ValueError("objective must be one of ...")),
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        run_pipeline_against(date(2026, 9, 8), "BOGUS", 100000.0, "llm_s_only", "db.duckdb", "live")
+    assert not isinstance(excinfo.value, DividendFloorError)

@@ -1223,3 +1223,42 @@ different control - but the confusion was justified, because a third case was ge
 in the command's output and in `README.md`: populate `data/portfolio.duckdb` for
 historical-date screened runs, run after `portfolio-build-prices`. Every other path needs
 nothing.
+
+
+## Revision Note: an unsatisfiable request is reported, not raised (2026-09-08)
+
+A user ran `--objective MV --min-dividend-yield 0.03` and got a Python traceback whose last
+line was a perfectly good message: 12% is unreachable under a 3% floor, the best complying
+portfolio reaches 10.97%, here are three ways to fix it. Delivering that as a traceback
+wasted the message and looked like a crash.
+
+This plan chose that behavior deliberately, reasoning that an unreachable `--target-return`
+already propagated the same way and that consistency argued for matching it. The reasoning
+was sound and the conclusion was wrong: the precedent was itself bad, and copying it spread a
+defect rather than containing one. Consistency with a bad pattern is not a virtue - worth
+remembering the next time this plan's Decision Log cites an existing behavior as
+justification.
+
+It was also a family. Three conditions - a dividend floor blocking an MV target, a target no
+pool can reach, a risk-free rate above every expected return - are all `ValueError`, all
+tracebacked on the initial run, and all were already handled gracefully INSIDE the
+interactive edit loop. That asymmetry was the actual defect, and the second was worse than
+the reported one: PyPortfolioOpt's raw text named neither the flag responsible nor a value
+that would work.
+
+All five members now share `UnsatisfiableRequestError` in the new `src/errors.py` (the
+dividend pair, `MixedCurrencyPoolError`, and two new ones translating PyPortfolioOpt's raw
+messages), so `src/flow/cli.py` catches one narrow type rather than `ValueError`, which would
+also swallow genuine bugs. A test pins that: a `ValueError` which is not an
+`UnsatisfiableRequestError` still escapes `main`.
+
+The design constraint worth recording is why the failure is RETURNED rather than raised from
+`run_pipeline_against`. That function runs `run_scan` - the LLM agents - and then the
+optimizer, so an exception discards the screening, and re-running it means re-invoking agents
+this project treats as a correctness problem to repeat, not merely a cost. So the result dict
+now carries `unsatisfiable` with every figure `None` beside it, which is the shape
+`BenchmarkStats` and `HoldingsStats` already use. The payoff is better than a clean exit: the
+LLM rule, the scanner branch and the candidate list all still print, and the session stays
+open so `[t]` or `[d]` fixes the number against the snapshot already paid for. Verified end to
+end - the reported command now prints its reason and then produces a full report after
+typing `t` and `0.10`, with no refetch, exiting 0; finishing without a correction exits 1.

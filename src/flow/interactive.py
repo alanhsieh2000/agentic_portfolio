@@ -83,6 +83,7 @@ from src.optimizer.holdings import (
     unavailable_holdings,
 )
 from src.dataset.dividends import load_dividend_figures
+from src.errors import UnsatisfiableRequestError
 from src.optimizer.dividends import DividendFloor, DividendFloorError
 from src.optimizer.portfolio import (
     DEFAULT_TARGET_ANNUAL_RETURN,
@@ -916,27 +917,72 @@ def run_pipeline_against(
     benchmark, so no programmatic caller of this function ever acquires a
     network fetch it did not ask for - applying a per-currency default is the
     CLI's job, not this layer's.
+
+    An optimization the request makes impossible - a target return no
+    combination of these candidates can reach, a dividend floor above the
+    best-yielding one's own yield, a risk-free rate above every expected
+    return - is REPORTED rather than raised: `"unsatisfiable"` carries the
+    `UnsatisfiableRequestError` and `"weights"`, `"allocation"`, `"stats"`
+    and `"benchmark"` are all `None` together. Everything `run_scan`
+    produced is still present, which is the point: those agents must not be
+    asked twice, so a caller has to be able to offer a corrected retry
+    without re-screening. Every other exception propagates unchanged.
     """
     scan = run_scan(rebalance_date, selection, db_path, rule=rule, candidates=candidates)
-    stats, allocation = compute_weights_and_allocation(
-        scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date, db_path,
-        target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
-        dividend_floor=dividend_floor, consult_dividends=consult_dividends,
-    )
 
-    return {
+    base = {
         "mode": mode,
         "rebalance_date": rebalance_date,
         "objective": objective,
         "selection": selection,
         **scan,
+        "currency": currency,
+    }
+
+    try:
+        stats, allocation = compute_weights_and_allocation(
+            scan["scan_detail"]["candidates"], objective, portfolio_value, rebalance_date,
+            db_path,
+            target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
+            dividend_floor=dividend_floor, consult_dividends=consult_dividends,
+        )
+    except UnsatisfiableRequestError as e:
+        # RETURNED, not raised, and only for this one narrow type. `run_scan`
+        # above has already run the LLM-S/LLM-F agents, and re-running those
+        # is something this project treats as a correctness problem rather
+        # than merely a wasted cost (see `src/flow/backtest.py` on a fresh
+        # LLM-S call per month). Letting the exception out would discard the
+        # rule, the branch and the candidate list along with it, so the
+        # caller would have no way to offer a corrected retry without paying
+        # for the screening twice.
+        #
+        # This is the same shape `BenchmarkStats` and `HoldingsStats`
+        # already use: every figure populated together, or every figure
+        # `None` beside a reason a person can act on.
+        logger.info("optimization was unsatisfiable for this request: %s", e)
+        return {
+            **base,
+            "weights": None,
+            "allocation": None,
+            "stats": None,
+            # Deliberately no benchmark. `benchmark_stats_for_window` needs
+            # the portfolio's own returns window to narrow to, and a
+            # benchmark exists to be read beside figures that do not exist
+            # here - so fetching one would cost a request to print a line
+            # with nothing to compare against.
+            "benchmark": None,
+            "unsatisfiable": e,
+        }
+
+    return {
+        **base,
         "weights": stats.weights,
         "allocation": allocation,
         "stats": stats,
-        "currency": currency,
         "benchmark": benchmark_stats_for_window(
             benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
         ),
+        "unsatisfiable": None,
     }
 
 

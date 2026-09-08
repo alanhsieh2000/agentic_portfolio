@@ -946,6 +946,13 @@ def print_pipeline_result(
     for a plainer reason: it is what `--value` allocated, the orchestration
     layer never puts it in the result dict, and it is what turns a dividend
     yield into money.
+
+    A result carrying `"unsatisfiable"` prints its reason where the weights
+    and allocation would have gone, and nothing else changes: the mode,
+    date, objective, LLM rule, scanner branch and candidate list are all
+    real and all still shown. That is strictly more useful than a bare
+    failure, since the reason is a statement about numbers on the command
+    line and the candidate list is what makes it actionable.
     """
     print(f"Mode: {result['mode']}  Rebalance date: {result['rebalance_date']}  "
           f"Objective: {result['objective']}  Selection: {result['selection']}")
@@ -962,6 +969,17 @@ def print_pipeline_result(
           f"(buy_s={scan_detail['buy_s_size']} buy_f={scan_detail['buy_f_size']} "
           f"intersection={scan_detail['intersection_size']} union={scan_detail['union_size']})")
     print(f"Candidates ({len(scan_detail['candidates'])}): {', '.join(scan_detail['candidates'])}")
+
+    unsatisfiable = result.get("unsatisfiable")
+    if unsatisfiable is not None:
+        # In place of the weights and allocation block, which do not exist.
+        # Everything above still printed, because the screening really did
+        # run and its output is what the person paid for - and because
+        # seeing the candidate list beside the reason is what makes the
+        # remedy obvious.
+        print(f"\nCannot optimize this run: {unsatisfiable}")
+        print("The fetched data is still open, so you can fix this without starting over.")
+        return
 
     print_weights_and_allocation(
         result["stats"], result["allocation"], result["objective"], result["currency"],
@@ -1587,11 +1605,23 @@ def _run_edit_loop(
     benchmark: BenchmarkSource | None = None,
     allow_benchmark_fetch: bool = True,
     risk_free_rate_origin: str | None = None,
-) -> None:
+) -> bool:
     """Prompt in a loop for add/remove/objective/target-return/benchmark/
     finish; each
     edit recomputes weights and allocation against the current `candidates`
-    and reprints them. Returns when the user chooses to finish.
+    and reprints them. Returns when the user chooses to finish, reporting
+    whether it ever printed a report.
+
+    That return value exists because this loop is now also entered when the
+    INITIAL optimization produced nothing - an impossible `--target-return`,
+    dividend floor or risk-free rate - which is why it prompts before it
+    computes. Live mode's snapshot cost minutes of fetching and is still
+    open, so `[t]`, `[d]` or `[o]` can correct the number without paying for
+    any of it again; exiting instead would make a corrected retry cost a
+    full refetch. `main` combines the flag with the initial outcome to pick
+    an exit code, so a session that explained why it could not optimize and
+    was then finished without a correction exits non-zero rather than
+    looking like a success.
 
     For `selection="user_provided"` an added ticker is validated and
     ingested first (the pool is the user's own, so a typo here deserves the
@@ -1630,6 +1660,7 @@ def _run_edit_loop(
     treatment `[o]bjective` gives a rejected edit. A benchmark chosen here is
     always an explicit choice, so for `user_provided` it is persisted.
     """
+    printed_a_report = False
     while True:
         choice = input(
             "\nEdit candidates? [a]dd tickers / [r]emove tickers / [o]bjective / "
@@ -1637,7 +1668,7 @@ def _run_edit_loop(
         ).strip().lower()
 
         if choice in ("", "f", "finish"):
-            return
+            return printed_a_report
 
         previous_candidates, previous_objective, previous_target, previous_dividend_floor = (
             candidates,
@@ -1748,6 +1779,7 @@ def _run_edit_loop(
         if selection == "user_provided" and choice in ("a", "add", "r", "remove"):
             save_candidate_pool(candidates, path=memory_path, currency=currency)
 
+        printed_a_report = True
         print_weights_and_allocation(
             stats, allocation, objective, currency, portfolio_value=portfolio_value,
             benchmark=benchmark_stats_for_window(
@@ -2056,7 +2088,15 @@ def main() -> None:
         # ticker clears 5% would write 0.05 to disk and then raise out of
         # PyPortfolioOpt, leaving standing state from a run that printed
         # nothing.
-        _remember_risk_free_rate(resolved_rate, currency, args.rates_path)
+        # Skipped when the run produced no portfolio, for exactly the
+        # reason the comment above gives: this is the "printed nothing"
+        # case, reached now by report rather than by traceback. A later
+        # interactive edit may succeed, but the remember call sits here by
+        # design, so a run whose first attempt failed does not record its
+        # rate. That is the conservative reading of "only after a report".
+        produced_report = result.get("unsatisfiable") is None
+        if produced_report:
+            _remember_risk_free_rate(resolved_rate, currency, args.rates_path)
 
         # Printed once, here, rather than from inside
         # `print_weights_and_allocation`: that function reprints the pool's
@@ -2066,7 +2106,11 @@ def main() -> None:
         # three unchanged numbers after every keystroke would be noise, and
         # would imply a relationship between the edit and the holdings that
         # does not exist.
-        if not args.no_holdings:
+        # Also skipped on the unsatisfiable path: the holdings block reads
+        # "beneath the optimizer's own figures", and there are none to sit
+        # beneath. It costs a fetch, and the reason and the edit prompt are
+        # what the reader needs next.
+        if not args.no_holdings and produced_report:
             stale = format_stale_share_counts(
                 args.holdings_path,
                 currency,
@@ -2090,7 +2134,7 @@ def main() -> None:
                 risk_free_rate_origin=resolved_rate.origin,
             )
 
-        _run_edit_loop(
+        edited_report = _run_edit_loop(
             result["scan_detail"]["candidates"], args.objective, args.value, rebalance_date, session_db_path,
             selection=args.selection, memory_path=args.memory_path,
             target_annual_return=args.target_return, risk_free_rate=args.risk_free_rate,
@@ -2100,6 +2144,11 @@ def main() -> None:
             allow_benchmark_fetch=not args.no_benchmark_fetch,
             risk_free_rate_origin=resolved_rate.origin,
         )
+
+        # A run that never printed a portfolio must not look like a success
+        # to a script, however gracefully it explained itself.
+        if not (produced_report or edited_report):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

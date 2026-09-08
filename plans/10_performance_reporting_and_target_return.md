@@ -481,3 +481,25 @@ Changed, after this plan was otherwise complete: a `--risk-free-rate` command-li
 Why: the repository owner questioned this plan's claim about `max_sharpe` and the risk-free rate, asking specifically whether a value like `0.015` could be passed. Verifying it confirmed the plan's account was correct — PyPortfolioOpt's signature is `max_sharpe(self, risk_free_rate=0.0)`, the old code called it with no argument and so took the `0.0` default, and the parameter is entirely passable — but the question itself revealed that comparing rates per run is a real workflow. Requiring an environment variable for that, when `--target-return` had just been added one line away for exactly the same kind of per-run analytical value, was the wrong ergonomics. The flag is deliberately not editable inside the interactive loop, for the reason given in the Decision Log: unlike `MV`'s target, the risk-free rate describes the market environment rather than the portfolio being designed.
 
 One genuine bug was avoided in the process, and is worth recording because it would have been easy to ship. Adding the argparse entry alone is not sufficient: `_run_edit_loop` performs its own `compute_weights_and_allocation` calls, so a rate threaded only into the initial `run_pipeline_against` call would have governed the first printed result and then silently reverted to the configured default on the very first interactive edit — the kind of inconsistency that is invisible unless the two outputs are compared closely. `test_run_edit_loop_carries_the_risk_free_rate_into_every_recompute` and the edit-loop assertion in `test_main_threads_the_risk_free_rate_argument_into_the_pipeline_and_the_edit_loop` exist to pin exactly that.
+
+
+## Revision Note: an unreachable target return no longer propagates (2026-09-08)
+
+This plan decided that an unreachable `--target-return` should propagate out of `main`,
+on the grounds that only the optimizer can discover it and that a `parser.error` would
+therefore be the wrong shape. The first half was right and the second did not follow: "not
+knowable at parse time" does not imply "deliver it as a traceback".
+
+Two things were wrong in practice. PyPortfolioOpt's message - "target_return must be lower
+than the maximum possible return" - names neither the flag responsible nor a value that would
+work, so the person is told they asked for something impossible but not what to ask instead.
+And the same condition was already handled gracefully inside the interactive edit loop, so
+the behavior depended on whether the target was typed on the command line or at a prompt.
+
+`--target-return` above the pool's ceiling now raises
+`UnreachableTargetReturnError`, one of the `UnsatisfiableRequestError` family in
+`src/errors.py`, with a message naming the flag, the attainable ceiling and the ticker that
+sets it. `src/flow/cli.py` prints it and enters the edit loop rather than raising, so the
+number can be corrected without rebuilding a live snapshot. See
+`plans/15_minimum_expected_dividend.md`'s revision note of the same date, which copied this
+plan's decision and prompted the correction of both.

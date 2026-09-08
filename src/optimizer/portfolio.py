@@ -28,6 +28,7 @@ from pypfopt.exceptions import OptimizationError
 
 from src.config.settings import settings
 from src.dataset.prices import load_latest_close
+from src.errors import UnsatisfiableRequestError
 from src.optimizer.dividends import (
     DIVIDEND_BINDING_TOLERANCE,
     DividendFloor,
@@ -418,11 +419,98 @@ def _fit_efficient_frontier(
             dividend_floor, objective, yields_vector, list(mu.index), e
         ) from e
     except ValueError as e:
-        if dividend_floor is None or objective != "MV" or "maximum possible return" not in str(e):
-            raise
-        raise _dividend_blocked_target(dividend_floor, ef, target_annual_return) from e
+        # PyPortfolioOpt reports two "you asked for something impossible"
+        # conditions as bare `ValueError`s whose text names neither the flag
+        # responsible nor a value that would work. Translate both, so a
+        # person is told what to change - and so `src/flow/cli.py` can catch
+        # one narrow type rather than `ValueError`, which would also swallow
+        # genuine bugs. Anything else is re-raised untouched.
+        message = str(e)
+        if objective == "MV" and "maximum possible return" in message:
+            if dividend_floor is not None:
+                raise _dividend_blocked_target(dividend_floor, ef, target_annual_return) from e
+            raise _unreachable_target_return(ef, mu, target_annual_return) from e
+        if objective == "MSR" and "exceeding the risk-free rate" in message:
+            raise _risk_free_rate_too_high(mu, risk_free_rate) from e
+        raise
 
     return ef, mu, cov_matrix
+
+
+class UnreachableTargetReturnError(UnsatisfiableRequestError):
+    """`--target-return` is above the best return any portfolio of these
+    candidates can produce.
+
+    Its own type, rather than PyPortfolioOpt's bare `ValueError`, because
+    that library's message - "target_return must be lower than the maximum
+    possible return" - names neither the flag that caused it nor the value
+    that would work, and this is a request a person can simply correct.
+    `DividendFloorError` covers the related case where a dividend floor is
+    what lowered the ceiling, since there the remedy includes relaxing the
+    floor.
+    """
+
+
+class RiskFreeRateTooHighError(UnsatisfiableRequestError):
+    """`--risk-free-rate` is at or above every candidate's expected return,
+    which leaves MSR undefined.
+
+    The maximum Sharpe ratio is the largest excess return per unit of risk,
+    and if no candidate earns more than the riskless asset then no portfolio
+    has a positive excess return to maximize. `compute_weights_and_stats`'s
+    docstring already noted this became reachable once the rate stopped
+    being zero, and chose to let PyPortfolioOpt's own `ValueError`
+    propagate rather than mask it - which was right about not masking it and
+    wrong about propagating a message that names no flag.
+    """
+
+
+def _unreachable_target_return(
+    ef: EfficientFrontier, mu: pd.Series, target_annual_return: float
+) -> UnreachableTargetReturnError:
+    """PyPortfolioOpt's target-return refusal, reworded to name the flag,
+    the attainable ceiling and the ticker that sets it.
+
+    The ceiling is read from `_max_return_value`, which `efficient_return`
+    populates from a deepcopy before it raises. That is a private attribute,
+    so it is read defensively and the message degrades to a version without
+    the number rather than failing a second time inside an error path - the
+    same treatment `_dividend_blocked_target` gives it.
+
+    The best single ticker is named because it is the actionable part: a
+    pool's maximum return is its best member's, so seeing which one that is
+    tells a person whether to lower the target or add a different candidate.
+    """
+    reachable = getattr(ef, "_max_return_value", None)
+    best = str(mu.idxmax()) if len(mu) else "none"
+    if reachable is None:
+        return UnreachableTargetReturnError(
+            f"--target-return {float(target_annual_return):.4f} is unreachable for this "
+            f"pool, whose best single candidate is {best} at {float(mu.max()):.4f}. Lower "
+            "--target-return, add a higher-returning candidate, or switch to GMV or MSR."
+        )
+    return UnreachableTargetReturnError(
+        f"--target-return {float(target_annual_return):.4f} is unreachable for this pool: "
+        f"the highest annual return any portfolio of these candidates can reach is "
+        f"{float(reachable):.4f}, from {best}. Lower --target-return to at most "
+        f"{float(reachable):.4f}, add a higher-returning candidate, or switch to GMV or MSR."
+    )
+
+
+def _risk_free_rate_too_high(mu: pd.Series, risk_free_rate: float) -> RiskFreeRateTooHighError:
+    """PyPortfolioOpt's max-Sharpe refusal, reworded to name the flag and
+    the best return the pool actually offers.
+
+    `max_sharpe` checks this before it builds a problem at all, so there is
+    no solved state to inspect - the numbers come from `mu` directly.
+    """
+    best = str(mu.idxmax()) if len(mu) else "none"
+    return RiskFreeRateTooHighError(
+        f"--risk-free-rate {float(risk_free_rate):.4f} is at or above every candidate's "
+        "expected annual return, so no portfolio has a positive excess return and MSR is "
+        f"undefined. The best this pool offers is {float(mu.max()):.4f}, from {best}. Lower "
+        "--risk-free-rate below that, or switch to GMV or MV."
+    )
 
 
 def _dividend_infeasibility(

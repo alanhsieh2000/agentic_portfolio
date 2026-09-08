@@ -37,6 +37,8 @@ from typing import NamedTuple
 
 import numpy as np
 
+from src.errors import UnsatisfiableRequestError
+
 MAX_DIVIDEND_YIELD = 0.25
 """Ceiling on an acceptable dividend-yield FLOOR, refusing a percentage
 typed as a decimal.
@@ -68,10 +70,11 @@ rounds to five decimals and clips below 1e-4, which moved a solved yield by
 """
 
 
-class DividendFloorError(ValueError):
+class DividendFloorError(UnsatisfiableRequestError):
     """A dividend floor that no portfolio of these candidates can meet.
 
-    A `ValueError` subclass for precisely the reason
+    An `UnsatisfiableRequestError` (and so still a `ValueError`) for
+    precisely the reason
     `src/dataset/ticker_currency.py`'s `MixedCurrencyPoolError` is one: the
     interactive edit loop in `src/flow/cli.py` catches `ValueError` to
     revert a rejected edit, and that loop holds live mode's ONLY fetched
@@ -83,7 +86,7 @@ class DividendFloorError(ValueError):
     """
 
 
-class DividendYieldUnavailableError(ValueError):
+class DividendYieldUnavailableError(UnsatisfiableRequestError):
     """A dividend floor was asked for over a pool containing a ticker whose
     trailing yield is not known.
 
@@ -91,7 +94,8 @@ class DividendYieldUnavailableError(ValueError):
     "the answer is no", this one means "the question cannot be asked". A
     missing yield is not a zero yield, and the gap between those two is the
     gap between a portfolio that pays nothing and a portfolio nobody
-    measured. Also a `ValueError`, for the same edit-loop reason.
+    measured. Also an `UnsatisfiableRequestError`, and so still a
+    `ValueError`, for the same edit-loop reason.
     """
 
 

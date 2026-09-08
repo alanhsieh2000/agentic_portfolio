@@ -33,6 +33,7 @@ import pandas as pd
 import yfinance as yf
 
 from src.config.settings import settings
+from src.errors import UnsatisfiableRequestError
 from src.dataset.prices import to_yfinance_symbol
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ CURRENCY_LOOKUP_FAILED_REASON = (
 )
 
 
-class MixedCurrencyPoolError(ValueError):
+class MixedCurrencyPoolError(UnsatisfiableRequestError):
     """Raised when one portfolio's tickers do not share a single currency.
 
     Deliberately a `ValueError` subclass: `src/flow/cli.py`'s `_run_edit_loop`

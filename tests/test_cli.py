@@ -37,6 +37,7 @@ from src.flow.cli import (
     format_stale_share_counts,
     main,
     print_weights_and_allocation,
+    print_pipeline_result,
 )
 from src.config.settings import settings
 from src.optimizer.benchmark import BenchmarkSource, BenchmarkStats
@@ -2472,3 +2473,155 @@ def test_run_edit_loop_refuses_a_dividend_floor_when_dividends_were_not_consulte
     out = capsys.readouterr().out
     assert "A dividend floor needs dividend data" in out
     assert stub_optimizer.call_count == 0
+
+
+# ==========================================================================
+# An unsatisfiable run explains itself and keeps the session open
+# ==========================================================================
+
+
+def _unsatisfiable_result(error):
+    return {
+        "mode": "live", "rebalance_date": REBALANCE_DATE, "objective": "MV",
+        "selection": "user_provided", "rule": None,
+        "llm_s_signals": None, "llm_f_signals": None,
+        "scan_detail": {"branch": "user_provided", "buy_s_size": None, "buy_f_size": None,
+                        "intersection_size": None, "union_size": None,
+                        "candidates": ["AAA", "BBB"]},
+        "weights": None, "allocation": None, "stats": None, "currency": "USD",
+        "benchmark": None, "unsatisfiable": error,
+    }
+
+
+def test_print_pipeline_result_prints_the_reason_instead_of_a_weights_block(capsys):
+    """Everything above the weights still prints: the screening really ran,
+    and the candidate list beside the reason is what makes the remedy
+    obvious.
+    """
+    error = DividendFloorError(
+        "a target annual return of 0.1200 is unreachable once --min-dividend-yield's "
+        "dividend floor of 0.0300 is applied"
+    )
+    print_pipeline_result(_unsatisfiable_result(error), portfolio_value=100000.0)
+
+    out = capsys.readouterr().out
+    assert "Candidates (2): AAA, BBB" in out
+    assert "Cannot optimize this run: a target annual return of 0.1200 is unreachable" in out
+    assert "The fetched data is still open, so you can fix this without starting over." in out
+    assert "Weights:" not in out
+    assert "Share allocation:" not in out
+
+
+def _patch_main_for_unsatisfiable(monkeypatch, error, loop_return):
+    """Run `main` with the pipeline reporting `error`, capturing what the
+    edit loop was handed. Returns the recorded state.
+    """
+    seen: dict = {}
+
+    @contextlib.contextmanager
+    def session(*_a, **_k):
+        yield "session.duckdb", "live"
+
+    def loop(candidates, *_a, **kwargs):
+        seen["candidates"] = candidates
+        return loop_return
+
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr(
+        "src.flow.cli.run_pipeline_against", lambda *a, **k: _unsatisfiable_result(error)
+    )
+    monkeypatch.setattr("src.flow.cli._run_edit_loop", loop)
+    remember_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli._remember_risk_free_rate", remember_spy)
+    holdings_spy = MagicMock()
+    monkeypatch.setattr("src.flow.cli.prepare_holdings", holdings_spy)
+    seen["remember"] = remember_spy
+    seen["holdings"] = holdings_spy
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "today", "--objective", "MV", "--value", "100000",
+         "--benchmark", "none"],
+    )
+    return seen
+
+
+def test_main_enters_the_edit_loop_after_an_unsatisfiable_initial_run(monkeypatch, capsys):
+    """Live mode's snapshot cost minutes of fetching and is still open, so a
+    corrected retry must not require paying for all of it again.
+    """
+    seen = _patch_main_for_unsatisfiable(
+        monkeypatch, DividendFloorError("floor unreachable"), loop_return=True
+    )
+
+    main()
+
+    assert seen["candidates"] == ["AAA", "BBB"]
+    assert "Cannot optimize this run: floor unreachable" in capsys.readouterr().out
+
+
+def test_main_exits_one_when_no_report_was_ever_produced(monkeypatch):
+    """A run that printed no portfolio must not look like a success to a
+    script, however gracefully it explained itself.
+    """
+    _patch_main_for_unsatisfiable(
+        monkeypatch, DividendFloorError("floor unreachable"), loop_return=False
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 1
+
+
+def test_main_exits_zero_when_an_edit_produced_a_report(monkeypatch):
+    _patch_main_for_unsatisfiable(
+        monkeypatch, DividendFloorError("floor unreachable"), loop_return=True
+    )
+    main()  # no SystemExit
+
+
+def test_main_remembers_no_rate_and_skips_holdings_when_nothing_was_optimized(monkeypatch):
+    """The existing rule is that nothing is remembered until a run produces a
+    report, and the holdings block reads "beneath the optimizer's own
+    figures" - of which there are none.
+    """
+    seen = _patch_main_for_unsatisfiable(
+        monkeypatch, DividendFloorError("floor unreachable"), loop_return=False
+    )
+
+    with pytest.raises(SystemExit):
+        main()
+
+    seen["remember"].assert_not_called()
+    seen["holdings"].assert_not_called()
+
+
+def test_main_still_propagates_an_error_that_is_not_an_unsatisfiable_request(monkeypatch):
+    """The guard on the narrow catch: a genuine bug must keep escaping
+    rather than being presented as an impossible request.
+    """
+    @contextlib.contextmanager
+    def session(*_a, **_k):
+        yield "session.duckdb", "live"
+
+    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr(
+        "src.flow.cli.run_pipeline_against",
+        MagicMock(side_effect=RuntimeError("a real bug")),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "today", "--objective", "GMV", "--value", "100000",
+         "--benchmark", "none"],
+    )
+
+    with pytest.raises(RuntimeError, match="a real bug"):
+        main()
+
+
+def test_run_edit_loop_reports_whether_it_printed_a_report(monkeypatch, stub_optimizer):
+    """`main` needs this to pick an exit code after an unsatisfiable start."""
+    _script(monkeypatch, "f")
+    assert _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "s.duckdb") is False
+
+    _script(monkeypatch, "o", "MSR", "f")
+    assert _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "s.duckdb") is True

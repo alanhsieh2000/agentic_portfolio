@@ -24,6 +24,8 @@ from pypfopt.exceptions import OptimizationError
 
 from src.config.settings import settings
 from src.dataset.prices import load_latest_close
+from src.dataset.ticker_currency import MixedCurrencyPoolError
+from src.errors import UnsatisfiableRequestError
 from src.optimizer.dividends import (
     DividendFloor,
     DividendFloorError,
@@ -31,6 +33,8 @@ from src.optimizer.dividends import (
 )
 from src.optimizer.portfolio import (
     MV_RETURN_TOLERANCE,
+    RiskFreeRateTooHighError,
+    UnreachableTargetReturnError,
     _covariance_input,
     allocate_shares,
     apply_min_history_rule,
@@ -833,3 +837,88 @@ def test_the_floor_and_its_origin_are_echoed_back_for_the_report():
     assert stats.dividend_floor_origin == (
         "--min-annual-dividend $4,000.00 USD / --value $100,000.00 USD"
     )
+
+
+# ==========================================================================
+# Unsatisfiable requests are one family, with messages that name the flag
+# ==========================================================================
+
+
+def test_every_unsatisfiable_request_shares_one_type():
+    """`src/flow/cli.py`'s `main` catches this base rather than `ValueError`,
+    which would also swallow genuine bugs. They stay `ValueError` too, so
+    the interactive edit loop's pre-existing handler keeps reverting them.
+    """
+    for cls in (
+        DividendFloorError,
+        DividendYieldUnavailableError,
+        UnreachableTargetReturnError,
+        RiskFreeRateTooHighError,
+        MixedCurrencyPoolError,
+    ):
+        assert issubclass(cls, UnsatisfiableRequestError), cls.__name__
+        assert issubclass(cls, ValueError), cls.__name__
+
+
+def test_an_unreachable_target_return_names_the_flag_the_ceiling_and_the_ticker():
+    """PyPortfolioOpt's own text - "target_return must be lower than the
+    maximum possible return" - names neither the flag responsible nor a
+    value that would work, so it was translated.
+    """
+    df = _three_ticker_fixture()
+    with pytest.raises(UnreachableTargetReturnError) as excinfo:
+        compute_weights_and_stats(df, "MV", target_annual_return=0.99)
+
+    # Derived, not hardcoded, so the assertion says "it names the pool's
+    # best-returning ticker" rather than restating this fixture's numbers.
+    best = max(
+        compute_weights_and_stats(df, "GMV").expected_returns.items(), key=lambda kv: kv[1]
+    )[0]
+    message = str(excinfo.value)
+    assert "--target-return 0.9900" in message
+    assert best in message
+    assert "Lower --target-return to at most" in message
+    # The library's cause is preserved for anyone debugging.
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_a_risk_free_rate_above_every_return_names_the_flag_and_the_best_return():
+    df = _three_ticker_fixture()
+    with pytest.raises(RiskFreeRateTooHighError) as excinfo:
+        compute_weights_and_stats(df, "MSR", risk_free_rate=0.9)
+
+    best = max(
+        compute_weights_and_stats(df, "GMV").expected_returns.items(), key=lambda kv: kv[1]
+    )[0]
+    message = str(excinfo.value)
+    assert "--risk-free-rate 0.9000" in message
+    assert "MSR is undefined" in message
+    assert best in message
+
+
+def test_a_dividend_floor_keeps_its_own_message_for_a_blocked_mv_target():
+    """The dividend case stays `DividendFloorError` rather than becoming
+    `UnreachableTargetReturnError`, because its remedy includes relaxing the
+    floor - which the plain case has no notion of.
+    """
+    df = _three_ticker_fixture()
+    with pytest.raises(DividendFloorError) as excinfo:
+        compute_weights_and_stats(
+            df,
+            "MV",
+            target_annual_return=0.118,
+            dividend_floor=_floor(0.0599),
+            dividend_yields=_dividend_yields(),
+        )
+    assert "dividend floor" in str(excinfo.value)
+    assert not isinstance(excinfo.value, UnreachableTargetReturnError)
+
+
+def test_an_unrelated_value_error_from_the_optimizer_is_not_translated():
+    """The narrow catch must not become a catch-all: an invalid objective is
+    a programming error, not an impossible request, and must keep its own
+    type so nothing masks it.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        compute_weights_and_stats(_three_ticker_fixture(), "BOGUS")
+    assert not isinstance(excinfo.value, UnsatisfiableRequestError)
