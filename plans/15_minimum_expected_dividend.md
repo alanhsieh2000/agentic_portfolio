@@ -96,7 +96,7 @@ portfolios the optimizer may choose from. That is the trade being made, not a bu
       test files in 368.54s, up from 590 before this work. Per-group figures are recorded in
       `Validation and Acceptance` too, for an environment that cannot hold a six-minute
       process.
-- [ ] Backfill `data/holdings.duckdb` via `uv run portfolio-holdings --refresh-holdings`
+- [x] Backfill `data/holdings.duckdb` via `uv run portfolio-holdings --refresh-holdings`
       (needs the holdings file, which is user state, so it is left for the user to run).
 - [x] (2026-09-07 14:15Z) Wired `build_dividends_for_tickers` into
       `validate_and_ingest_tickers`, which Milestone 2 specified and the first end-to-end
