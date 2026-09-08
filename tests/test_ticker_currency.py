@@ -73,8 +73,13 @@ def test_normalize_currency_upcases_and_strips_an_unknown_major_unit():
 def test_apply_price_multipliers_scales_both_price_columns():
     """Both columns are quoted in the minor unit - verified against Yahoo
     Finance, where BARC.L reports close 184.119995 and adj_close 184.006180
-    for a share that genuinely traded near GBP 1.84 - and `adj_close` is the
-    one `load_latest_prices` reads.
+    for a share that genuinely traded near GBP 1.84.
+
+    Both must be scaled whatever the rest of the project reads: `close` is
+    what prices a trade and values a holding (see
+    `src/dataset/prices.py`'s `load_latest_close`) while `adj_close` is what
+    the monthly returns are computed from, so leaving either in pence would
+    be wrong by a factor of a hundred somewhere.
     """
     df = _prices(("BARC.L", 184.119995, 184.006180))
 

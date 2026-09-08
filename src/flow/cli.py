@@ -516,21 +516,18 @@ def format_allocated_dividends(
     does the portfolio I asked for yield" and "what will these share counts
     pay me" - and each belongs beside the block it describes.
 
-    Two things separate them, and the second is larger than it looks.
-    Whole shares plus leftover cash cannot reproduce continuous weights
-    exactly, which is a rounding effect worth a fraction of a percent. But
-    `allocate_shares` prices shares from `load_latest_prices`, which reads
-    `adj_close`, while a dividend yield is cash over the raw market `close`
-    (see `src/dataset/dividends.py`'s `load_latest_close` for why it must
-    be). On a database whose price window ended well before it was fetched,
-    `adj_close` sits meaningfully below `close` - by 6.7% to 17.8% across
-    the dividend payers in the shipped `data/portfolio.duckdb` - so the
-    share counts are struck against the lower number and this total comes
-    out correspondingly higher. It is an accurate statement about the share
-    counts printed above it; the gap is a property of which price column
-    the pre-existing allocation step uses, not of this arithmetic. On a
-    cache fetched up to today the two columns agree at the newest date and
-    the gap collapses to rounding alone.
+    What separates them is whole-share rounding alone: whole shares plus
+    leftover cash cannot reproduce continuous weights exactly, so the two
+    differ by a fraction of a percent. Measured on a five-name high-dividend
+    pool, $6,900.48 against $6,898.91 - 0.02% apart.
+
+    That was not always true. Until the allocation was corrected to price
+    shares at the market `close` rather than the back-adjusted `adj_close`,
+    the two figures sat about 18% apart on a historical-window database,
+    because the share counts were struck against a price nobody could trade
+    at. Their agreement is now the cleanest end-to-end signal that the
+    allocation is priced correctly, which is worth knowing if it ever
+    widens again.
 
     Computed as `sum(shares * dividends_per_share)`, from the per-share
     cash the data layer stored rather than from a yield, because a share

@@ -213,3 +213,46 @@ At the end of this plan, the following must exist and be usable by later plans e
 
 
 In `src/optimizer/portfolio.py`: `def load_returns_matrix(tickers: list[str], as_of: date, lookback_months: int = 60, min_months: int = 24, db_path: str = "data/portfolio.duckdb") -> pd.DataFrame`; `def load_latest_prices(tickers: list[str], as_of: date, db_path: str = "data/portfolio.duckdb") -> pd.Series`; `def compute_weights(returns_matrix: pd.DataFrame, objective: str, target_monthly_return: float = 0.01) -> dict[str, float]`; `def allocate_shares(weights: dict[str, float], latest_prices: pd.Series, total_value: float) -> tuple[dict[str, int], float]`. Plan 6 (`plans/06_interactive_flow.md`) calls all four in sequence — `scan` (plan 4) to get candidates, `load_returns_matrix` and `compute_weights` (this plan) to get weights under whichever objective the user picks, `load_latest_prices` (this plan) to get allocation-ready prices, and `allocate_shares` (this plan) to turn weights into a concrete share order, re-running `compute_weights`/`allocate_shares` fresh whenever the user edits the candidate list. Plan 6 also reads `plans/01_dataset.md`'s `returns` table directly (not through this plan's functions) for its own backtest-scoring purpose, per that table's Interfaces documentation in `plans/01_dataset.md`.
+
+
+## Revision Note: allocation prices at the market close, not the adjusted close (2026-09-08)
+
+This plan's `Plan of Work` specified that `load_latest_prices` return "its most recent
+`adj_close` on or before `as_of`", and that specification was wrong. It has been corrected to
+read the raw `close`.
+
+The reasoning behind the original choice was that `adj_close` supplied SPLIT adjustment,
+without which a pre-split price would be several times too high - the test that guarded it
+even annotated its fixture "split-adjusted, close != adj_close". That belief was mistaken,
+and `plans/01_dataset.md` already recorded why: yfinance's `Close` is always split-adjusted
+regardless of `auto_adjust`, so in the `prices` table the two columns differ by DIVIDEND
+adjustment alone. Confirmed against the stored data - AAPL closed near 300 on 2020-01-02
+before its 4:1 split of 2020-08-31, and the table holds `close` 75.0875, already divided by
+four, against `adj_close` 72.3339. So `close` carries every split correction this plan's
+allocation needs, and `adj_close` only added a dividend distortion.
+
+The consequence was not cosmetic. `adj_close` is back-adjusted so that reinvested dividends
+make the series a total-return index, which means it is not a price anybody can transact at,
+and dividing a budget by it buys more shares than the money can pay for. Measured on the
+shipped `data/portfolio.duckdb`, `close / adj_close` at each ticker's latest row has a median
+of 1.0395 and a maximum of 2.8659 (AIV, 8.06 against 2.81). A real run - a five-name
+high-dividend pool at 2024-04-01 with a 100,000 budget - recommended MO 625, PFE 831, T 690,
+VZ 949, WU 1153 and reported `Leftover cash: $17.69`, while those share counts would actually
+have cost 118,088.76 at market: an 18.1% overspend, reported as being 17 dollars under
+budget. After the correction the same run recommends MO 532, PFE 705, T 610, VZ 806, WU 924,
+costing 99,984.08 - inside the budget, as `Leftover cash` claims.
+
+The fix went into `load_latest_prices` itself rather than into `allocate_shares`, so the
+holdings valuation in `plans/13_user_portfolio.md` moves with it and the two keep pricing
+against the same column, as that plan requires. The lookup now lives once, in
+`src/dataset/prices.py`'s `load_latest_close`, which is also what
+`plans/15_minimum_expected_dividend.md`'s dividend yields divide by - so the price a share is
+bought at, valued at, and has its dividend measured against is provably one number.
+
+Nothing in Backtest Mode moves: `src/flow/backtest.py` calls neither `allocate_shares` nor
+`load_latest_prices`, which this plan's own `Plan of Work` already noted. The `returns`
+table continues to be built from `adj_close`, correctly: a monthly return has to be a total
+return, which is exactly what the adjusted series provides. That distinction - adjusted for
+measuring, raw for transacting - is the lasting lesson, and it was blurred here for four
+plans because every test fixture happened to price the two columns equally, so the choice was
+invisible.

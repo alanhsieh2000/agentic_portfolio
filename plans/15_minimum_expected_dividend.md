@@ -105,10 +105,11 @@ portfolios the optimizer may choose from. That is the trade being made, not a bu
       correctly but uselessly refused as having no yield.
 - [ ] Optional follow-up: the four uncovered universe tickers are ones yfinance cannot
       resolve at all and already appear in `unresolved_tickers`; confirm and leave them.
-- [ ] Separate piece of work, surfaced by this one: `allocate_shares` prices shares from
-      `adj_close` rather than raw `close`, so on a historical-window database it
-      over-allocates by however far the two columns have drifted (about 12% on the shipped
-      data). See `Surprises & Discoveries`. Not changed here, deliberately.
+- [x] (2026-09-08) FIXED, as its own piece of work: `allocate_shares` priced shares from
+      `adj_close` rather than raw `close`, over-allocating by up to 2.87x on a
+      historical-window database (18.1% on a real five-name run). `load_latest_prices` now
+      reads the market close through one shared loader in `src/dataset/prices.py`. See
+      `plans/05_optimizer_and_allocation.md`'s revision note.
 
 
 ## Surprises & Discoveries
@@ -1151,5 +1152,18 @@ reports were exercised against live data - `portfolio-holdings show` and
 `uv run portfolio-holdings set 9984.T 4000` was then run to confirm it parses verbatim.
 
 One item from this plan's `Progress` list is now resolved by other means: `data/holdings.duckdb`
-has been backfilled, since the splits migration forces a refresh on next use. The
-`allocate_shares` `adj_close` issue remains open and untouched.
+has been backfilled, since the splits migration forces a refresh on next use.
+
+The `allocate_shares` `adj_close` issue, carried as follow-up through two sessions, is now
+FIXED - see `plans/05_optimizer_and_allocation.md`'s revision note of the same date. Two
+consequences for this plan. The `Annual dividends at these share counts` line and the
+`Annual dividend income` line above it now agree to within whole-share rounding ($6,900.48
+against $6,898.91, 0.02% apart) where they previously sat about 18% apart, so
+`format_allocated_dividends`' docstring and the `README.md` bullet no longer explain a gap
+that exists. And the dividend yield's denominator is no longer a separate near-copy of the
+price lookup: `load_latest_close` moved out of `src/dataset/dividends.py` into
+`src/dataset/prices.py`, where `src/optimizer/portfolio.py`'s `load_latest_prices` now also
+reads it, so the price a share is bought at, valued at and has its dividend divided by is one
+number by construction rather than by coincidence. The duplication this plan introduced was
+itself part of how the column choice drifted, which is worth remembering the next time a
+convenient local copy looks harmless.

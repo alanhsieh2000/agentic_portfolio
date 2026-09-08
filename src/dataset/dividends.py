@@ -78,7 +78,7 @@ import pandas as pd
 import yfinance as yf
 
 from src.config.settings import settings
-from src.dataset.prices import _build_symbol_map
+from src.dataset.prices import _build_symbol_map, load_latest_close
 
 logger = logging.getLogger(__name__)
 
@@ -1007,75 +1007,6 @@ if __name__ == "__main__":
     main()
 
 
-def load_latest_close(tickers: list[str], as_of: date, db_path: str) -> pd.Series:
-    """Most recent RAW `close` on or before `as_of` for each of `tickers`.
-
-    The dividend-yield denominator, and deliberately not
-    `src/optimizer/portfolio.py`'s `load_latest_prices`, which reads
-    `adj_close`. A yield is cash per share over the price of one share, and
-    `adj_close` is back-adjusted - at any date before the fetch window's end
-    it is lower than the price anyone could have paid, so dividing a real
-    cash dividend by it overstates the yield.
-
-    This is not a theoretical concern. The shipped `data/portfolio.duckdb`
-    holds prices through 2024-04-29 but was fetched later, so two further
-    years of dividends have back-adjusted even its newest row: AAPL closes
-    at 173.50 there with an `adj_close` of 171.78, a 1% gap that would
-    inflate every yield computed from it. Where the two DO agree - a cache
-    fetched up to today, which is the holdings path - `close` gives the same
-    answer, so `close` is correct in both regimes and `adj_close` in only
-    one.
-
-    `load_latest_prices` itself is deliberately left alone: share allocation
-    and holdings valuation must price against the same column as each other,
-    and for their as-of dates the two agree anyway.
-
-    Reuses `attach_nearest_price` (src/dataset/fundamentals.py), the same
-    nearest-on-or-before-per-ticker join the rest of this project uses, by
-    aliasing `close` to the `adj_close` column name that function reads.
-    Yields NaN for a ticker with no price row on or before `as_of`.
-    """
-    if not tickers:
-        return pd.Series(dtype=float, name="close", index=pd.Index([], name="ticker"))
-
-    from src.dataset.fundamentals import attach_nearest_price
-
-    placeholders = ", ".join(["?"] * len(tickers))
-    try:
-        con = duckdb.connect(db_path, read_only=True)
-    except duckdb.IOException:
-        return pd.Series(
-            [float("nan")] * len(tickers),
-            index=pd.Index(tickers, name="ticker"),
-            name="close",
-        )
-    try:
-        prices = con.execute(
-            f"SELECT date, ticker, close AS adj_close FROM prices "
-            f"WHERE ticker IN ({placeholders}) AND date <= ?",
-            [*tickers, pd.Timestamp(as_of).date()],
-        ).fetchdf()
-    except duckdb.CatalogException:
-        prices = pd.DataFrame(columns=["date", "ticker", "adj_close"])
-    finally:
-        con.close()
-
-    if not prices.empty:
-        prices["date"] = pd.to_datetime(prices["date"])
-        prices["ticker"] = prices["ticker"].astype(str)
-
-    grid = pd.DataFrame(
-        {
-            "rebalance_date": pd.to_datetime([as_of] * len(tickers)).astype("datetime64[us]"),
-            "ticker": pd.array(tickers, dtype=str),
-        }
-    )
-    merged = attach_nearest_price(grid, prices)
-    result = merged.set_index("ticker")["adj_close"].reindex(tickers)
-    result.index.name = "ticker"
-    return result.rename("close")
-
-
 def load_dividend_figures(
     tickers: list[str],
     as_of: date,
@@ -1117,6 +1048,9 @@ def load_dividend_figures(
     known = tickers_with_dividend_data(tickers, db_path)
     long_df = load_dividends_long(tickers, window_start, as_of, db_path)
     per_share = trailing_dividends_per_share(long_df, tickers, as_of, lookback_months)
+    # The same market price `allocate_shares` and the holdings valuation
+    # use, from the one shared loader - so a dividend yield's denominator
+    # and the price a share is bought or valued at are provably one number.
     prices = load_latest_close(tickers, as_of, db_path)
     yields, unavailable = trailing_dividend_yields(per_share, prices, known)
     available_per_share = {t: per_share[t] for t in yields}

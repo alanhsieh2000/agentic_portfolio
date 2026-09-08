@@ -893,3 +893,34 @@ def test_unavailable_holdings_can_still_carry_dividend_figures():
     )
     assert stats.annual_return is None
     assert stats.dividends.total_annual_dividends == pytest.approx(111.0)
+
+
+def test_holdings_are_valued_at_the_market_close_not_the_adjusted_close(tmp_path):
+    """`Total value` and every weight derived from it must use a price
+    somebody could sell at.
+
+    `adj_close` is back-adjusted, so at any date before the price window's
+    end it sits below the market price - measured on the real holdings
+    cache, `VZ` at 2024-06-03 was undervalued by 15.9%. Because
+    `weights_from_positions` shares one price loader with
+    `allocate_shares`, this and the allocation are provably the same number,
+    which is the invariant `plans/13_user_portfolio.md` established.
+    """
+    db = str(tmp_path / "h.duckdb")
+    con = duckdb.connect(db)
+    try:
+        con.execute("CREATE TABLE returns (rebalance_date DATE, ticker VARCHAR, monthly_return DOUBLE)")
+        con.execute("CREATE TABLE prices (date DATE, ticker VARCHAR, close DOUBLE, adj_close DOUBLE)")
+        con.execute("CREATE TABLE splits (ex_date DATE, ticker VARCHAR, ratio DOUBLE)")
+        con.executemany(
+            "INSERT INTO returns VALUES (?, 'VZ', ?)",
+            [(ts.date(), float(v)) for ts, v in _monthly_returns(40, "VZ").items()],
+        )
+        con.execute("INSERT INTO prices VALUES ('2024-06-03', 'VZ', 40.98, 35.37)")
+    finally:
+        con.close()
+
+    stats = holdings_stats({"VZ": 100.0}, date(2024, 6, 4), db, "USD")
+
+    assert stats.market_values["VZ"] == pytest.approx(4098.0)
+    assert stats.total_value == pytest.approx(4098.0)

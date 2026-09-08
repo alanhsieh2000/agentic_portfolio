@@ -7,8 +7,10 @@ returns matrix that feeds PyPortfolioOpt's expected-return and
 covariance-matrix estimation - never `prices` directly for that purpose,
 per plan 5's Decision Log (one shared returns table, not an independently
 recomputed one). `prices` is used only for allocation-time share pricing
-(`load_latest_prices`), the one place in this module that still touches
-raw daily prices rather than monthly returns.
+(`load_latest_prices`, which delegates to `src/dataset/prices.py`'s
+`load_latest_close` and therefore reads the raw `close` - a real market
+price - rather than the back-adjusted `adj_close`), the one place in this
+module that still touches raw daily prices rather than monthly returns.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from pypfopt.base_optimizer import portfolio_performance
 from pypfopt.exceptions import OptimizationError
 
 from src.config.settings import settings
-from src.dataset.fundamentals import attach_nearest_price
+from src.dataset.prices import load_latest_close
 from src.optimizer.dividends import (
     DIVIDEND_BINDING_TOLERANCE,
     DividendFloor,
@@ -840,28 +842,6 @@ def stats_for_weights(
     )
 
 
-def _load_prices_up_to(tickers: list[str], as_of: date, db_path: str) -> pd.DataFrame:
-    """Long-format rows (['date', 'ticker', 'adj_close']) from the `prices`
-    table for `tickers`, restricted to `date <= as_of` - only the rows
-    `attach_nearest_price` could possibly need, not the whole table.
-    """
-    if not tickers:
-        return pd.DataFrame(columns=["date", "ticker", "adj_close"])
-
-    placeholders = ", ".join(["?"] * len(tickers))
-    con = duckdb.connect(db_path)
-    try:
-        df = con.execute(
-            f"SELECT date, ticker, adj_close FROM prices WHERE ticker IN ({placeholders}) AND date <= ?",
-            [*tickers, pd.Timestamp(as_of).date()],
-        ).fetchdf()
-    finally:
-        con.close()
-    df["date"] = pd.to_datetime(df["date"])
-    df["ticker"] = df["ticker"].astype(str)
-    return df
-
-
 def latest_price_date(tickers: list[str], as_of: date, db_path: str) -> date | None:
     """The date of the most recent price row `db_path` holds for `tickers` at
     or before `as_of`, or `None` when it holds none.
@@ -900,37 +880,26 @@ def latest_price_date(tickers: list[str], as_of: date, db_path: str) -> date | N
 
 
 def load_latest_prices(tickers: list[str], as_of: date, db_path: str = settings.db_path) -> pd.Series:
-    """Most recent `adj_close` on or before `as_of` for each of `tickers`,
-    read from the `prices` table (not `returns`) - `allocate_shares` needs
-    a real per-share dollar price, which a monthly return has no unit for.
+    """Most recent MARKET price (raw `close`) on or before `as_of` for each
+    of `tickers`, read from the `prices` table (not `returns`) -
+    `allocate_shares` needs a real per-share price, which a monthly return
+    has no unit for.
 
-    Reuses `attach_nearest_price` (src/dataset/fundamentals.py), the same
-    nearest-on-or-before-per-ticker join `src/dataset/returns.py` uses,
-    rather than reimplementing it, per that function's own docstring note.
-    Yields NaN (not an error) for a ticker with no price row on or before
-    `as_of`, matching `attach_nearest_price`'s own missing-data behavior;
-    logged so a silent NaN doesn't surface only much later at the
-    allocation step.
+    A thin delegation to `src/dataset/prices.py`'s `load_latest_close`,
+    which is the single place this project decides what a share is worth and
+    which carries the full reasoning for the column. Keeping this name and
+    signature means `allocate_shares`, `src/optimizer/holdings.py`'s
+    `weights_from_positions` and `src/flow/interactive.py` all keep pricing
+    against one another - the invariant `plans/13_user_portfolio.md`
+    established - and they cannot drift apart again, because there is now
+    only one function to change.
+
+    It used to read `adj_close`, which is back-adjusted and therefore not a
+    price anybody can trade at; see `load_latest_close` for the measured
+    18% over-allocation that caused and why the original split-adjustment
+    rationale was mistaken.
     """
-    if not tickers:
-        return pd.Series(dtype=float, name="adj_close", index=pd.Index([], name="ticker"))
-
-    grid = pd.DataFrame(
-        {
-            "rebalance_date": pd.to_datetime([as_of] * len(tickers)).astype("datetime64[us]"),
-            "ticker": pd.array(tickers, dtype=str),
-        }
-    )
-    prices = _load_prices_up_to(tickers, as_of, db_path)
-    merged = attach_nearest_price(grid, prices)
-    result = merged.set_index("ticker")["adj_close"].reindex(tickers)
-    result.index.name = "ticker"
-
-    missing = result[result.isna()].index.tolist()
-    if missing:
-        logger.warning("no price on or before %s for ticker(s): %s", as_of, sorted(missing))
-
-    return result
+    return load_latest_close(tickers, as_of, db_path)
 
 
 def allocate_shares(weights: dict[str, float], latest_prices: pd.Series, total_value: float) -> tuple[dict[str, int], float]:

@@ -23,6 +23,7 @@ import inspect
 from pypfopt.exceptions import OptimizationError
 
 from src.config.settings import settings
+from src.dataset.prices import load_latest_close
 from src.optimizer.dividends import (
     DividendFloor,
     DividendFloorError,
@@ -383,13 +384,68 @@ def test_load_latest_prices_is_nan_for_ticker_with_no_price_on_or_before_as_of(t
     assert pd.isna(result["AAPL"])
 
 
-def test_load_latest_prices_uses_adj_close_not_close(tmp_path):
+def test_load_latest_prices_uses_close_not_adj_close(tmp_path):
+    """A share is priced at what it trades for.
+
+    This assertion was the other way round until it was found to cause an
+    18% over-allocation on real data. The original reasoning was that
+    `adj_close` was needed for SPLIT adjustment - the previous version of
+    this test even annotated its fixture "split-adjusted, close !=
+    adj_close" - but `plans/01_dataset.md` records that yfinance's `Close`
+    is always split-adjusted regardless of `auto_adjust`, so the two columns
+    differ by DIVIDEND adjustment alone. `adj_close` is back-adjusted and
+    therefore not a price anybody can transact at; `close` already carries
+    every split correction an allocation needs.
+    """
     db_path = str(tmp_path / "prices.duckdb")
-    _make_prices_db(db_path, [("2024-01-01", "AAPL", 100.0, 95.0)])  # split-adjusted, close != adj_close
+    _make_prices_db(db_path, [("2024-01-01", "AAPL", 100.0, 95.0)])
 
     result = load_latest_prices(["AAPL"], date(2024, 1, 1), db_path=db_path)
 
-    assert result["AAPL"] == pytest.approx(95.0)
+    assert result["AAPL"] == pytest.approx(100.0)
+
+
+def test_load_latest_prices_is_the_shared_market_price_loader(tmp_path):
+    """`optimizer.load_latest_prices` and `dataset.prices.load_latest_close`
+    must be one number, so the price a share is bought at, valued at and has
+    its dividend divided by cannot drift apart again - which is how the
+    column choice diverged in the first place.
+    """
+    db_path = str(tmp_path / "prices.duckdb")
+    _make_prices_db(
+        db_path, [("2024-01-01", "AAPL", 100.0, 95.0), ("2024-01-01", "MSFT", 42.0, 40.0)]
+    )
+
+    assert load_latest_prices(["AAPL", "MSFT"], date(2024, 1, 1), db_path=db_path).equals(
+        load_latest_close(["AAPL", "MSFT"], date(2024, 1, 1), db_path=db_path)
+    )
+
+
+def test_allocate_shares_stays_within_budget_when_close_exceeds_adj_close(tmp_path):
+    """The regression the bug deserved, and one no existing test could have
+    caught: every fixture priced `close` equal to `adj_close`, so the column
+    choice was invisible.
+
+    Asserted as the property that matters - the recommended share counts,
+    valued at the MARKET price, must fit the budget - rather than as a
+    column name. Priced from `adj_close` (95 against a real 100) the greedy
+    allocator buys about 5% too many shares, so this fails before the change
+    and passes after.
+    """
+    db_path = str(tmp_path / "prices.duckdb")
+    _make_prices_db(
+        db_path, [("2024-01-01", "AAPL", 100.0, 95.0), ("2024-01-01", "MSFT", 50.0, 40.0)]
+    )
+    budget = 10_000.0
+
+    prices = load_latest_prices(["AAPL", "MSFT"], date(2024, 1, 1), db_path=db_path)
+    shares, leftover = allocate_shares({"AAPL": 0.5, "MSFT": 0.5}, prices, budget)
+
+    market_cost = shares["AAPL"] * 100.0 + shares["MSFT"] * 50.0
+    assert market_cost <= budget
+    # And the leftover the report prints is real money, not an artefact of a
+    # price nobody can trade at.
+    assert market_cost + leftover == pytest.approx(budget, abs=100.0)
 
 
 def test_load_latest_prices_empty_tickers_returns_empty_series(tmp_path):

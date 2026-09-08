@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -235,6 +236,111 @@ def fetch_price_history(
         if i < len(chunks):
             time.sleep(pause_seconds)
     return pd.concat(frames, axis=1) if frames else pd.DataFrame()
+
+
+def load_latest_close(
+    tickers: list[str], as_of: date, db_path: str = settings.db_path
+) -> pd.Series:
+    """Most recent raw `close` on or before `as_of` for each of `tickers`,
+    indexed by ticker, NaN where there is no such row.
+
+    THE market-price lookup for this project: the one answer to "what is a
+    share of this worth?", used both to turn a budget into share counts
+    (`src/optimizer/portfolio.py`'s `allocate_shares`) and to turn a share
+    count into a market value (`src/optimizer/holdings.py`'s
+    `weights_from_positions`), and to divide a dividend by
+    (`src/dataset/dividends.py`). Those three must agree, so they read this.
+
+    Why `close` and not `adj_close`, which this project reached for first.
+    `adj_close` is BACK-ADJUSTED: every historical price is scaled down so
+    that reinvested dividends make the series a total-return index, which is
+    exactly right for computing a return and exactly wrong for pricing a
+    trade, because nobody can transact at it. Dividing a budget by it buys
+    more shares than the money can pay for - measured on the shipped
+    `data/portfolio.duckdb`, a 100,000 allocation across five high-dividend
+    names produced share counts that really cost 118,088.76, an 18%
+    overspend, while the report claimed 17.69 of leftover cash.
+
+    The original choice of `adj_close` was made to obtain SPLIT adjustment,
+    and that reasoning was mistaken: `plans/01_dataset.md` records that
+    yfinance's `Close` is always split-adjusted regardless of
+    `auto_adjust`, so in this table the two columns differ by dividend
+    adjustment alone. AAPL closed near 300 on 2020-01-02, before its 4:1
+    split of 2020-08-31, and this table holds `close` 75.0875 - already
+    divided by four - against `adj_close` 72.3339. So `close` carries every
+    split correction an allocation needs and adds no dividend distortion.
+
+    Reuses `attach_nearest_price` (src/dataset/fundamentals.py), the same
+    nearest-on-or-before-per-ticker join `src/dataset/returns.py` and
+    `src/dataset/momentum.py` use. That import is function-local rather than
+    module-level because `fundamentals.py` itself imports
+    `to_yfinance_symbol` from this module, so a module-level import here
+    would be circular - the same idiom `src/dataset/holdings_cache.py` uses
+    for the same reason. `attach_nearest_price` names its output column
+    `adj_close`, so `close` is aliased to that name at the SQL boundary and
+    the result renamed back; the alias is confined to these few lines.
+
+    A missing price is logged rather than raised, matching
+    `attach_nearest_price`'s own behavior, so a silent NaN does not surface
+    only much later inside `DiscreteAllocation`.
+    """
+    from src.dataset.fundamentals import attach_nearest_price
+
+    if not tickers:
+        return pd.Series(dtype=float, name="close", index=pd.Index([], name="ticker"))
+
+    prices = _load_closes_up_to(tickers, as_of, db_path)
+    grid = pd.DataFrame(
+        {
+            "rebalance_date": pd.to_datetime([as_of] * len(tickers)).astype("datetime64[us]"),
+            "ticker": pd.array(tickers, dtype=str),
+        }
+    )
+    merged = attach_nearest_price(grid, prices)
+    result = merged.set_index("ticker")["adj_close"].reindex(tickers)
+    result.index.name = "ticker"
+
+    missing = result[result.isna()].index.tolist()
+    if missing:
+        logger.warning("no price on or before %s for ticker(s): %s", as_of, sorted(missing))
+
+    return result.rename("close")
+
+
+def _load_closes_up_to(tickers: list[str], as_of: date, db_path: str) -> pd.DataFrame:
+    """Long-format rows (['date', 'ticker', 'adj_close']) holding each
+    ticker's raw `close` up to `as_of` - only the rows
+    `attach_nearest_price` could possibly need, not the whole table.
+
+    The column is ALIASED to `adj_close` because that is the name
+    `attach_nearest_price` reads and writes; the values are `close`. Opened
+    read-only, and a missing file or missing `prices` table yields the
+    correctly-shaped empty frame rather than raising, so asking about a
+    database never creates one.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=["date", "ticker", "adj_close"])
+
+    placeholders = ", ".join(["?"] * len(tickers))
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+    except duckdb.IOException:
+        return pd.DataFrame(columns=["date", "ticker", "adj_close"])
+    try:
+        df = con.execute(
+            f"SELECT date, ticker, close AS adj_close FROM prices "
+            f"WHERE ticker IN ({placeholders}) AND date <= ?",
+            [*tickers, pd.Timestamp(as_of).date()],
+        ).fetchdf()
+    except duckdb.CatalogException:
+        return pd.DataFrame(columns=["date", "ticker", "adj_close"])
+    finally:
+        con.close()
+
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        df["ticker"] = df["ticker"].astype(str)
+    return df
 
 
 def load_ticker_universe(db_path: str = settings.db_path) -> list[str]:
