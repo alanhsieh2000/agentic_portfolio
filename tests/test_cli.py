@@ -51,6 +51,7 @@ from src.config.settings import settings
 from src.optimizer.benchmark import BenchmarkSource, BenchmarkStats
 from src.optimizer.dividends import DividendFloor, DividendFloorError
 from src.flow.backtest import compute_sharpe_ratio
+from src.flow.report_archive import ReportArchive, load_report
 from src.flow.rate_memory import (
     DEFAULT_RATES_PATH,
     load_all_risk_free_rates,
@@ -3323,3 +3324,294 @@ def test_edit_loop_summary_uses_the_rate_the_session_already_settled_on(
     )
 
     assert "Risk-free rate used: 0.0050 (remembered for USD)" in capsys.readouterr().out
+
+
+# ==========================================================================
+# Archiving each printed report under output/<month>/
+#
+# The archive itself - digests, filenames, front matter, deduplication - is
+# tested in tests/test_report_archive.py. What is tested here is only what
+# `src/flow/cli.py` is responsible for: which section of the report is
+# archived, which facts reach it, that the two flags arrive, and that the
+# interactive edit loop keeps archiving after the initial report. Every test
+# points the archive at `tmp_path`; note that `tests/conftest.py` also
+# redirects `settings.output_dir` for the whole suite, so a test that forgot
+# to would still not write into the repository.
+# ==========================================================================
+
+
+def _report_archive(tmp_path, **overrides) -> ReportArchive:
+    fields = {
+        "output_dir": str(tmp_path / "output"),
+        "enabled": True,
+        "kind": "portfolio",
+        "as_of": REBALANCE_DATE,
+        "command": "portfolio --date today --objective GMV --value 100000",
+    }
+    fields.update(overrides)
+    return ReportArchive(**fields)
+
+
+def _satisfiable_result(**overrides) -> dict:
+    """A `run_pipeline_against` result that produced a real portfolio, built
+    from `_unsatisfiable_result`'s shape so the two stay in step."""
+    result = _unsatisfiable_result(None)
+    result["unsatisfiable"] = None
+    result["stats"] = _stats(
+        weights={"AAA": 0.6, "BBB": 0.4},
+        expected_returns={"AAA": 0.1, "BBB": 0.08},
+        volatility={"AAA": 0.2, "BBB": 0.15},
+        portfolio_expected_return=0.0871,
+        portfolio_volatility=0.0451,
+        portfolio_sharpe=1.4878,
+    )
+    result["allocation"] = ({"AAA": 10, "BBB": 20}, 12.5)
+    result["resolved_objective"] = None
+    result["concentration_note"] = None
+    result["objective"] = "GMV"
+    result.update(overrides)
+    return result
+
+
+def _archived(tmp_path) -> list[Path]:
+    month = tmp_path / "output" / REBALANCE_DATE.strftime("%Y-%m")
+    return sorted(month.iterdir()) if month.exists() else []
+
+
+def test_archived_body_is_the_portfolio_block_not_the_header(tmp_path, capsys):
+    """The header facts are stored as front-matter values instead, because the
+    section below them is the only one the edit loop reprints - and anchoring
+    the digest there is what lets an edit that returns to this portfolio be
+    recognized rather than saved twice.
+    """
+    print_pipeline_result(
+        _satisfiable_result(), portfolio_value=100000.0, archive=_report_archive(tmp_path)
+    )
+
+    out = capsys.readouterr().out
+    (saved,) = _archived(tmp_path)
+    _facts, body = load_report(saved)
+
+    assert "Candidates (2): AAA, BBB" in out          # printed
+    assert "Candidates (2)" not in body               # but not archived as prose
+    assert "Mode: live" not in body
+    assert "Portfolio currency: USD" in body
+    assert "Share allocation:" in body
+
+
+def test_archiving_names_the_file_it_wrote(tmp_path, capsys):
+    print_pipeline_result(
+        _satisfiable_result(), portfolio_value=100000.0, archive=_report_archive(tmp_path)
+    )
+
+    (saved,) = _archived(tmp_path)
+    assert f"Saved report: {saved}" in capsys.readouterr().out
+
+
+def test_front_matter_carries_the_facts_a_comparison_needs(tmp_path):
+    print_pipeline_result(
+        _satisfiable_result(
+            benchmark=BenchmarkStats(
+                "SPY", "USD", 0.0912, 0.1770, 0.4023, 0.02,
+                date(2020, 5, 1), date(2025, 4, 1), 60, None,
+            ),
+            resolved_objective=ResolvedObjective("GMV", None, "named on the command line"),
+        ),
+        portfolio_value=100000.0,
+        archive=_report_archive(tmp_path),
+    )
+
+    (saved,) = _archived(tmp_path)
+    facts, _body = load_report(saved)
+
+    assert facts["objective"] == "GMV"
+    assert facts["objective_origin"] == "named on the command line"
+    assert facts["selection"] == "user_provided"
+    assert facts["currency"] == "USD"
+    assert facts["candidates"] == "AAA, BBB"
+    assert facts["value"] == "100000.00"
+    assert facts["benchmark"] == "SPY"
+    assert facts["benchmark_return"] == "0.0912"
+    assert facts["annual_return"] == "0.0871"
+    assert facts["annual_volatility"] == "0.0451"
+    assert facts["sharpe"] == "1.4878"
+    assert facts["window_start"] == "2020-05-01"
+    assert facts["window_months"] == "60"
+
+
+def test_the_target_return_is_recorded_only_for_mv(tmp_path):
+    """Meaningful only for MV, as everywhere else in this project - so it is
+    absent rather than stored as a number a reader must know to ignore."""
+    archive = _report_archive(tmp_path)
+    print_pipeline_result(_satisfiable_result(), portfolio_value=1000.0, archive=archive)
+    gmv_facts, _ = load_report(_archived(tmp_path)[0])
+
+    assert "target_return" not in gmv_facts
+
+    print_pipeline_result(
+        _satisfiable_result(objective="MV"), portfolio_value=1000.0, archive=archive
+    )
+    mv_facts, _ = load_report(
+        next(p for p in _archived(tmp_path) if "-MV-" in p.name)
+    )
+
+    assert mv_facts["target_return"] == f"{DEFAULT_TARGET_ANNUAL_RETURN:.4f}"
+
+
+def test_an_identical_report_is_recognized_rather_than_saved_twice(tmp_path, capsys):
+    archive = _report_archive(tmp_path)
+
+    print_pipeline_result(_satisfiable_result(), portfolio_value=100000.0, archive=archive)
+    capsys.readouterr()
+    print_pipeline_result(_satisfiable_result(), portfolio_value=100000.0, archive=archive)
+
+    assert "Report already saved this month:" in capsys.readouterr().out
+    assert len(_archived(tmp_path)) == 1
+
+
+def test_an_unsatisfiable_run_archives_nothing(tmp_path, capsys):
+    """There is no portfolio, so there is nothing to compare against another
+    portfolio - and the reason still prints."""
+    error = DividendFloorError("a target annual return of 0.1200 is unreachable")
+    print_pipeline_result(
+        _unsatisfiable_result(error), portfolio_value=100000.0, archive=_report_archive(tmp_path)
+    )
+
+    assert "Cannot optimize this run" in capsys.readouterr().out
+    assert _archived(tmp_path) == []
+
+
+def test_a_disabled_archive_prints_exactly_what_it_always_did(tmp_path, capsys):
+    """The `--no-save-reports` path: no file, no directory, and no extra line
+    in the report."""
+    with_archive = _report_archive(tmp_path, enabled=False)
+    print_pipeline_result(_satisfiable_result(), portfolio_value=100000.0, archive=with_archive)
+    disabled = capsys.readouterr().out
+
+    print_pipeline_result(_satisfiable_result(), portfolio_value=100000.0)
+    unarchived = capsys.readouterr().out
+
+    assert disabled == unarchived
+    assert not (tmp_path / "output").exists()
+
+
+def test_main_builds_the_archive_from_its_flags(monkeypatch, tmp_path):
+    seen = {}
+    _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "src.flow.cli.print_pipeline_result",
+        lambda result, **kwargs: seen.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--output-dir", str(tmp_path / "elsewhere")],
+    )
+
+    main()
+
+    archive = seen["archive"]
+    assert archive.output_dir == str(tmp_path / "elsewhere")
+    assert archive.enabled is True
+    assert archive.kind == "portfolio"
+    # The month folder follows --date, not the clock.
+    assert archive.as_of == date(2024, 3, 1)
+    assert archive.command.startswith("portfolio --date 2024-03-01")
+
+
+def test_main_disables_the_archive_with_no_save_reports(monkeypatch):
+    seen = {}
+    _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "src.flow.cli.print_pipeline_result",
+        lambda result, **kwargs: seen.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000",
+         "--no-save-reports"],
+    )
+
+    main()
+
+    assert seen["archive"].enabled is False
+
+
+def test_main_passes_one_archive_to_both_the_report_and_the_edit_loop(monkeypatch):
+    """Carried into the loop for the same reason the risk-free rate is: a
+    facility that applied to the initial report and stopped applying on the
+    first edit would be worse than none."""
+    seen = {}
+    _pipeline_spy, edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        "src.flow.cli.print_pipeline_result",
+        lambda result, **kwargs: seen.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["portfolio", "--date", "2024-03-01", "--objective", "GMV", "--value", "1000"],
+    )
+
+    main()
+
+    assert edit_spy.call_args.kwargs["archive"] is seen["archive"]
+
+
+def _stub_optimizer_that_prints(monkeypatch, stats_by_objective):
+    """`stub_optimizer`, except the report actually prints something - the
+    archive stores what was printed, so a no-op printer would store nothing.
+
+    Keyed by objective so a test can drive the loop to a different portfolio
+    and back, which is the case digest deduplication exists for.
+    """
+
+    def recompute(candidates, objective, *args, **kwargs):
+        return stats_by_objective[objective], ({"AAA": 10}, 0.0)
+
+    monkeypatch.setattr("src.flow.cli.compute_weights_and_allocation", recompute)
+
+
+def test_the_edit_loop_archives_each_recompute(monkeypatch, tmp_path):
+    _stub_optimizer_that_prints(
+        monkeypatch,
+        {
+            "GMV": _stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1},
+                          volatility={"AAA": 0.2}, portfolio_expected_return=0.05),
+            "MSR": _stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1},
+                          volatility={"AAA": 0.2}, portfolio_expected_return=0.09),
+        },
+    )
+    _script(monkeypatch, "o", "MSR", "f")
+
+    _run_edit_loop(
+        ["AAA"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        archive=_report_archive(tmp_path),
+    )
+
+    (saved,) = _archived(tmp_path)
+    facts, _body = load_report(saved)
+    assert facts["variant"] == "edit"
+    assert facts["objective"] == "MSR"
+
+
+def test_editing_back_to_an_earlier_portfolio_adds_no_file(monkeypatch, tmp_path):
+    """The reason the archived body is the section both report paths share:
+    the same portfolio reached twice is one stored report, not two."""
+    _stub_optimizer_that_prints(
+        monkeypatch,
+        {
+            "GMV": _stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1},
+                          volatility={"AAA": 0.2}, portfolio_expected_return=0.05),
+            "MSR": _stats(weights={"AAA": 1.0}, expected_returns={"AAA": 0.1},
+                          volatility={"AAA": 0.2}, portfolio_expected_return=0.09),
+        },
+    )
+    _script(monkeypatch, "o", "MSR", "o", "GMV", "o", "MSR", "f")
+
+    _run_edit_loop(
+        ["AAA"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        archive=_report_archive(tmp_path),
+    )
+
+    # Three recomputes, two distinct portfolios.
+    assert len(_archived(tmp_path)) == 2

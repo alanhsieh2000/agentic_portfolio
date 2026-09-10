@@ -1,9 +1,10 @@
 """Single source of truth for every environment-configurable runtime value
-in this project: the DuckDB path, fetch/rebalance date windows, batch
-sizes, rate-limit pause seconds, HTTP timeouts, the book-equity reporting
-lag, the trailing dividend-yield window, the transaction cost and risk-free
-rate used by Backtest Mode Stage 2, the LLM model name, and the
-`SEC_UA`/Anthropic environment variables.
+in this project: the DuckDB path, the report archive directory,
+fetch/rebalance date windows, batch sizes, rate-limit pause seconds, HTTP
+timeouts, the book-equity reporting lag, the trailing dividend-yield
+window, the transaction cost and risk-free rate used by Backtest Mode
+Stage 2, the LLM model name, and the `SEC_UA`/Anthropic environment
+variables.
 
 `transaction_cost_bps` and `risk_free_rate` are consumed by
 `plans/06_interactive_flow.md`'s backtest runner (not yet implemented as
@@ -44,6 +45,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     db_path: str = "data/portfolio.duckdb"
+
+    output_dir: str = "output"
+    """Directory the printed portfolio reports are archived under, one
+    subdirectory per month of the run's as-of date (see
+    `src/flow/report_archive.py`). Override with OUTPUT_DIR, or per run with
+    `--output-dir` on either entry point."""
 
     fetch_start: str = "2015-01-01"
     fetch_end: str = "2024-04-30"

@@ -84,9 +84,11 @@ from src.flow.cli import (
     format_dividend_delta,
     format_stale_share_counts,
     format_holdings_delta,
+    holdings_report_facts,
     parse_date,
     print_user_portfolio,
 )
+from src.flow.report_archive import ReportArchive, command_line, record_report
 from src.flow.rate_memory import (
     DEFAULT_RATES_PATH,
     load_risk_free_rate,
@@ -514,12 +516,24 @@ def _run_whatif(args) -> None:
     shape would make unbearable: each variation would re-pay the Yahoo
     Finance round trip that `open_holdings_session` pays once.
 
-    Never writes. Not to `memory/portfolio.json`, and - the easier one to
+    Writes no state. Not to `memory/portfolio.json`, and - the easier one to
     miss - not to `memory/rates.json` either: `--risk-free-rate` works here
     as a run-only override, useful for asking what a different riskless
     return would do to the Sharpe ratio, but `_remember_rate` is
     deliberately not called, because a command whose whole promise is
     changing nothing must not leave a rate behind.
+
+    The one thing it does write is a copy of each report it prints, under
+    `--output-dir` (see `src/flow/report_archive.py`), and that is not an
+    exception to the promise above: state is what changes a later run, and a
+    report changes none - it is an observation. The distinction matters
+    because trying five variations in a row is exactly the case whose results
+    are worth keeping, and re-deriving one costs the Yahoo Finance round trip
+    `open_holdings_session` pays. Each variant names the file it went to as it
+    is printed, so nothing is written silently, and `--no-save-reports`
+    restores writing nothing whatsoever. `NOT_SAVED` below is left as it is:
+    it speaks about the portfolio, and about the portfolio it remains exactly
+    true.
 
     Imitates `src/flow/cli.py`'s `_run_edit_loop` throughout: snapshot the
     positions before an edit so a rejected one reverts, `continue` on
@@ -545,6 +559,19 @@ def _run_whatif(args) -> None:
         "--risk-free-rate, not remembered - this is a what-if"
         if resolved.from_override
         else resolved.origin
+    )
+
+    # One archive for the whole session, built before the fetch below for the
+    # same reason `uv run portfolio` builds its own before opening a pipeline
+    # session: a malformed --output-dir should be discovered before a Yahoo
+    # Finance round trip, not after it. `kind="whatif"` is what keeps these
+    # files distinguishable from a pool report's in a shared month folder.
+    archive = ReportArchive(
+        output_dir=args.output_dir,
+        enabled=not args.no_save_reports,
+        kind="whatif",
+        as_of=parse_date(args.date),
+        command=command_line(),
     )
 
     with open_holdings_session(
@@ -577,9 +604,15 @@ def _run_whatif(args) -> None:
         )
         if stale is not None:
             print(stale)
-        print_user_portfolio(
-            baseline, args.path, risk_free_rate_origin=origin, window_origin=window_note()
-        )
+        # The stale warning is deliberately OUTSIDE the archived block: it is
+        # a fact about `memory/portfolio.json` and the price cache rather than
+        # about the portfolio's figures, so including it would give the same
+        # holdings two different digests depending on cache state, and the
+        # same baseline would be stored twice across two days.
+        with record_report(archive, **holdings_report_facts("baseline", baseline)):
+            print_user_portfolio(
+                baseline, args.path, risk_free_rate_origin=origin, window_origin=window_note()
+            )
 
         positions = dict(baseline_positions)
         while True:
@@ -632,29 +665,35 @@ def _run_whatif(args) -> None:
                 # - not saved" would be a false label on the person's real
                 # portfolio, and the delta beneath it would be a row of
                 # zeroes dressed up as a finding.
-                print_user_portfolio(
-                    baseline,
-                    args.path,
-                    risk_free_rate_origin=origin,
-                    window_origin=window_note(),
-                )
+                with record_report(archive, **holdings_report_facts("baseline", baseline)):
+                    print_user_portfolio(
+                        baseline,
+                        args.path,
+                        risk_free_rate_origin=origin,
+                        window_origin=window_note(),
+                    )
                 continue
 
             hypothetical = measure(positions)
-            print_user_portfolio(
-                hypothetical,
-                args.path,
-                risk_free_rate_origin=origin,
-                heading=f"What if ({currency}) - not saved",
-                window_origin=window_note(),
-            )
-            print(format_holdings_delta(baseline, hypothetical))
-            # A separate line, and one that stays informative across a
-            # [w]indow change: a trailing dividend is a record of cash
-            # paid, not an estimate over a returns window, so the two
-            # sides remain comparable where the Sharpe delta above does
-            # not. See `format_dividend_delta`.
-            print(format_dividend_delta(baseline, hypothetical))
+            # The two delta lines are inside the archived block because they
+            # are part of what the reader compares: a stored variant that had
+            # dropped them would be missing the very figures the experiment
+            # was run to see.
+            with record_report(archive, **holdings_report_facts("what-if", hypothetical)):
+                print_user_portfolio(
+                    hypothetical,
+                    args.path,
+                    risk_free_rate_origin=origin,
+                    heading=f"What if ({currency}) - not saved",
+                    window_origin=window_note(),
+                )
+                print(format_holdings_delta(baseline, hypothetical))
+                # A separate line, and one that stays informative across a
+                # [w]indow change: a trailing dividend is a record of cash
+                # paid, not an estimate over a returns window, so the two
+                # sides remain comparable where the Sharpe delta above does
+                # not. See `format_dividend_delta`.
+                print(format_dividend_delta(baseline, hypothetical))
 
 
 def _whatif_set(
@@ -893,6 +932,22 @@ def main() -> None:
         default=DEFAULT_RATES_PATH,
         help="Which file the per-currency risk-free rates are remembered in. One file holds "
              "one rate per currency, shared with 'uv run portfolio'.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=settings.output_dir,
+        help="Directory every report 'whatif' prints is also saved under, one subdirectory per "
+             "month of --date (so 'output/2026-09/'). A variant identical to one already saved "
+             "that month is recognized by a digest of its own text and not written twice. This is "
+             "the only thing 'whatif' writes; your portfolio and the remembered rates are still "
+             "untouched. Shared with 'uv run portfolio', so a month's folder holds both commands' "
+             "reports side by side.",
+    )
+    parser.add_argument(
+        "--no-save-reports",
+        action="store_true",
+        help="Print the reports and keep no copy of them, restoring 'whatif' to writing nothing "
+             "whatsoever. Nothing is written under --output-dir, and no directory is created.",
     )
     parser.add_argument(
         # Spelled the same as `uv run portfolio`'s flag, with the shorter

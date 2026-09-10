@@ -26,6 +26,7 @@ from src.flow.holdings_cli import (
     main,
 )
 from src.flow.interactive import HoldingsSession
+from src.flow.report_archive import load_report
 from src.flow.rate_memory import load_all_risk_free_rates, load_risk_free_rate
 from src.flow.user_portfolio import load_all_portfolios, load_portfolio
 from src.optimizer.holdings import HoldingsStats, unavailable_holdings
@@ -1255,3 +1256,175 @@ def test_the_window_survives_an_undo_all(monkeypatch, tmp_path):
     _run(monkeypatch, path, ["whatif"])
 
     assert windows[-1] == 36
+
+
+# ==========================================================================
+# Archiving each whatif report under output/<month>/
+#
+# The archive itself is tested in tests/test_report_archive.py. What is
+# tested here is only what `_run_whatif` is responsible for: that the
+# baseline and each variant are stored, that the never-save promise about the
+# PORTFOLIO still holds while they are, and that --no-save-reports restores
+# writing nothing whatsoever.
+# ==========================================================================
+
+
+def _whatif_archive_dir(tmp_path) -> Path:
+    """The month folder a whatif run archives into. `--date` defaults to
+    `today`, so the month is this month."""
+    return tmp_path / "reports" / date.today().strftime("%Y-%m")
+
+
+def _whatif_argv(tmp_path, *extra: str) -> list[str]:
+    return ["whatif", "--output-dir", str(tmp_path / "reports"), *extra]
+
+
+def _archived_whatif(tmp_path) -> list[Path]:
+    month = _whatif_archive_dir(tmp_path)
+    return sorted(month.iterdir()) if month.exists() else []
+
+
+def test_whatif_archives_the_baseline_and_each_variant(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, _whatif_argv(tmp_path))
+
+    out = capsys.readouterr().out
+    saved = _archived_whatif(tmp_path)
+
+    assert len(saved) == 2
+    variants = [load_report(p)[0]["variant"] for p in saved]
+    assert sorted(variants) == ["baseline", "what-if"]
+    assert out.count("Saved report: ") == 2
+
+
+def test_whatif_still_saves_nothing_about_the_portfolio_while_archiving(
+    monkeypatch, tmp_path, capsys
+):
+    """The promise the command is built on, re-asserted now that it writes a
+    file: state is what changes a later run, and a report changes none.
+    """
+    path = tmp_path / "portfolio.json"
+    rates = tmp_path / "rates.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+    before_portfolio = path.read_bytes()
+    before_rates = rates.read_bytes() if rates.exists() else None
+
+    save_positions, save_rate = _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, _whatif_argv(tmp_path))
+
+    assert save_positions.called is False
+    assert save_rate.called is False
+    assert path.read_bytes() == before_portfolio
+    assert (rates.read_bytes() if rates.exists() else None) == before_rates
+    # And the sentence is left exactly as it was: it speaks about the
+    # portfolio, and about the portfolio it is still true.
+    assert "Nothing was saved" in capsys.readouterr().out
+    assert _archived_whatif(tmp_path) != []
+
+
+def test_whatif_undo_all_adds_no_new_report(monkeypatch, tmp_path):
+    """Back at the saved holdings is the baseline again, and the baseline is
+    already stored - which is what the digest recognizes."""
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "u", "f")
+    _run(monkeypatch, path, _whatif_argv(tmp_path))
+
+    # Baseline, the hypothetical, and the baseline again - two files.
+    assert len(_archived_whatif(tmp_path)) == 2
+
+
+def test_whatif_no_save_reports_writes_nothing(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, _whatif_argv(tmp_path, "--no-save-reports"))
+
+    assert "Saved report:" not in capsys.readouterr().out
+    assert not (tmp_path / "reports").exists()
+
+
+def test_an_archived_whatif_report_records_the_positions_and_the_figures(
+    monkeypatch, tmp_path
+):
+    """What a later side-by-side comparison reads instead of parsing prose."""
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+    _stub_session(monkeypatch)
+    _script(monkeypatch, "s", "NVDA 100", "f")
+    _run(monkeypatch, path, _whatif_argv(tmp_path))
+
+    variant = next(
+        p for p in _archived_whatif(tmp_path) if load_report(p)[0]["variant"] == "what-if"
+    )
+    facts, body = load_report(variant)
+
+    assert facts["kind"] == "whatif"
+    assert facts["currency"] == "USD"
+    assert facts["positions"] == "NVDA:100, SPY:1000"
+    assert facts["annual_return"] == "0.1234"
+    assert facts["annual_volatility"] == "0.1500"
+    assert facts["sharpe"] == "0.6893"
+    assert facts["total_value"] == "100000.00"
+    assert facts["priced_as_of"] == "2026-09-04"
+    assert facts["command"].startswith("portfolio-holdings whatif")
+    # The delta lines are part of what the reader compares, so they are part
+    # of what is stored.
+    assert "What if (USD) - not saved" in body
+
+
+def test_a_whatif_report_without_figures_records_no_figures(monkeypatch, tmp_path):
+    """`HoldingsStats` is all-or-nothing, so an unmeasurable portfolio
+    contributes no figure lines rather than zeroes."""
+    path = tmp_path / "portfolio.json"
+    _stub_ingest(monkeypatch, {"SPY": "USD", "NVDA": "USD"})
+    _stub_report(monkeypatch)
+    _run(monkeypatch, path, ["set", "SPY", "1000"])
+
+    _no_writes(monkeypatch)
+
+    @contextmanager
+    def fake_session(*_args, **_kwargs):
+        yield HoldingsSession(db_path="session.duckdb", can_ingest=True)
+
+    monkeypatch.setattr("src.flow.holdings_cli.open_holdings_session", fake_session)
+    monkeypatch.setattr(
+        "src.flow.holdings_cli.measure_holdings",
+        lambda positions, currency, *a, **k: unavailable_holdings(
+            currency, dict(positions), 0.02, "not enough history"
+        ),
+    )
+    _script(monkeypatch, "f")
+    _run(monkeypatch, path, _whatif_argv(tmp_path))
+
+    (saved,) = _archived_whatif(tmp_path)
+    facts, _body = load_report(saved)
+
+    assert "sharpe" not in facts
+    assert "annual_return" not in facts
+    assert facts["positions"] == "SPY:1000"

@@ -84,6 +84,7 @@ from src.flow.interactive import (
     run_pipeline_against,
     validate_and_edit_candidates,
 )
+from src.flow.report_archive import ReportArchive, command_line, record_report
 from src.flow.rate_memory import (
     DEFAULT_RATES_PATH,
     ResolvedRiskFreeRate,
@@ -974,10 +975,135 @@ def format_holdings_delta(baseline: HoldingsStats, hypothetical: HoldingsStats) 
     )
 
 
+def report_facts(
+    variant: str,
+    currency: str,
+    stats: PortfolioStats,
+    objective: str,
+    resolved_objective=None,
+    selection: str | None = None,
+    candidates: list[str] | None = None,
+    portfolio_value: float | None = None,
+    benchmark: BenchmarkStats | None = None,
+) -> dict[str, object]:
+    """One optimized portfolio's report reduced to the flat facts stored above
+    the report text (see `src/flow/report_archive.py`).
+
+    It lives here, beside the printers, for the reason
+    `print_pipeline_result`'s own docstring gives for taking
+    `risk_free_rate_origin` as a parameter: this is the display layer, and it
+    is the only layer that already knows every one of `PortfolioStats`,
+    `BenchmarkStats` and `ResolvedObjective`. The archive module deliberately
+    knows none of them - it stores scalars, so it never has to be revised when
+    a record gains a field.
+
+    Every figure the eventual side-by-side comparison would otherwise have to
+    read out of English prose is included as a value: the three headline
+    figures, the dividend yield, the returns window, and the provenance
+    phrases for the objective and any dividend floor. `None` facts are dropped
+    by the archive rather than written, so an absent benchmark or an
+    unconsulted dividend layer simply has no line - which is why nothing here
+    substitutes a zero for a figure that was never measured.
+
+    `annual_dividend` is derived rather than carried, because
+    `PortfolioStats` holds the yield and only the command line knows the value
+    it applies to. It is omitted when either half is missing, since a cash
+    figure resting on an assumed value would be worse than no cash figure.
+
+    `candidates` is SORTED here rather than kept in the order the report
+    printed it. A pool is a set - the same tickers screened by a different
+    branch, or typed in a different order, are the same pool - and the stored
+    fact exists to be compared across runs, which an order-dependent string
+    could not be. The printed list is untouched; it keeps the scanner's own
+    order because that is what the reader was shown.
+    """
+    dividend_yield = stats.portfolio_dividend_yield
+    annual_dividend = (
+        dividend_yield * portfolio_value
+        if dividend_yield is not None and portfolio_value is not None
+        else None
+    )
+    # The target is meaningful only for MV, as everywhere else in this
+    # project, so it is recorded only there rather than stored as a number a
+    # reader would have to know to ignore.
+    target_return = stats.target_annual_return if objective == "MV" else None
+
+    return {
+        "variant": variant,
+        "currency": currency,
+        "objective": objective,
+        "objective_origin": resolved_objective.origin if resolved_objective is not None else None,
+        "target_return": target_return,
+        "clamped_from": (
+            resolved_objective.clamped_from if resolved_objective is not None else None
+        ),
+        "selection": selection,
+        "value": portfolio_value,
+        "candidates": sorted(candidates) if candidates else None,
+        "benchmark": benchmark.ticker if benchmark is not None else None,
+        "benchmark_return": benchmark.annual_return if benchmark is not None else None,
+        "risk_free_rate": stats.risk_free_rate,
+        "dividend_floor_yield": stats.dividend_yield_floor,
+        "dividend_floor_origin": stats.dividend_floor_origin,
+        "window_start": stats.returns_window_start,
+        "window_end": stats.returns_window_end,
+        "window_months": stats.returns_window_months,
+        "annual_return": stats.portfolio_expected_return,
+        "annual_volatility": stats.portfolio_volatility,
+        "sharpe": stats.portfolio_sharpe,
+        "annual_dividend": annual_dividend,
+        "dividend_yield": dividend_yield,
+    }
+
+
+def holdings_report_facts(variant: str, holdings: HoldingsStats) -> dict[str, object]:
+    """One held-portfolio report reduced to the flat facts stored above the
+    report text - the `whatif` counterpart of `report_facts`.
+
+    `positions` is rendered as sorted `TICKER:shares` pairs so two variants of
+    the same portfolio produce the same string regardless of the order the
+    shares were typed in, which matters because that string is what a reader
+    scans to tell one saved variant from another. Share counts go through
+    `_as_argument` rather than `format_share_count`: the latter adds thousands
+    separators for reading, and a comma inside a field whose own separator is a
+    comma would make `SPY:1,000` unparseable by the command meant to read it.
+
+    `HoldingsStats`' three figures are all-or-nothing - either all six of the
+    return, volatility, Sharpe and window fields are populated or all six are
+    `None` - so nothing here checks them individually: an unmeasurable
+    portfolio simply contributes no such lines, and the archive omits them.
+    That is the honest outcome. A portfolio whose value can be priced but whose
+    history is too short to measure still records what it is worth.
+    """
+    dividends = holdings.dividends
+    return {
+        "variant": variant,
+        "currency": holdings.currency,
+        "positions": ", ".join(
+            f"{ticker}:{_as_argument(shares)}"
+            for ticker, shares in sorted(holdings.positions.items())
+        )
+        or None,
+        "total_value": holdings.total_value,
+        "priced_as_of": holdings.priced_as_of,
+        "risk_free_rate": holdings.risk_free_rate,
+        "window_start": holdings.window_start,
+        "window_end": holdings.window_end,
+        "window_months": holdings.window_months,
+        "annual_return": holdings.annual_return,
+        "annual_volatility": holdings.annual_volatility,
+        "sharpe": holdings.sharpe,
+        "annual_dividend": dividends.total_annual_dividends,
+        "dividend_yield": dividends.dividend_yield,
+    }
+
+
 def print_pipeline_result(
     result: dict,
     risk_free_rate_origin: str | None = None,
     portfolio_value: float | None = None,
+    *,
+    archive: ReportArchive | None = None,
 ) -> None:
     """Human-readable rendering of one `run_pipeline_against` result dict.
 
@@ -995,6 +1121,23 @@ def print_pipeline_result(
     real and all still shown. That is strictly more useful than a bare
     failure, since the reason is a statement about numbers on the command
     line and the candidate list is what makes it actionable.
+
+    `archive`, when given, saves the weights-and-allocation block - not this
+    function's whole output - to a file under its output directory, and names
+    the file afterwards. See `src/flow/report_archive.py` for why the archived
+    body stops where it does: that block is the only section this function and
+    the interactive edit loop both print, so anchoring the digest on it is what
+    lets an edit that returns to this portfolio be recognized as the same
+    report rather than saved a second time. The header lines above it are not
+    lost - they are passed as front-matter facts, where the eventual
+    side-by-side comparison wants them as values rather than as a sentence.
+
+    A `None` archive - the default, and so every existing caller and test -
+    prints byte-identically to what this function printed before archiving
+    existed. The unsatisfiable path returns before the archived block is
+    reached, so such a run stores nothing without needing a check for it:
+    there is no portfolio, and an archive of non-answers would only make the
+    month folder harder to read.
     """
     resolved = result.get("resolved_objective")
     origin = f" ({resolved.origin})" if resolved is not None else ""
@@ -1025,14 +1168,28 @@ def print_pipeline_result(
         print("The fetched data is still open, so you can fix this without starting over.")
         return
 
-    print_weights_and_allocation(
-        result["stats"], result["allocation"], result["objective"], result["currency"],
-        benchmark=result.get("benchmark"), risk_free_rate_origin=risk_free_rate_origin,
-        portfolio_value=portfolio_value, resolved_objective=resolved,
-    )
-    note = result.get("concentration_note")
-    if note is not None:
-        print(note)
+    with record_report(
+        archive,
+        **report_facts(
+            variant="initial",
+            currency=result["currency"],
+            stats=result["stats"],
+            objective=result["objective"],
+            resolved_objective=resolved,
+            selection=result.get("selection"),
+            candidates=result["scan_detail"]["candidates"],
+            portfolio_value=portfolio_value,
+            benchmark=result.get("benchmark"),
+        ),
+    ):
+        print_weights_and_allocation(
+            result["stats"], result["allocation"], result["objective"], result["currency"],
+            benchmark=result.get("benchmark"), risk_free_rate_origin=risk_free_rate_origin,
+            portfolio_value=portfolio_value, resolved_objective=resolved,
+        )
+        note = result.get("concentration_note")
+        if note is not None:
+            print(note)
 
 
 def _print_add_outcome(
@@ -1948,6 +2105,7 @@ def _run_edit_loop(
     risk_free_rate_origin: str | None = None,
     show_summaries: bool = False,
     profile_cache: dict[str, TickerProfile] | None = None,
+    archive: ReportArchive | None = None,
 ) -> bool:
     """Prompt in a loop for add/remove/objective/target-return/benchmark/
     finish; each
@@ -2018,6 +2176,15 @@ def _run_edit_loop(
     every existing caller and test of this loop. `main` passes `True`.
     `profile_cache` is shared with that loop so a ticker summarized before
     the report is not re-fetched after it.
+
+    `archive` is carried for exactly the same reason `risk_free_rate` and
+    `risk_free_rate_origin` are: a facility that applied to the initial report
+    and silently stopped applying on the first edit would be worse than none at
+    all. Every recompute here is a report of its own and is offered to the
+    archive as one; identical ones collapse by digest, which is what keeps an
+    edit that returns to an earlier portfolio from adding a second copy of it.
+    Defaults to `None`, so every existing caller and test of this loop writes
+    nothing and prints byte-identically to before.
     """
     def show_summary(symbol: str) -> None:
         """Print one ticker's summary against the rate this session settled
@@ -2172,13 +2339,30 @@ def _run_edit_loop(
             save_candidate_pool(candidates, path=memory_path, currency=currency)
 
         printed_a_report = True
-        print_weights_and_allocation(
-            stats, allocation, objective, currency, portfolio_value=portfolio_value,
-            benchmark=benchmark_stats_for_window(
-                benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
-            ),
-            risk_free_rate_origin=risk_free_rate_origin,
+        # Hoisted out of the call below because the archived facts need the
+        # same `BenchmarkStats` the report prints, and re-narrowing the
+        # benchmark twice could only ever disagree with itself.
+        benchmark_stats = benchmark_stats_for_window(
+            benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
         )
+        with record_report(
+            archive,
+            **report_facts(
+                variant="edit",
+                currency=currency,
+                stats=stats,
+                objective=objective,
+                selection=selection,
+                candidates=candidates,
+                portfolio_value=portfolio_value,
+                benchmark=benchmark_stats,
+            ),
+        ):
+            print_weights_and_allocation(
+                stats, allocation, objective, currency, portfolio_value=portfolio_value,
+                benchmark=benchmark_stats,
+                risk_free_rate_origin=risk_free_rate_origin,
+            )
 
 
 def main() -> None:
@@ -2326,6 +2510,21 @@ def main() -> None:
              "candidate pool is measured against.",
     )
     parser.add_argument(
+        "--output-dir",
+        default=settings.output_dir,
+        help="Directory every report this run prints is also saved under, one subdirectory per "
+             "month of --date (so 'output/2026-09/'). A report identical to one already saved "
+             "that month is recognized by a digest of its own text and not written twice. Point "
+             "it somewhere else to try something without adding to the real archive; override "
+             "the default for good with OUTPUT_DIR.",
+    )
+    parser.add_argument(
+        "--no-save-reports",
+        action="store_true",
+        help="Print the reports and keep no copy of them - the counterpart of --no-holdings. "
+             "Nothing is written under --output-dir, and no directory is created.",
+    )
+    parser.add_argument(
         "--refresh-holdings",
         action="store_true",
         help="Refetch the holdings' prices now rather than reusing the cache, which is otherwise "
@@ -2426,6 +2625,22 @@ def main() -> None:
 
     rebalance_date = parse_date(args.date)
 
+    # One archive for the whole run, not one per report: the output directory,
+    # the kind, the as-of date and the command line are properties of the
+    # invocation rather than of any single report. Built here, before
+    # `open_pipeline_session` fetches anything, so a malformed --output-dir is
+    # discovered before a live snapshot costs minutes of Yahoo Finance calls.
+    # The month folder follows `rebalance_date`, not the clock, because a
+    # report is about a month of market data: a --date 2024-03-29 run belongs
+    # with the month it measured.
+    archive = ReportArchive(
+        output_dir=args.output_dir,
+        enabled=not args.no_save_reports,
+        kind="portfolio",
+        as_of=rebalance_date,
+        command=command_line(),
+    )
+
     benchmark_enabled = args.benchmark != BENCHMARK_DISABLED
     benchmark_override = args.benchmark if benchmark_enabled else None
 
@@ -2497,7 +2712,8 @@ def main() -> None:
             consult_dividends=not args.no_dividend_fetch,
         )
         print_pipeline_result(
-            result, risk_free_rate_origin=resolved_rate.origin, portfolio_value=args.value
+            result, risk_free_rate_origin=resolved_rate.origin, portfolio_value=args.value,
+            archive=archive,
         )
 
         # Remembered only now, after the run has actually produced a report.
@@ -2594,6 +2810,7 @@ def main() -> None:
             risk_free_rate_origin=resolved_rate.origin,
             show_summaries=not args.no_ticker_summary,
             profile_cache=profile_cache,
+            archive=archive,
         )
 
         # A run that never printed a portfolio must not look like a success
