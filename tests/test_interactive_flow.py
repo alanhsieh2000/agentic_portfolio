@@ -35,6 +35,7 @@ from unittest.mock import MagicMock
 import duckdb
 import pandas as pd
 from src.optimizer.dividends import DividendFloorError
+from src.dataset.ticker_profile import RawTickerProfile
 from src.flow.interactive import (
     CLAMP_EPSILON,
     CONCENTRATION_THRESHOLD,
@@ -56,6 +57,7 @@ from src.flow.interactive import (
     edit_candidates,
     open_pipeline_session,
     prepare_benchmark,
+    prepare_ticker_summary,
     run_pipeline,
     run_pipeline_against,
     run_scan,
@@ -589,10 +591,19 @@ def _bench_months(n: int = 24, end: str = "2024-03-01") -> list[tuple[str, float
 
 
 def _insert_returns(db_path: str, ticker: str, rows: list[tuple[str, float]]) -> None:
+    """One multi-row INSERT rather than `executemany`, which is five times
+    slower here for no benefit: measured on this fixture's own row counts,
+    `executemany` costs 4.7s/4.9s/9.0s for 24/36/60 rows against 1.0s/0.8s/2.8s
+    for a single statement. These fixtures are built dozens of times across
+    this file, so the difference is minutes of suite time.
+    """
+    if not rows:
+        return
+    values = ", ".join(f"('{d}', '{ticker}', {r!r})" for d, r in rows)
     con = duckdb.connect(db_path)
     try:
         con.execute("CREATE TABLE IF NOT EXISTS returns (rebalance_date DATE, ticker VARCHAR, monthly_return DOUBLE)")
-        con.executemany(f"INSERT INTO returns VALUES (?, '{ticker}', ?)", rows)
+        con.execute(f"INSERT INTO returns VALUES {values}")
     finally:
         con.close()
 
@@ -1201,3 +1212,213 @@ def test_the_concentration_note_is_silent_for_a_diversified_clamped_result():
 
     resolved = ResolvedObjective("MV", 0.03, "derived", clamped_from=0.9)
     assert _concentration_note(resolved, stats, matrix, 0.02) is None
+
+
+# ---------------------------------------------------------------------------
+# prepare_ticker_summary
+# ---------------------------------------------------------------------------
+#
+# The structural guarantee under test here is the same one
+# `prepare_benchmark`'s tests assert: rows fetched to describe a ticker can
+# never reach the database the portfolio's own returns window is derived
+# from. `_load_window_dates` runs `SELECT DISTINCT rebalance_date FROM
+# returns` over the WHOLE table, so a summarized ticker with longer history
+# than the pool could otherwise widen the window the portfolio is measured
+# over - meaning that merely LOOKING at a candidate would change the numbers
+# printed for the portfolio.
+
+
+def _fake_profile_fetch(monkeypatch, quote_type: str = "ETF") -> MagicMock:
+    spy = MagicMock(
+        side_effect=lambda ticker, **kw: RawTickerProfile(
+            info={"quoteType": quote_type, "longName": f"{ticker} Fund", "currency": "USD"},
+            fund_profile=None,
+            fund_performance=None,
+            fund_data_reason="no fund data in this test",
+        )
+    )
+    monkeypatch.setattr("src.flow.interactive.fetch_ticker_profile", spy)
+    return spy
+
+
+def test_prepare_ticker_summary_reads_a_pool_ticker_from_the_session_database(
+    tmp_path, monkeypatch
+):
+    """A ticker already in the pool was ingested by the add that put it
+    there, so summarizing it must cost no scratch database and no ingestion
+    call at all."""
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    _fake_profile_fetch(monkeypatch)
+    ingest_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+
+    summary = prepare_ticker_summary(
+        "AAA", date(2024, 3, 1), ["AAA"], db_path, rates_path=None
+    )
+
+    assert ingest_spy.called is False
+    assert summary.stats.unavailable_reason is None
+    assert summary.stats.window_months == 36
+    assert summary.profile.long_name == "AAA Fund"
+
+
+def test_prepare_ticker_summary_ingests_a_non_pool_ticker_into_a_scratch_database(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    scratch_path = str(tmp_path / "scratch.duckdb")
+    _fake_benchmark_fetch(monkeypatch, scratch_path, _bench_months(36))
+    _fake_profile_fetch(monkeypatch)
+
+    summary = prepare_ticker_summary(
+        "SPY", date(2024, 3, 1), ["AAA"], db_path, rates_path=None
+    )
+
+    assert summary.stats.unavailable_reason is None
+    assert summary.stats.window_months == 36
+    assert summary.stats.currency == "USD"
+
+
+def test_prepare_ticker_summary_never_writes_to_the_session_database(tmp_path, monkeypatch):
+    """The structural guarantee. A summarized ticker's rows must not be able
+    to move the window the portfolio is measured over."""
+    db_path = tmp_path / "session.duckdb"
+    _insert_returns(str(db_path), "AAA", _bench_months(36))
+    before_mtime = db_path.stat().st_mtime_ns
+    scratch_path = str(tmp_path / "scratch.duckdb")
+    _fake_benchmark_fetch(monkeypatch, scratch_path, _bench_months(60))
+    _fake_profile_fetch(monkeypatch)
+
+    prepare_ticker_summary("SPY", date(2024, 3, 1), ["AAA"], str(db_path), rates_path=None)
+
+    assert db_path.stat().st_mtime_ns == before_mtime
+    rows = duckdb.connect(str(db_path), read_only=True).execute(
+        "SELECT DISTINCT ticker FROM returns"
+    ).fetchall()
+    assert [r[0] for r in rows] == ["AAA"]
+
+
+def test_prepare_ticker_summary_reports_an_unresolvable_symbol_by_name(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    scratch_path = str(tmp_path / "scratch.duckdb")
+    _fake_benchmark_fetch(
+        monkeypatch, scratch_path, [], invalid={"ZZZZQQQ": "no price data in range"}
+    )
+    _fake_profile_fetch(monkeypatch)
+
+    summary = prepare_ticker_summary(
+        "ZZZZQQQ", date(2024, 3, 1), ["AAA"], db_path, rates_path=None
+    )
+
+    assert summary.stats.unavailable_reason == "no price data in range"
+    assert summary.stats.annual_return is None
+
+
+def test_prepare_ticker_summary_survives_an_ingestion_failure(tmp_path, monkeypatch):
+    """Losing a live session's fetched snapshot over a summary would cost far
+    more than the summary is worth."""
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    scratch_path = str(tmp_path / "scratch.duckdb")
+    _fake_benchmark_fetch(monkeypatch, scratch_path, [], raises=RuntimeError("network down"))
+    _fake_profile_fetch(monkeypatch)
+
+    summary = prepare_ticker_summary(
+        "SPY", date(2024, 3, 1), ["AAA"], db_path, rates_path=None
+    )
+
+    assert "could not measure SPY" in summary.stats.unavailable_reason
+    assert "network down" in summary.stats.unavailable_reason
+    # The Yahoo half is untouched.
+    assert summary.profile.long_name == "SPY Fund"
+
+
+def test_prepare_ticker_summary_resolves_and_names_the_risk_free_rate(tmp_path, monkeypatch):
+    """The confirm loop runs before `_settle_risk_free_rate`, so a summary
+    printed there resolves its own rate - and must say where it came from,
+    because a bare plausible 0.0200 is indistinguishable from a deliberate
+    choice."""
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    _fake_profile_fetch(monkeypatch)
+    rates_path = tmp_path / "rates.json"
+    rates_path.write_text(
+        '{"rates": {"USD": {"risk_free_rate": 0.045, "updated_at": "2026-01-01T00:00:00Z"}}}'
+    )
+
+    summary = prepare_ticker_summary(
+        "AAA", date(2024, 3, 1), ["AAA"], db_path, rates_path=str(rates_path)
+    )
+
+    assert summary.stats.risk_free_rate == 0.045
+    assert summary.risk_free_rate_origin == "remembered for USD"
+
+
+def test_prepare_ticker_summary_passes_a_settled_rate_straight_through(tmp_path, monkeypatch):
+    """The post-run edit loop already carries the rate the report used, and a
+    summary printed under that report must agree with it rather than
+    resolving a second one."""
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    _fake_profile_fetch(monkeypatch)
+
+    summary = prepare_ticker_summary(
+        "AAA", date(2024, 3, 1), ["AAA"], db_path,
+        risk_free_rate=0.005, risk_free_rate_origin="remembered for JPY",
+        rates_path="never-read.json",
+    )
+
+    assert summary.stats.risk_free_rate == 0.005
+    assert summary.risk_free_rate_origin == "remembered for JPY"
+
+
+def test_prepare_ticker_summary_with_fetching_disabled_neither_fetches_nor_ingests(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    fetch_spy = _fake_profile_fetch(monkeypatch)
+    ingest_spy = MagicMock()
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+
+    summary = prepare_ticker_summary(
+        "SPY", date(2024, 3, 1), ["AAA"], db_path, rates_path=None, allow_fetch=False
+    )
+
+    assert fetch_spy.called is False
+    assert ingest_spy.called is False
+    assert "fetching" in summary.profile.unavailable_reason
+    assert "not in this pool" in summary.stats.unavailable_reason
+
+
+def test_prepare_ticker_summary_caches_the_profile_across_calls(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    fetch_spy = _fake_profile_fetch(monkeypatch)
+    cache = {}
+
+    for _ in range(3):
+        prepare_ticker_summary(
+            "AAA", date(2024, 3, 1), ["AAA"], db_path, rates_path=None, profile_cache=cache
+        )
+
+    assert fetch_spy.call_count == 1
+    assert set(cache) == {"AAA"}
+
+
+def test_prepare_ticker_summary_upper_cases_and_strips_the_typed_symbol(tmp_path, monkeypatch):
+    """The `[s]ummary` prompt reads free text, and every ticker in this
+    project is stored upper-cased."""
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    _fake_profile_fetch(monkeypatch)
+
+    summary = prepare_ticker_summary(
+        "  aaa  ", date(2024, 3, 1), ["AAA"], db_path, rates_path=None
+    )
+
+    assert summary.stats.ticker == "AAA"
+    assert summary.stats.unavailable_reason is None

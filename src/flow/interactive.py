@@ -97,6 +97,18 @@ from src.optimizer.portfolio import (
     load_latest_prices,
     load_returns_matrix,
 )
+from src.dataset.ticker_profile import (
+    RawTickerProfile,
+    TickerProfile,
+    build_ticker_profile,
+    fetch_ticker_profile,
+)
+from src.optimizer.ticker_stats import TickerStats, ticker_stats
+from src.flow.rate_memory import (
+    DEFAULT_RATES_PATH,
+    load_risk_free_rate,
+    resolve_risk_free_rate,
+)
 from src.scanner.candidate_scanner import scan_with_detail
 
 logger = logging.getLogger(__name__)
@@ -317,6 +329,262 @@ def prepare_benchmark(
             monthly_returns=empty_benchmark_returns(ticker),
             unavailable_reason=f"could not prepare {ticker} as a benchmark: {e}",
         )
+
+
+class TickerSummary(NamedTuple):
+    """Everything `src/flow/cli.py`'s `print_ticker_summary` needs about one
+    ticker: what Yahoo Finance publishes about it, what this project measured
+    itself, and where the risk-free rate behind that Sharpe ratio came from.
+
+    The two halves are independent by construction - one is a network
+    response, the other a database read - and either can arrive carrying only
+    a reason. The renderer prints whichever half it has, so a Yahoo outage
+    still shows the figures that decide whether to keep the ticker, and a
+    ticker too newly listed to measure still shows its category and fees.
+    """
+
+    profile: TickerProfile
+    stats: TickerStats
+    risk_free_rate_origin: str | None = None
+
+
+def _summary_risk_free_rate(
+    currency: str | None,
+    settled_rate: float | None,
+    settled_origin: str | None,
+    rates_path: str | None,
+    override: float | None,
+) -> tuple[float, str | None]:
+    """The rate a summary's Sharpe ratio is measured against, and a phrase
+    naming where it came from.
+
+    Two callers, two situations. `src/flow/cli.py`'s post-run `_run_edit_loop`
+    already carries the rate and origin this session settled on, and passes
+    them straight through - a summary printed there must agree with the report
+    printed above it. The candidate-pool confirm loop cannot: `main` calls it
+    BEFORE `_settle_risk_free_rate`, because the rate is per-currency and the
+    currency is not known until the pool is confirmed. So it passes
+    `settled_rate=None` and this resolves one, against the SUMMARIZED
+    ticker's own currency, which ingestion has just established even when the
+    pool's has not been.
+
+    Printing a Sharpe ratio without saying which rate produced it is the
+    exact failure the per-currency rate work was done to fix, so this always
+    returns an origin phrase, including for the plain configured default.
+    """
+    if settled_rate is not None:
+        return float(settled_rate), settled_origin
+
+    saved = None
+    if rates_path:
+        try:
+            saved = load_risk_free_rate(rates_path, currency or DEFAULT_CURRENCY)
+        except Exception as e:  # noqa: BLE001 - a malformed rates file must not lose the summary
+            logger.warning("could not read a remembered risk-free rate: %s", e)
+    resolved = resolve_risk_free_rate(
+        override, currency or DEFAULT_CURRENCY, saved, settings.risk_free_rate
+    )
+    return resolved.rate, resolved.origin
+
+
+def _summary_profile(
+    ticker: str, profile_cache: dict[str, TickerProfile] | None, allow_fetch: bool
+) -> TickerProfile:
+    """The Yahoo half of a summary, from `profile_cache` when it is already
+    there and from the network otherwise.
+
+    Cached per session because these are point-in-time descriptions of a
+    security rather than a history to accumulate, so there is nothing to be
+    gained from making them durable and there would be a staleness question
+    to answer if they were. Re-summarizing a ticker, or summarizing one in
+    the confirm loop and again in the post-run loop, therefore costs nothing.
+
+    Never raises: `fetch_ticker_profile` already returns reasons rather than
+    exceptions, and this adds one more guard so that even a failure inside
+    normalization becomes a printable line.
+    """
+    if profile_cache is not None and ticker in profile_cache:
+        return profile_cache[ticker]
+
+    if not allow_fetch:
+        return TickerProfile(
+            ticker=ticker,
+            unavailable_reason=(
+                "Yahoo Finance was not consulted for this ticker's profile because fetching "
+                "was disabled for this run"
+            ),
+        )
+
+    try:
+        profile = build_ticker_profile(ticker, fetch_ticker_profile(ticker))
+    except Exception as e:  # noqa: BLE001 - yfinance raises assorted types here
+        logger.warning("could not build a profile for %s: %s", ticker, e)
+        profile = build_ticker_profile(
+            ticker,
+            RawTickerProfile(
+                info={},
+                fund_profile=None,
+                fund_performance=None,
+                info_reason=f"could not read this ticker's profile from Yahoo Finance ({type(e).__name__})",
+            ),
+        )
+
+    if profile_cache is not None:
+        profile_cache[ticker] = profile
+    return profile
+
+
+def prepare_ticker_summary(
+    ticker: str,
+    as_of: date,
+    pool: list[str],
+    session_db_path: str,
+    currency: str | None = None,
+    risk_free_rate: float | None = None,
+    risk_free_rate_origin: str | None = None,
+    rates_path: str | None = DEFAULT_RATES_PATH,
+    risk_free_rate_override: float | None = None,
+    profile_cache: dict[str, TickerProfile] | None = None,
+    allow_fetch: bool = True,
+) -> TickerSummary:
+    """Gather everything needed to print one ticker's summary, doing whatever
+    fetching that requires.
+
+    This is the fetching counterpart to `prepare_benchmark` and
+    `prepare_holdings` and lives here for the same reason they do: it keeps
+    network decisions out of `src/optimizer/ticker_stats.py` (which reads a
+    database and nothing else) and out of `src/flow/cli.py` (which prints).
+
+    WHERE THE RETURNS COME FROM, which is the one subtle thing here. A ticker
+    already in `pool` is read straight out of `session_db_path`, because the
+    add that put it in the pool already ingested 65 months of its prices,
+    returns, currency and dividends there. A ticker NOT in `pool` - the
+    `[s]ummary` case, someone studying a candidate before committing to it -
+    is ingested into a fresh throwaway database from `build_scratch_snapshot`
+    and read from there, and `session_db_path` is not written to at all.
+
+    That is a correctness requirement, not tidiness, and it is the identical
+    hazard `prepare_benchmark` documents. `src/optimizer/portfolio.py`'s
+    `_load_window_dates` derives the portfolio's returns window from `SELECT
+    DISTINCT rebalance_date FROM returns` over the WHOLE table rather than
+    over the candidate tickers. A summarized ticker with longer history than
+    anything in the pool would therefore add earlier month-ends to that set
+    and could widen the window the portfolio's own report is measured over.
+    Merely LOOKING at a ticker must not change the numbers printed for the
+    portfolio, and keeping the two databases apart makes that structural
+    rather than a convention someone has to remember.
+
+    Ingestion reuses `validate_and_ingest_tickers` unchanged, so a symbol
+    that does not resolve comes back named exactly as it is at the add
+    prompt, and the ticker's own trading currency comes back from the same
+    call - which is what lets a summary be printed for a ticker in another
+    currency, something an add would refuse. Looking is always allowed;
+    only joining a pool is gated on currency.
+
+    Never raises. Anything that goes wrong becomes a `TickerSummary` whose
+    halves carry reasons, because losing a live session's fetched snapshot
+    over a summary would cost far more than the summary is worth.
+    """
+    ticker = ticker.strip().upper()
+    profile = _summary_profile(ticker, profile_cache, allow_fetch)
+    found_currency = currency or profile.currency
+
+    def resolve_rate() -> tuple[float, str | None]:
+        """The rate and its origin for whatever `found_currency` is known to
+        be at the moment of the call.
+
+        A closure rather than one value computed up front, because ingesting
+        a ticker that is not in the pool is what establishes its currency,
+        and the rate is per-currency: resolving before that would measure a
+        Tokyo ticker's Sharpe ratio against the dollar rate. Every early
+        return below happens before or after that refinement, so each asks
+        for the answer at its own point rather than sharing a stale one.
+        """
+        return _summary_risk_free_rate(
+            found_currency,
+            risk_free_rate,
+            risk_free_rate_origin,
+            rates_path,
+            risk_free_rate_override,
+        )
+
+    def summarize(stats: TickerStats, origin: str | None) -> TickerSummary:
+        return TickerSummary(profile=profile, stats=stats, risk_free_rate_origin=origin)
+
+    try:
+        if ticker in pool:
+            rate, origin = resolve_rate()
+            return summarize(
+                ticker_stats(
+                    ticker, as_of, session_db_path, currency=found_currency, risk_free_rate=rate
+                ),
+                origin,
+            )
+
+        if not allow_fetch:
+            rate, origin = resolve_rate()
+            return summarize(
+                _no_ticker_stats(
+                    ticker,
+                    found_currency,
+                    rate,
+                    f"{ticker} is not in this pool and fetching its history was disabled "
+                    "for this run",
+                ),
+                origin,
+            )
+
+        with build_scratch_snapshot(prefix="summary_snapshot_") as scratch_db_path:
+            valid, invalid, currencies = validate_and_ingest_tickers(
+                [ticker], as_of, scratch_db_path
+            )
+            if ticker not in valid:
+                rate, origin = resolve_rate()
+                return summarize(
+                    _no_ticker_stats(
+                        ticker,
+                        found_currency,
+                        rate,
+                        invalid.get(ticker, f"{ticker} produced no usable price history"),
+                    ),
+                    origin,
+                )
+            found_currency = currencies.get(ticker, found_currency)
+            rate, origin = resolve_rate()
+            stats = ticker_stats(
+                ticker, as_of, scratch_db_path, currency=found_currency, risk_free_rate=rate
+            )
+        return summarize(stats, origin)
+    except Exception as e:  # noqa: BLE001 - duckdb and yfinance raise assorted types here
+        logger.warning("could not measure %s for a summary: %s", ticker, e)
+        rate, origin = resolve_rate()
+        return summarize(
+            _no_ticker_stats(ticker, found_currency, rate, f"could not measure {ticker}: {e}"),
+            origin,
+        )
+
+
+def _no_ticker_stats(
+    ticker: str, currency: str | None, risk_free_rate: float, reason: str
+) -> TickerStats:
+    """A `TickerStats` carrying only a reason, for the cases this module
+    discovers before `ticker_stats` is ever reached - an unresolvable symbol,
+    or fetching having been switched off."""
+    return TickerStats(
+        ticker=ticker,
+        currency=currency,
+        annual_return=None,
+        annual_volatility=None,
+        sharpe=None,
+        risk_free_rate=float(risk_free_rate),
+        window_start=None,
+        window_end=None,
+        window_months=0,
+        dividend_yield=None,
+        dividend_lookback_months=None,
+        dividend_unavailable_reason=None,
+        unavailable_reason=reason,
+    )
 
 
 class HoldingsSession(NamedTuple):

@@ -23,7 +23,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
+from src.dataset.ticker_profile import RawTickerProfile, TickerProfile
 from src.optimizer.benchmark import ResolvedObjective
+from src.optimizer.ticker_stats import TickerStats
 import pytest
 
 from src.flow.cli import (
@@ -34,6 +36,11 @@ from src.flow.cli import (
     _settle_benchmark,
     _settle_dividend_floor,
     format_benchmark,
+    format_ratio_pair,
+    format_risk_statistics,
+    format_ticker_dividend_yield,
+    format_trailing_return_rows,
+    print_ticker_summary,
     format_split_restatement,
     format_stale_share_counts,
     main,
@@ -2780,3 +2787,539 @@ def test_print_pipeline_result_prints_the_concentration_note(capsys):
     print_pipeline_result(result, portfolio_value=100000.0)
 
     assert "Note: this target sits at the pool's ceiling" in capsys.readouterr().out
+
+
+# --- per-ticker summary rendering -------------------------------------------
+#
+# The block these tests pin is printed inside an interactive loop, so its
+# conventions matter more than usual: every ratio is a four-decimal fraction
+# (Yahoo publishes several of the same figures as percentages - see
+# `src/dataset/ticker_profile.py`), and each half of the block fails
+# independently of the other.
+
+
+def _ticker_profile(**overrides) -> TickerProfile:
+    """An ETF profile in the shape `build_ticker_profile` produces from a
+    real AMLP payload, overridable per test."""
+    base = dict(
+        ticker="AMLP",
+        long_name="Alerian MLP ETF",
+        quote_type="ETF",
+        currency="USD",
+        fifty_two_week_low=44.64,
+        fifty_two_week_high=56.29,
+        category_name="Energy Limited Partnership",
+        family="ALPS",
+        legal_type="Exchange Traded Fund",
+        expense_ratio=0.0101,
+        expense_ratio_category=0.0156968,
+        holdings_turnover=0.14,
+        net_assets=13442306048,
+        trailing_returns={"YTD": 0.2496513, "1Y": 0.23550029, "3Y": 0.19673571},
+        trailing_returns_category={"YTD": 0.23837629, "1Y": 0.3075745, "3Y": 0.2577587},
+        trailing_returns_as_of=date(2026, 9, 8),
+        risk_statistics={"alpha": 0.1044, "beta": 0.27, "stdDev": 0.137, "sharpeRatio": 1.05},
+    )
+    base.update(overrides)
+    return TickerProfile(**base)
+
+
+def _ticker_stats_fixture(**overrides) -> TickerStats:
+    base = dict(
+        ticker="AMLP",
+        currency="USD",
+        annual_return=0.2071,
+        annual_volatility=0.1893,
+        sharpe=1.0412,
+        risk_free_rate=0.02,
+        window_start=date(2021, 9, 30),
+        window_end=date(2026, 8, 31),
+        window_months=60,
+        dividend_yield=0.0733,
+        dividend_lookback_months=12,
+        dividend_unavailable_reason=None,
+        unavailable_reason=None,
+    )
+    base.update(overrides)
+    return TickerStats(**base)
+
+
+def test_the_etf_summary_prints_both_halves(capsys):
+    print_ticker_summary(_ticker_profile(), _ticker_stats_fixture(), "the configured default")
+    out = capsys.readouterr().out
+
+    assert "Ticker summary: AMLP - Alerian MLP ETF  (ETF, USD)" in out
+    assert "Category: Energy Limited Partnership" in out
+    assert "Expense ratio: 0.0101 (category average 0.0157)" in out
+    assert "Net assets: $13,442,306,048.00 USD" in out
+    assert "52-week range: 44.64 - 56.29" in out
+    assert "Yahoo trailing total returns as of 2026-09-08, fund / category:" in out
+    assert "YTD 0.2497 / 0.2384" in out
+    assert "Yahoo risk statistics (3y): alpha=0.1044  beta=0.2700" in out
+    assert "This project's own figures, 2021-09-30 to 2026-08-31 (60 month(s)" in out
+    assert "Annual return: 0.2071   Annual volatility: 0.1893   Sharpe: 1.0412" in out
+    assert "Risk-free rate used: 0.0200 (the configured default)" in out
+    assert "Trailing 12-month dividend yield: 0.0733" in out
+
+
+def test_the_summary_never_prints_a_percentage(capsys):
+    """Yahoo publishes the same expense ratio as 1.01, the same YTD return as
+    24.97 and the same standard deviation as 13.70. Every one of them prints
+    here as a fraction, so a stray `%` anywhere in this block means a
+    percentage-valued field leaked through.
+    """
+    print_ticker_summary(_ticker_profile(), _ticker_stats_fixture(), "remembered for USD")
+    out = capsys.readouterr().out
+
+    assert "%" not in out
+    assert "1.01" not in out
+    assert "13.70" not in out
+
+
+def test_a_company_share_collapses_the_fund_lines_to_one_named_n_a(capsys):
+    profile = _ticker_profile(
+        ticker="AVB",
+        long_name="AvalonBay Communities Inc",
+        quote_type="EQUITY",
+        category_name=None,
+        family=None,
+        legal_type=None,
+        expense_ratio=None,
+        expense_ratio_category=None,
+        holdings_turnover=None,
+        net_assets=None,
+        trailing_returns=None,
+        trailing_returns_category=None,
+        trailing_returns_as_of=None,
+        risk_statistics=None,
+        sector="Real Estate",
+        industry="REIT - Residential",
+        market_cap=26283393024,
+        trailing_pe=25.248285,
+        forward_pe=36.584446,
+        beta=0.773,
+        fund_data_reason=(
+            "AVB is not a fund (quoteType EQUITY), so Yahoo publishes no category "
+            "comparison or fund risk statistics for it"
+        ),
+    )
+
+    print_ticker_summary(profile, _ticker_stats_fixture(ticker="AVB"), "remembered for USD")
+    out = capsys.readouterr().out
+
+    assert "Sector: Real Estate   Industry: REIT - Residential" in out
+    assert "Market cap: $26,283,393,024.00 USD" in out
+    assert "Trailing P/E: 25.2483   Forward P/E: 36.5844   Beta: 0.7730" in out
+    assert "Yahoo fund figures: n/a - AVB is not a fund (quoteType EQUITY)" in out
+    assert "Expense ratio" not in out
+    # The other half is untouched: the two sources fail independently.
+    assert "Annual return: 0.2071" in out
+
+
+def test_an_unavailable_profile_still_prints_this_projects_own_figures(capsys):
+    """The whole point of the second half is that it needs no network at
+    all - the add already ingested the returns - so a Yahoo outage must not
+    cost a person the figures that decide whether to keep the ticker."""
+    profile = TickerProfile(ticker="AMLP", unavailable_reason="could not read this ticker's profile")
+
+    print_ticker_summary(profile, _ticker_stats_fixture(), None)
+    out = capsys.readouterr().out
+
+    assert "Ticker summary: AMLP - n/a - could not read this ticker's profile" in out
+    assert "Annual return: 0.2071" in out
+
+
+def test_unavailable_own_figures_still_print_what_yahoo_published(capsys):
+    """And the reverse: a ticker too newly listed for this project to measure
+    still has a category and an expense ratio worth knowing about."""
+    stats = _ticker_stats_fixture(
+        annual_return=None,
+        annual_volatility=None,
+        sharpe=None,
+        window_start=None,
+        window_end=None,
+        window_months=0,
+        dividend_yield=None,
+        dividend_lookback_months=None,
+        unavailable_reason="8 month(s) of history for AMLP in this window, below the 24 required",
+    )
+
+    print_ticker_summary(_ticker_profile(), stats, None)
+    out = capsys.readouterr().out
+
+    assert "Expense ratio: 0.0101" in out
+    assert (
+        "This project's own figures: n/a - 8 month(s) of history for AMLP in this "
+        "window, below the 24 required" in out
+    )
+    assert "Annual return" not in out
+
+
+def test_a_missing_dividend_yield_prints_its_reason_and_not_a_zero(capsys):
+    """A missing yield is not a zero yield - `AVB`, `EA`, `EQR` and `LEG` are
+    exactly this case in this project's own data."""
+    stats = _ticker_stats_fixture(
+        dividend_yield=None,
+        dividend_lookback_months=None,
+        dividend_unavailable_reason="Yahoo Finance no longer serves this window for AVB",
+    )
+
+    print_ticker_summary(_ticker_profile(), stats, None)
+    out = capsys.readouterr().out
+
+    assert (
+        "Trailing dividend yield: n/a - Yahoo Finance no longer serves this window for AVB"
+        in out
+    )
+    assert "dividend yield: 0.0000" not in out
+
+
+def test_a_confirmed_non_payer_prints_a_zero_yield(capsys):
+    print_ticker_summary(_ticker_profile(), _ticker_stats_fixture(dividend_yield=0.0), None)
+
+    assert "Trailing 12-month dividend yield: 0.0000" in capsys.readouterr().out
+
+
+def test_format_ratio_pair_drops_the_parenthesis_with_no_category_average():
+    assert format_ratio_pair("Expense ratio", 0.0101, None) == "Expense ratio: 0.0101"
+    assert format_ratio_pair("Expense ratio", None, 0.0157) is None
+
+
+def test_trailing_return_rows_wrap_rather_than_running_past_a_terminal():
+    """Seven periods with two figures each does not fit a terminal, and a
+    line that wraps wherever the window happens to end is unreadable."""
+    returns = {label: 0.1 for label in ("YTD", "1M", "3M", "1Y", "3Y", "5Y", "10Y")}
+    rows = format_trailing_return_rows(returns, dict(returns))
+
+    assert len(rows) == 2
+    assert rows[0].startswith("    YTD 0.1000 / 0.1000")
+    assert "10Y" in rows[1]
+    assert all(len(row) < 100 for row in rows)
+
+
+def test_a_period_the_category_has_no_figure_for_prints_the_fund_alone():
+    rows = format_trailing_return_rows({"YTD": 0.25, "10Y": 0.07}, {"YTD": 0.24})
+
+    assert rows == ["    YTD 0.2500 / 0.2400   10Y 0.0700"]
+
+
+def test_format_risk_statistics_is_silent_when_yahoo_supplied_none():
+    assert format_risk_statistics({}) is None
+    assert format_risk_statistics({"rSquared": 5.82}) is None
+
+
+# --- the [s]ummary choice and automatic-on-add printing ---------------------
+#
+# These test the sequencing the two loops are responsible for, not the
+# arithmetic or the fetch: `fetch_ticker_profile` (the one call that would
+# reach Yahoo Finance for a profile) and `ticker_stats` are monkeypatched on
+# the importing module's own symbol, per AGENTS.md and the convention every
+# other test in this file follows.
+
+
+def _script_recording(monkeypatch, *responses: str) -> list[str]:
+    """`_script`, but returns the list the prompts land in.
+
+    The prompt text is an assertion target for these tests - whether
+    `[s]ummary` is offered at all is the behavior under test - and the
+    mocked `input()` discards it, so it never reaches captured stdout.
+    """
+    prompts: list[str] = []
+    remaining = iter(responses)
+
+    def fake_input(prompt: str = "") -> str:
+        prompts.append(prompt)
+        return next(remaining)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    return prompts
+
+
+def _fake_summary_sources(monkeypatch, stats: TickerStats | None = None) -> MagicMock:
+    """Stand in for both halves of a summary. Returns the profile-fetch spy,
+    so a test can assert how many times Yahoo would have been asked."""
+    fetch_spy = MagicMock(
+        side_effect=lambda ticker, **kw: RawTickerProfile(
+            info={"quoteType": "ETF", "longName": f"{ticker} Fund", "currency": "USD"},
+            fund_profile=None,
+            fund_performance=None,
+            fund_data_reason="no fund data in this test",
+        )
+    )
+    monkeypatch.setattr("src.flow.interactive.fetch_ticker_profile", fetch_spy)
+    monkeypatch.setattr(
+        "src.flow.interactive.ticker_stats",
+        lambda ticker, as_of, db_path, **kw: (stats or _ticker_stats_fixture(ticker=ticker)),
+    )
+    return fetch_spy
+
+
+def test_confirm_loop_summary_choice_prints_a_block_without_changing_the_pool(
+    monkeypatch, capsys
+):
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    prompts = _script_recording(monkeypatch, "a", "AAPL", "s", "AAPL", "d")
+
+    pool, currency = _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
+    )
+    out = capsys.readouterr().out
+
+    assert pool == ["AAPL"]
+    assert currency == "USD"
+    assert "Ticker summary: AAPL - AAPL Fund" in out
+    assert any("[s]ummary" in prompt for prompt in prompts)
+    assert "Ticker to summarize: " in prompts
+
+
+def test_confirm_loop_summary_of_a_ticker_outside_the_pool_leaves_the_pool_alone(
+    monkeypatch, capsys
+):
+    """The whole point of the on-demand half: studying a candidate BEFORE
+    deciding to add it. The pool line printed afterwards must be unchanged.
+    """
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "s", "AMLP", "d")
+
+    pool, _currency = _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
+    )
+    out = capsys.readouterr().out
+
+    assert pool == ["AAPL"]
+    assert "Ticker summary: AMLP - AMLP Fund" in out
+    assert out.count("Candidate pool (1): AAPL") == 1
+
+
+def test_a_summary_only_ticker_is_never_ingested_into_the_session_database(monkeypatch):
+    """`_load_window_dates` derives the portfolio's returns window from
+    `SELECT DISTINCT rebalance_date FROM returns` over the WHOLE table, so a
+    summarized ticker with longer history than the pool could widen the
+    window the portfolio is measured over. Merely looking must not change the
+    numbers printed for the portfolio, which is why a non-pool ticker is
+    ingested into a throwaway database instead.
+    """
+    seen_db_paths = []
+
+    def fake_ingest(tickers, as_of, db_path):
+        seen_db_paths.append((sorted(tickers), db_path))
+        cleaned = sorted({t.strip().upper() for t in tickers if t.strip()})
+        return cleaned, {}, {t: "USD" for t in cleaned}
+
+    monkeypatch.setattr("src.flow.cli.validate_and_ingest_tickers", fake_ingest)
+    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fake_ingest)
+    monkeypatch.setattr(
+        "src.flow.interactive.load_ticker_currencies",
+        lambda tickers, db_path: {t: "USD" for t in tickers},
+    )
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "s", "AMLP", "d")
+
+    _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
+
+    summary_ingests = [(t, db) for t, db in seen_db_paths if t == ["AMLP"]]
+    assert summary_ingests, "the summary-only ticker was never ingested anywhere"
+    for _tickers, db_path in summary_ingests:
+        assert db_path != "session.duckdb"
+        assert "summary_snapshot_" in db_path
+
+
+def test_confirm_loop_summary_of_an_unresolvable_symbol_reports_it_by_name(monkeypatch, capsys):
+    _fake_ingestion(monkeypatch, invalid={"ZZZZQQQ"})
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "s", "ZZZZQQQ", "d")
+
+    pool, _currency = _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
+    )
+    out = capsys.readouterr().out
+
+    assert pool == ["AAPL"]
+    assert "ZZZZQQQ" in out
+    assert "no data" in out
+
+
+def test_confirm_loop_summary_with_no_ticker_typed_says_so_and_carries_on(monkeypatch, capsys):
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "s", "", "d")
+
+    pool, _currency = _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
+    )
+
+    assert pool == ["AAPL"]
+    assert "No ticker given; nothing to summarize." in capsys.readouterr().out
+
+
+def test_a_ticker_in_another_currency_can_be_summarized_though_an_add_would_refuse_it(
+    monkeypatch, capsys
+):
+    """Looking is always allowed; only joining a pool is gated on currency."""
+    _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "s", "7203.T", "a", "7203.T", "d")
+
+    pool, currency = _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json"
+    )
+    out = capsys.readouterr().out
+
+    assert pool == ["AAPL"]
+    assert currency == "USD"
+    assert "Ticker summary: 7203.T - 7203.T Fund" in out
+    assert "Refused: 7203.T is priced in JPY but this pool is USD." in out
+
+
+def test_confirm_loop_summarizes_every_added_ticker_in_typed_order(monkeypatch, capsys):
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "MSFT AAPL", "d")
+
+    _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json", show_summaries=True
+    )
+    out = capsys.readouterr().out
+
+    assert out.index("Ticker summary: MSFT") < out.index("Ticker summary: AAPL")
+
+
+def test_no_ticker_summary_suppresses_the_automatic_half_but_not_the_choice(
+    monkeypatch, capsys
+):
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "s", "AAPL", "d")
+
+    _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json", show_summaries=False
+    )
+    out = capsys.readouterr().out
+
+    assert "Added: AAPL." in out
+    # Exactly one block, from the explicit [s] choice - not two.
+    assert out.count("Ticker summary: AAPL") == 1
+
+
+def test_a_summarized_profile_is_fetched_once_per_session(monkeypatch):
+    """Yahoo's description of a security is a point-in-time fact, so the
+    per-session cache makes re-reading one free."""
+    _fake_ingestion(monkeypatch)
+    fetch_spy = _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "s", "AAPL", "s", "AAPL", "d")
+    cache = {}
+
+    _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json",
+        show_summaries=True, profile_cache=cache,
+    )
+
+    assert fetch_spy.call_count == 1
+    assert set(cache) == {"AAPL"}
+
+
+def test_a_yahoo_failure_still_prints_this_projects_own_figures(monkeypatch, capsys):
+    _fake_ingestion(monkeypatch)
+    monkeypatch.setattr(
+        "src.flow.interactive.ticker_stats",
+        lambda ticker, as_of, db_path, **kw: _ticker_stats_fixture(ticker=ticker),
+    )
+
+    def boom(ticker, **kw):
+        raise RuntimeError("rate limited")
+
+    monkeypatch.setattr("src.flow.interactive.fetch_ticker_profile", boom)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "a", "AAPL", "d")
+
+    _run_user_provided_confirm_loop(
+        {}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json", show_summaries=True
+    )
+    out = capsys.readouterr().out
+
+    assert "Ticker summary: AAPL - n/a - " in out
+    assert "Annual return: 0.2071" in out
+
+
+def test_edit_loop_offers_summary_only_for_user_provided(monkeypatch, stub_optimizer):
+    """The same narrow gate that already makes adds validate and edits
+    persist in this loop: the other three selections' candidate lists are one
+    agent run's ephemeral output, and this feature is about a pool somebody
+    typed themselves."""
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    prompts = _script_recording(monkeypatch, "f")
+
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+
+    assert prompts and not any("[s]ummary" in prompt for prompt in prompts)
+
+
+def test_edit_loop_treats_s_as_unrecognized_for_a_selection_it_is_not_offered_to(
+    monkeypatch, stub_optimizer, capsys
+):
+    """A choice the prompt never offered must be reported as unrecognized
+    rather than quietly doing something."""
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    _script_recording(monkeypatch, "s", "f")
+
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+    out = capsys.readouterr().out
+
+    assert "Unrecognized choice 's'." in out
+    assert "Ticker summary" not in out
+
+
+def test_edit_loop_summary_choice_prints_a_block_without_recomputing(
+    monkeypatch, stub_optimizer, capsys
+):
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    prompts = _script_recording(monkeypatch, "s", "AAPL", "f")
+
+    printed_a_report = _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        selection="user_provided", memory_path="mem.json",
+    )
+    out = capsys.readouterr().out
+
+    assert any("[s]ummary" in prompt for prompt in prompts)
+    assert "Ticker summary: AAPL - AAPL Fund" in out
+    # A summary changes nothing, so it must not recompute or reprint.
+    assert printed_a_report is False
+    assert stub_optimizer.call_count == 0
+
+
+def test_edit_loop_summary_uses_the_rate_the_session_already_settled_on(
+    monkeypatch, stub_optimizer, capsys
+):
+    """A summary printed after the report must agree with the report, so this
+    loop passes its settled rate and origin straight through rather than
+    resolving a second one."""
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(
+        monkeypatch, stats=_ticker_stats_fixture(ticker="AAPL", risk_free_rate=0.005)
+    )
+    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "s", "AAPL", "f")
+
+    _run_edit_loop(
+        ["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb",
+        selection="user_provided", memory_path="mem.json",
+        risk_free_rate=0.005, risk_free_rate_origin="remembered for USD",
+    )
+
+    assert "Risk-free rate used: 0.0050 (remembered for USD)" in capsys.readouterr().out

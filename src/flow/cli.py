@@ -80,6 +80,7 @@ from src.flow.interactive import (
     open_pipeline_session,
     prepare_benchmark,
     prepare_holdings,
+    prepare_ticker_summary,
     run_pipeline_against,
     validate_and_edit_candidates,
 )
@@ -108,6 +109,8 @@ from src.optimizer.dividends import (
 )
 from src.optimizer.holdings import HoldingsStats
 from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
+from src.dataset.ticker_profile import TickerProfile
+from src.optimizer.ticker_stats import TickerStats
 
 
 CURRENCY_SYMBOLS = {"USD": "$", "JPY": "¥", "GBP": "£", "EUR": "€"}
@@ -1059,6 +1062,226 @@ def _print_add_outcome(
         )
 
 
+NO_FUND_FIGURES_LABEL = "Yahoo fund figures"
+"""Label on the line that stands in for the fund block when there is none.
+
+It gets a label and a reason rather than being omitted because an absent
+line is indistinguishable from a line that was never going to be there: a
+person who typed a company share should learn that Yahoo publishes no
+category comparison for one, not silently see a shorter block and wonder
+whether the fetch failed.
+"""
+
+
+def format_ratio_pair(label: str, value: float | None, category: float | None) -> str | None:
+    """One `label: 0.0101 (category average 0.0157)` line, or `None` when
+    there is no figure to print at all.
+
+    The category average is what makes the fund's own number mean anything -
+    a 1% expense ratio is cheap in one category and dear in another - so it
+    is printed on the same line rather than left to be looked up. When Yahoo
+    supplies the fund's figure but no category average, the parenthesis is
+    dropped rather than filled with a placeholder.
+    """
+    if value is None:
+        return None
+    if category is None:
+        return f"{label}: {value:.4f}"
+    return f"{label}: {value:.4f} (category average {category:.4f})"
+
+
+def format_trailing_return_rows(
+    returns: dict[str, float], category: dict[str, float] | None, per_row: int = 4
+) -> list[str]:
+    """Yahoo's trailing total returns as `fund / category` pairs, wrapped
+    into rows of at most `per_row` periods.
+
+    Wrapped rather than printed on one line because seven periods with two
+    figures each does not fit a terminal, and a report line that wraps
+    wherever the window happens to end is unreadable. Each period prints as
+    `1Y 0.2355 / 0.3076`; a period the category has no figure for prints the
+    fund's alone rather than inventing a comparison.
+    """
+    category = category or {}
+    cells = []
+    for label, value in returns.items():
+        peer = category.get(label)
+        cells.append(
+            f"{label} {value:.4f} / {peer:.4f}" if peer is not None else f"{label} {value:.4f}"
+        )
+    return [
+        "    " + "   ".join(cells[i : i + per_row]) for i in range(0, len(cells), per_row)
+    ]
+
+
+def format_risk_statistics(statistics: dict[str, float]) -> str | None:
+    """Yahoo's three-year risk statistics as one line, or `None` when there
+    are none.
+
+    Every value here is already a fraction: `src/dataset/ticker_profile.py`
+    divides Yahoo's percentage-valued `alpha` and `stdDev` by 100 on the way
+    in, because these numbers are printed a few lines above this project's
+    own `Annual volatility`, and a `13.70` beside a `0.1893` invites a
+    hundredfold misreading.
+    """
+    if not statistics:
+        return None
+    names = {"alpha": "alpha", "beta": "beta", "stdDev": "stdDev", "sharpeRatio": "Sharpe"}
+    parts = [f"{names[k]}={v:.4f}" for k, v in statistics.items() if k in names]
+    if not parts:
+        return None
+    return f"  Yahoo risk statistics (3y): {'  '.join(parts)}"
+
+
+def format_ticker_dividend_yield(stats: TickerStats) -> str:
+    """The summary's dividend line: a trailing yield with the window it was
+    summed over, or a named `n/a`.
+
+    Never a bare zero. A yield of exactly `0.0` here means a CONFIRMED
+    non-payer - this project proved it had the dividend history and found no
+    payments - while a ticker whose history is missing prints its reason
+    instead. `AVB`, `EA`, `EQR` and `LEG` are the second case in this
+    project's own data, and collapsing the two would be the one silent wrong
+    answer this feature could produce.
+    """
+    if stats.dividend_yield is None:
+        reason = stats.dividend_unavailable_reason or "no trailing dividend data"
+        return f"    Trailing dividend yield: n/a - {reason}"
+    return (
+        f"    Trailing {stats.dividend_lookback_months}-month dividend yield: "
+        f"{stats.dividend_yield:.4f}"
+    )
+
+
+def _print_ticker_identity(profile: TickerProfile) -> None:
+    """The header line and whichever identity block fits the security: a
+    fund's category and fees, or a company share's sector and multiples.
+
+    A fund gets the fund block whenever Yahoo served the fund modules; every
+    security gets the equity block for the fields `info` carried, because
+    `sector`, `marketCap`, `trailingPE` and `beta` are the plain multiples
+    the unit rule permits and an ETF that happens to report them is not a
+    reason to hide them.
+    """
+    name = profile.long_name or "(name unavailable)"
+    kind = ", ".join(p for p in (profile.quote_type, profile.currency) if p)
+    header = f"\nTicker summary: {profile.ticker} - {name}"
+    print(f"{header}  ({kind})" if kind else header)
+
+    if profile.category_name or profile.family or profile.legal_type:
+        parts = [
+            f"Category: {profile.category_name}" if profile.category_name else None,
+            f"Family: {profile.family}" if profile.family else None,
+            f"Legal type: {profile.legal_type}" if profile.legal_type else None,
+        ]
+        print("  " + "   ".join(p for p in parts if p))
+
+    fees = [
+        format_ratio_pair("Expense ratio", profile.expense_ratio, profile.expense_ratio_category),
+        f"Holdings turnover: {profile.holdings_turnover:.4f}"
+        if profile.holdings_turnover is not None
+        else None,
+    ]
+    if any(fees):
+        print("  " + "   ".join(p for p in fees if p))
+
+    if profile.sector or profile.industry:
+        parts = [
+            f"Sector: {profile.sector}" if profile.sector else None,
+            f"Industry: {profile.industry}" if profile.industry else None,
+        ]
+        print("  " + "   ".join(p for p in parts if p))
+
+    currency = profile.currency or DEFAULT_CURRENCY
+    size = [
+        f"Net assets: {format_money(profile.net_assets, currency)}"
+        if profile.net_assets is not None
+        else None,
+        f"Market cap: {format_money(profile.market_cap, currency)}"
+        if profile.market_cap is not None
+        else None,
+        f"52-week range: {profile.fifty_two_week_low:.2f} - {profile.fifty_two_week_high:.2f}"
+        if profile.fifty_two_week_low is not None and profile.fifty_two_week_high is not None
+        else None,
+    ]
+    if any(size):
+        print("  " + "   ".join(p for p in size if p))
+
+    multiples = [
+        f"Trailing P/E: {profile.trailing_pe:.4f}" if profile.trailing_pe is not None else None,
+        f"Forward P/E: {profile.forward_pe:.4f}" if profile.forward_pe is not None else None,
+        f"Beta: {profile.beta:.4f}" if profile.beta is not None else None,
+    ]
+    if any(multiples):
+        print("  " + "   ".join(p for p in multiples if p))
+
+
+def print_ticker_summary(
+    profile: TickerProfile, stats: TickerStats, risk_free_rate_origin: str | None = None
+) -> None:
+    """The whole per-ticker summary block: what Yahoo Finance publishes about
+    the security, then the figures this project computed itself.
+
+    Printed automatically for each ticker added to a `user_provided`
+    candidate pool, and on demand through that loop's `[s]ummary` choice.
+    The two halves come from independent sources - `fetch_ticker_profile`
+    over the network, `ticker_stats` out of the session database - and they
+    FAIL INDEPENDENTLY here: either can collapse to a single `n/a` line
+    carrying its reason while the other prints in full. That is deliberate
+    and load-bearing. A ticker Yahoo has nothing to say about still has a
+    return and a volatility worth seeing before it joins a portfolio, and a
+    ticker too newly listed for this project to measure still has a category
+    and an expense ratio worth knowing about.
+
+    Every ratio prints as a four-decimal fraction, every money amount
+    through `format_money`, and the risk-free rate through
+    `format_risk_free_rate` with its provenance - the same conventions
+    `print_weights_and_allocation` follows, so the two blocks can be read
+    against each other without translating between units.
+
+    The heading over this project's own figures names the real first and last
+    month behind them rather than the 60-month window that was requested,
+    because real history is frequently shorter than the target and the same
+    command on two different days uses different months.
+    """
+    if profile.unavailable_reason is not None:
+        print(f"\nTicker summary: {profile.ticker} - n/a - {profile.unavailable_reason}")
+    else:
+        _print_ticker_identity(profile)
+
+        if profile.trailing_returns:
+            as_of = profile.trailing_returns_as_of
+            stamp = f" as of {as_of}" if as_of else ""
+            print(f"\n  Yahoo trailing total returns{stamp}, fund / category:")
+            for row in format_trailing_return_rows(
+                profile.trailing_returns, profile.trailing_returns_category
+            ):
+                print(row)
+
+        risk_line = format_risk_statistics(profile.risk_statistics or {})
+        if risk_line is not None:
+            print(risk_line)
+
+        if profile.fund_data_reason is not None:
+            print(f"  {NO_FUND_FIGURES_LABEL}: n/a - {profile.fund_data_reason}")
+
+    if stats.unavailable_reason is not None:
+        print(f"\n  This project's own figures: n/a - {stats.unavailable_reason}")
+        return
+
+    print(
+        f"\n  This project's own figures, {stats.window_start} to {stats.window_end} "
+        f"({stats.window_months} month(s) of monthly returns):"
+    )
+    print(
+        f"    Annual return: {stats.annual_return:.4f}   "
+        f"Annual volatility: {stats.annual_volatility:.4f}   "
+        f"Sharpe: {stats.sharpe:.4f}"
+    )
+    print(f"    {format_risk_free_rate(stats.risk_free_rate, risk_free_rate_origin)}")
+    print(format_ticker_dividend_yield(stats))
+
+
 def _resolve_mixed_persisted_pool(
     pool: list[str], currencies: dict[str, str], override: str | None = None
 ) -> tuple[list[str], str]:
@@ -1205,6 +1428,10 @@ def _run_user_provided_confirm_loop(
     db_path: str,
     memory_path: str = DEFAULT_CANDIDATES_PATH,
     currency: str | None = None,
+    rates_path: str = DEFAULT_RATES_PATH,
+    risk_free_rate: float | None = None,
+    show_summaries: bool = False,
+    profile_cache: dict[str, TickerProfile] | None = None,
 ) -> tuple[list[str], str]:
     """Show the persisted candidate pool, then prompt in a loop for
     add/remove until the user confirms they are done, and return the
@@ -1241,6 +1468,38 @@ def _run_user_provided_confirm_loop(
     whose ticker has since moved to Tokyo really is JPY now, and the
     database is a better authority on that than a stale key in a JSON file.
     The disagreement is reported rather than silently applied.
+
+    `[s]ummary` prints one ticker's performance summary - what Yahoo Finance
+    publishes about it beside the figures this project computes itself - and
+    changes nothing: not the pool, not its currency, not anything on disk.
+    That is what makes it usable for studying a candidate BEFORE deciding to
+    add it, and it is also why a ticker in another currency can be
+    summarized freely when an add would refuse it. Looking is always
+    allowed; only joining a pool is gated on currency.
+
+    Each ticker a successful add actually admits is summarized automatically
+    too, in the order it was typed, because the moment a ticker joins the
+    pool is exactly the moment the missing information matters and a person
+    who does not know to go looking will not go looking. `show_summaries`
+    (`main`'s `--no-ticker-summary`) switches off that automatic half only;
+    `[s]ummary` still works, because asking for something is not the same as
+    having it volunteered.
+
+    `show_summaries` defaults to `False` even though the behavior it enables
+    is ON for every real run, which `main` expresses by passing `True`. That
+    inversion is deliberate: the automatic summary reaches Yahoo Finance, and
+    a default of `True` would silently give network access to every existing
+    caller and test of this loop that only ever meant to exercise the
+    add/remove sequencing. This is the reasoning `format_risk_free_rate`'s
+    optional `origin` already follows - a defaulted parameter whose default
+    exists for the benefit of callers that predate it.
+
+    `rates_path` and `risk_free_rate` are needed only by the summary, and
+    only because this loop runs BEFORE `_settle_risk_free_rate`: the rate is
+    per-currency and the currency is not settled until this loop returns, so
+    a Sharpe ratio printed here has to resolve its own rate and name where it
+    came from. `profile_cache` is shared with `_run_edit_loop` so a ticker
+    summarized in one loop is not re-fetched in the other.
     """
     initial_pool, resumed_currency = _choose_pool_to_resume(
         initial_pools, load_pool_benchmarks(memory_path), override=currency
@@ -1268,10 +1527,42 @@ def _run_user_provided_confirm_loop(
 
     print(f"\nCurrent candidate pool ({len(pool)}): {', '.join(pool) if pool else '(empty)'}")
 
+    def show_summary(symbol: str, symbol_currency: str | None) -> None:
+        """Print one ticker's summary, resolving its own risk-free rate.
+
+        Closed over the loop's `db_path`, `pool` and caches so both the
+        `[s]ummary` choice and the automatic post-add printing go through one
+        code path - a summary that differed depending on which of the two
+        asked for it would be a bug waiting to happen.
+        """
+        summary = prepare_ticker_summary(
+            symbol,
+            rebalance_date,
+            pool,
+            db_path,
+            currency=symbol_currency,
+            rates_path=rates_path,
+            risk_free_rate_override=risk_free_rate,
+            profile_cache=profile_cache,
+        )
+        print_ticker_summary(summary.profile, summary.stats, summary.risk_free_rate_origin)
+
     while True:
         choice = input(
-            "\nEdit candidate pool? [a]dd tickers / [r]emove tickers / [d]one: "
+            "\nEdit candidate pool? [a]dd tickers / [r]emove tickers / [s]ummary / [d]one: "
         ).strip().lower()
+
+        if choice in ("s", "summary"):
+            symbol = input("Ticker to summarize: ").strip().upper()
+            if not symbol:
+                print("No ticker given; nothing to summarize.")
+                continue
+            # Deliberately not `continue`d through the edit machinery below:
+            # this choice changes nothing, so it must not print a pool line,
+            # must not touch `pool_currency`, and must not be able to trigger
+            # the empty-pool revert.
+            show_summary(symbol, pool_currency if symbol in pool else None)
+            continue
 
         if choice in ("", "d", "done"):
             if not pool:
@@ -1300,6 +1591,12 @@ def _run_user_provided_confirm_loop(
             pool = edit.pool
             pool_currency = edit.pool_currency or previous_pool_currency
             _print_add_outcome(edit.added, edit.invalid, edit.refused, pool_currency)
+            if show_summaries:
+                # In typed order, which `validate_and_edit_candidates` already
+                # preserves in `added`, so a person reading down the screen
+                # sees the blocks in the order they asked for them.
+                for symbol in edit.added:
+                    show_summary(symbol, pool_currency)
         elif choice in ("r", "remove"):
             raw = input("Ticker(s) to remove (space-separated): ").strip().upper()
             requested = raw.split()
@@ -1649,6 +1946,8 @@ def _run_edit_loop(
     benchmark: BenchmarkSource | None = None,
     allow_benchmark_fetch: bool = True,
     risk_free_rate_origin: str | None = None,
+    show_summaries: bool = False,
+    profile_cache: dict[str, TickerProfile] | None = None,
 ) -> bool:
     """Prompt in a loop for add/remove/objective/target-return/benchmark/
     finish; each
@@ -1703,16 +2002,59 @@ def _run_edit_loop(
     answer keeps the benchmark already in force, the same keep-what-you-had
     treatment `[o]bjective` gives a rejected edit. A benchmark chosen here is
     always an explicit choice, so for `user_provided` it is persisted.
+
+    `[s]ummary` is offered for `user_provided` only - the same narrow gate
+    that already makes adds validate and edits persist in this loop - and
+    prints one ticker's performance summary without changing anything, so it
+    cannot end the session or force a recompute. Unlike the candidate-pool
+    confirm loop, this one already carries the settled `risk_free_rate` and
+    `risk_free_rate_origin`, which are passed straight through: a summary
+    printed here must agree with the report printed above it rather than
+    resolving a second rate of its own.
+
+    `show_summaries` defaults to `False` for the reason given in
+    `_run_user_provided_confirm_loop`: the automatic post-add summary reaches
+    Yahoo Finance, and a `True` default would silently give network access to
+    every existing caller and test of this loop. `main` passes `True`.
+    `profile_cache` is shared with that loop so a ticker summarized before
+    the report is not re-fetched after it.
     """
+    def show_summary(symbol: str) -> None:
+        """Print one ticker's summary against the rate this session settled
+        on, so it agrees with the report printed above it."""
+        summary = prepare_ticker_summary(
+            symbol,
+            rebalance_date,
+            candidates,
+            db_path,
+            currency=currency if symbol in candidates else None,
+            risk_free_rate=risk_free_rate,
+            risk_free_rate_origin=risk_free_rate_origin,
+            profile_cache=profile_cache,
+        )
+        print_ticker_summary(summary.profile, summary.stats, summary.risk_free_rate_origin)
+
     printed_a_report = False
+    summary_offer = " / [s]ummary" if selection == "user_provided" else ""
     while True:
         choice = input(
             "\nEdit candidates? [a]dd tickers / [r]emove tickers / [o]bjective / "
-            "[t]arget-return / [d]ividend / [b]enchmark / [f]inish: "
+            f"[t]arget-return / [d]ividend / [b]enchmark{summary_offer} / [f]inish: "
         ).strip().lower()
 
         if choice in ("", "f", "finish"):
             return printed_a_report
+
+        if choice in ("s", "summary") and selection == "user_provided":
+            symbol = input("Ticker to summarize: ").strip().upper()
+            if not symbol:
+                print("No ticker given; nothing to summarize.")
+                continue
+            # Returns before the edit machinery below: this choice changes
+            # nothing, so it must not recompute, reprint the report, or be
+            # able to revert anything.
+            show_summary(symbol)
+            continue
 
         previous_candidates, previous_objective, previous_target, previous_dividend_floor = (
             candidates,
@@ -1729,6 +2071,12 @@ def _run_edit_loop(
                 )
                 candidates = edit.pool
                 _print_add_outcome(edit.added, edit.invalid, edit.refused, currency)
+                # Before the recompute below, so the summary that justifies
+                # keeping a ticker is read beside the add that admitted it
+                # rather than under the whole reprinted report.
+                if show_summaries:
+                    for symbol in edit.added:
+                        show_summary(symbol)
             else:
                 candidates = edit_candidates({"candidates": candidates}, add=raw.split(), remove=[])
         elif choice in ("r", "remove"):
@@ -1929,6 +2277,15 @@ def main() -> None:
              "reporting the benchmark as unavailable when the cache does not contain it.",
     )
     parser.add_argument(
+        "--no-ticker-summary",
+        action="store_true",
+        help="Do not print a ticker's performance summary automatically when it is added to "
+             "a --selection user_provided candidate pool. Each summary costs two Yahoo "
+             "Finance requests, so a scripted run that already knows its pool need not pay "
+             "for them. The [s]ummary choice in both interactive loops still works, since "
+             "asking for a summary is not the same as having it volunteered.",
+    )
+    parser.add_argument(
         "--memory-path",
         default=DEFAULT_CANDIDATES_PATH,
         help="Which file the user_provided selection's candidate pools are persisted in - an "
@@ -2072,6 +2429,13 @@ def main() -> None:
     benchmark_enabled = args.benchmark != BENCHMARK_DISABLED
     benchmark_override = args.benchmark if benchmark_enabled else None
 
+    # One cache for the whole run, shared by both interactive loops, so a
+    # ticker summarized while confirming the pool is not fetched again when
+    # it is summarized after the report. Yahoo's description of a security is
+    # a point-in-time fact rather than a history to accumulate, which is why
+    # this is a dictionary that dies with the process and not a table.
+    profile_cache: dict[str, TickerProfile] = {}
+
     with open_pipeline_session(
         rebalance_date,
         args.selection,
@@ -2087,6 +2451,10 @@ def main() -> None:
                 session_db_path,
                 memory_path=args.memory_path,
                 currency=args.currency,
+                rates_path=args.rates_path,
+                risk_free_rate=args.risk_free_rate,
+                show_summaries=not args.no_ticker_summary,
+                profile_cache=profile_cache,
             )
 
         # Settled after the confirm loop, never before: an empty pool has no
@@ -2224,6 +2592,8 @@ def main() -> None:
             currency=currency, benchmark=benchmark,
             allow_benchmark_fetch=not args.no_benchmark_fetch,
             risk_free_rate_origin=resolved_rate.origin,
+            show_summaries=not args.no_ticker_summary,
+            profile_cache=profile_cache,
         )
 
         # A run that never printed a portfolio must not look like a success

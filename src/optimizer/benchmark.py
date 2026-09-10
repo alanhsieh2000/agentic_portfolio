@@ -202,18 +202,25 @@ def empty_benchmark_returns(ticker: str | None = None) -> pd.Series:
     return pd.Series(dtype=float, name=ticker, index=pd.DatetimeIndex([], name="rebalance_date"))
 
 
-def load_benchmark_returns(ticker: str, as_of: date, db_path: str) -> pd.Series:
+def load_ticker_monthly_returns(ticker: str, as_of: date, db_path: str) -> pd.Series:
     """Every monthly return `db_path`'s `returns` table holds for `ticker` on
     or before `as_of`, indexed by `rebalance_date`, ascending, nulls dropped.
 
     Deliberately unbounded below: the whole history is read once and sliced
     per window afterwards, so an interactive session that recomputes a dozen
     times reads the database once. An empty series - never an exception - is
-    returned when the file, the `returns` table, or the ticker is absent,
-    which is the ordinary case for a benchmark that has to be fetched first.
+    returned when the file, the `returns` table, or the ticker is absent.
 
     Reads read-only via `load_returns_long`, so pointing this at the shared
     `data/portfolio.duckdb` cache cannot create, lock or modify it.
+
+    Named for a ticker rather than for a benchmark because nothing about it
+    is benchmark-specific, and it has a second caller:
+    `src/optimizer/ticker_stats.py` needs one candidate's history in exactly
+    this shape in order to report the same three figures over the same
+    window rules. `load_benchmark_returns` below is the benchmark-facing
+    name for this, kept because that is the name the benchmark code and its
+    tests already use.
     """
     long_df = load_returns_long([ticker], None, as_of, db_path, read_only=True)
     if long_df.empty:
@@ -227,6 +234,17 @@ def load_benchmark_returns(ticker: str, as_of: date, db_path: str) -> pd.Series:
     )
     series.name = ticker
     return series
+
+
+def load_benchmark_returns(ticker: str, as_of: date, db_path: str) -> pd.Series:
+    """The benchmark's whole usable monthly-return history up to `as_of`.
+
+    Identical to `load_ticker_monthly_returns`, which it delegates to - an
+    empty series, never an exception, when the file, the `returns` table or
+    the ticker is absent, which is the ordinary case for a benchmark that
+    has to be fetched first.
+    """
+    return load_ticker_monthly_returns(ticker, as_of, db_path)
 
 
 def annualized_return_and_volatility(monthly_returns: pd.Series) -> tuple[float, float]:
