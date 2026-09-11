@@ -1,0 +1,33 @@
+summary_task:
+  description: >
+    Write the prose for a decision briefing covering every portfolio report saved during
+    {month} - {report_count} reports in all. The figures are already computed and already laid
+    out in tables that the reader sees; your sentences go between those tables.
+
+    The facts below are the ONLY thing you know. Anything not written there does not exist:
+    not a ticker, not a figure, not a portfolio, not a month. Where the facts say a section was
+    not available, write exactly NOT APPLICABLE in that field.
+
+    Two rules carry the whole task. First, state no figure that is not written in the facts
+    below, and perform no arithmetic of any kind - the arithmetic was done before you were
+    called. Second, never read across returns windows: the facts rank portfolios only within a
+    window, and any line marked WINDOW SENSITIVITY is one portfolio measured twice, not two
+    portfolios.
+
+    For next_runs, suggest two to five things worth running next. Each entry is one line: a
+    real command using flags that exist, then a dash, then a short clause saying what it would
+    settle. The commands available are 'uv run portfolio' - whose flags include --objective
+    GMV/MV/MSR, --target-return, --value, --selection, --currency, --min-dividend-yield,
+    --min-annual-dividend, --benchmark and --risk-free-rate - and 'uv run portfolio-holdings
+    whatif', which tries hypothetical changes to the portfolio actually held. Suggest only runs
+    the facts below give a reason for.
+
+    Facts:
+    {facts}
+  expected_output: >
+    A MonthNarrative. headline is one sentence. exploration_story, risk_return_read,
+    holdings_gap_read, consensus_read are two to four sentences each. income_read and
+    methodology_caution are two to three sentences each. next_runs holds two to five one-line
+    entries. Prose only: no computed figures, no arithmetic, no comparison across returns
+    windows, and exactly NOT APPLICABLE for any section the facts report as unavailable.
+  agent: summary_agent

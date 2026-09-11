@@ -99,6 +99,17 @@ FACT_ORDER: tuple[str, ...] = (
     "kind",
     "variant",
     "command",
+    # Written only by `uv run portfolio-summary` (see `src/flow/summary_cli.py`),
+    # whose `kind` is "summary". Listed here rather than left to the sorted
+    # append at the end of `_ordered_facts` so a summary's front matter reads in
+    # the order a person would ask the questions. Purely additive: a key absent
+    # from a report's facts is omitted from that file, so no existing call site
+    # or saved file is affected, and digests cover the body alone.
+    "month",
+    "report_count",
+    "sources_digest",
+    "llm_model",
+    "narrative_status",
     "currency",
     "objective",
     "objective_origin",

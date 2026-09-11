@@ -38,6 +38,7 @@ portfolio-build-dividends = "src.dataset.dividends:main"
 portfolio-build-news-archive = "src.dataset.news_archive:main"
 portfolio-backfill-snapshot = "src.dataset.backfill_snapshot:main"
 portfolio-holdings = "src.flow.holdings_cli:main"
+portfolio-summary = "src.flow.summary_cli:main"
 portfolio-migrate-candidates = "src.flow.candidate_memory:main"
 
 [build-system]
