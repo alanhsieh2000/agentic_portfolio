@@ -129,18 +129,32 @@ def existing_summary(output_dir: str, month: str, sources_digest: str) -> Path |
     filename, because the filename carries a digest of the summary's own text -
     which changes whenever the prose does, while the question being asked here
     is whether these same reports have already been summarized.
+
+    The NEWEST match is returned when there are several, which happens after a
+    `--force` run: the same reports then have two summaries, and the one the
+    reader should be pointed at is the later one, since it is the one written by
+    the current version of this command. Returning whichever sorted first by
+    filename would have named the older briefing - the digests in those names
+    are content hashes and carry no order at all.
     """
     folder = Path(output_dir) / month
     if not folder.is_dir():
         return None
+    matches: list[tuple[str, Path]] = []
     for path in sorted(p for p in folder.glob("*.md") if not p.name.startswith(".")):
         try:
             facts, _ = load_report(path)
         except (ValueError, OSError, UnicodeDecodeError):
             continue
         if facts.get("kind") == SUMMARY_KIND and facts.get("sources_digest") == sources_digest:
-            return path
-    return None
+            matches.append((facts.get("saved_at", ""), path))
+    if not matches:
+        return None
+    # `saved_at` is UTC ISO-8601 to the second, so it sorts lexically; a summary
+    # missing it sorts to the front and so loses to any dated one, which is the
+    # safe way round. Two written within the same second tie, and the filename
+    # then decides - arbitrary but stable, and there is nothing better to use.
+    return max(matches, key=lambda match: (match[0], match[1].name))[1]
 
 
 def _write(

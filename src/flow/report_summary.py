@@ -722,6 +722,33 @@ class Comparability:
 
 
 @dataclass(frozen=True)
+class SourceReport:
+    """One saved report, named the way a reader has to name it to open it.
+
+    `digest8` is the first eight characters of the report's digest, which is
+    also the token `report_filename` in `src/flow/report_archive.py` builds the
+    filename from - so it is not an opaque identifier but the part of the file's
+    own name that tells it from its neighbours. It is unique within a month
+    folder by construction: two reports sharing it would collide on one path,
+    and `save_report` would recognize the second as already saved.
+
+    `label` is qualified with the returns window when another report in the same
+    month carries the same unqualified label, because without that four of the
+    nine reports in a real month folder are indistinguishable - the two
+    measurements of a held book share a label, and so do the two measurements of
+    any variant of it.
+    """
+
+    digest8: str
+    digest: str | None
+    saved_at: datetime | None
+    kind: str
+    variant: str | None
+    label: str
+    filename: str
+
+
+@dataclass(frozen=True)
 class Scope:
     month: str
     report_count: int
@@ -736,6 +763,11 @@ class Scope:
     benchmarks: tuple[tuple[str, BenchmarkLine], ...]
     commands: tuple[str, ...]
     skipped: tuple[str, ...]
+    #: The directory the reports were read from, so the source list can state
+    #: it once rather than repeating it on every row. Taken from the records
+    #: themselves rather than from a parameter, because they know where they
+    #: came from.
+    folder: str | None = None
 
 
 @dataclass(frozen=True)
@@ -748,6 +780,7 @@ class MonthDigest:
     ledger: ScenarioLedger
     comparability: Comparability
     sources_digest: str
+    sources: tuple[SourceReport, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -784,6 +817,13 @@ def _row(record: ReportRecord) -> LeaderRow:
 
 
 def _collapse(rows: Sequence[LeaderRow]) -> tuple[LeaderRow, ...]:
+    """Rows sharing a label and all four figures merged into one, counted.
+
+    Note for whoever reads `LeaderRow.digest` next: a collapsed row keeps only
+    the FIRST of its reports' digests, so that field does not identify the row's
+    sources and nothing renders it. The `Source reports` section is built from
+    the records instead (see `build_sources`), which is the per-file data.
+    """
     collapsed: list[LeaderRow] = []
     for row in rows:
         for index, seen in enumerate(collapsed):
@@ -1141,6 +1181,55 @@ def _build_comparability(
     )
 
 
+def build_sources(records: Sequence[ReportRecord]) -> tuple[SourceReport, ...]:
+    """Every report the briefing was built from, in the order it was saved.
+
+    Saved order rather than alphabetical, because that is the order the work
+    happened in and therefore the order a reader remembers it in. A report whose
+    `saved_at` cannot be read sorts last rather than first, so an unreadable
+    timestamp cannot silently claim to be the start of the session.
+
+    `digest8` comes from `stable_digest`, which falls back to hashing the body
+    when the front-matter `digest` is absent. Worth knowing about that fallback:
+    the identifier it produces is still stable and still unique, but it will NOT
+    match the name of a file whose front matter was edited after it was written,
+    because the name was built from the digest the writer recorded at the time.
+
+    A label is qualified with its returns window only when another report shares
+    the unqualified form. Qualifying unconditionally would be worse: the seven
+    unambiguous labels in a real month folder match the leaderboard verbatim,
+    which is how a reader gets from a row to this list at all.
+    """
+    seen_labels: dict[str, int] = {}
+    for record in records:
+        name = label(record)
+        seen_labels[name] = seen_labels.get(name, 0) + 1
+
+    # Not `record.sort_key`, which substitutes `_EPOCH` for a missing timestamp
+    # and so sorts an unreadable one FIRST. Here it must sort last, so a report
+    # whose `saved_at` cannot be read cannot pose as the start of the session.
+    def order(record: ReportRecord) -> tuple[bool, datetime, str]:
+        return (record.saved_at is None, record.saved_at or _EPOCH, record.path.name)
+
+    sources: list[SourceReport] = []
+    for record in sorted(records, key=order):
+        name = label(record)
+        if seen_labels.get(name, 0) > 1 and record.window_months is not None:
+            name = f"{name} {record.window_months}mo"
+        sources.append(
+            SourceReport(
+                digest8=record.stable_digest[:8],
+                digest=record.digest,
+                saved_at=record.saved_at,
+                kind=record.kind or "report",
+                variant=record.variant,
+                label=name,
+                filename=record.path.name,
+            )
+        )
+    return tuple(sources)
+
+
 def build_month_digest(
     records: Sequence[ReportRecord], month: str, skipped: Sequence[str] = ()
 ) -> MonthDigest:
@@ -1179,6 +1268,7 @@ def build_month_digest(
         benchmarks=tuple(sorted(benchmarks.items())),
         commands=tuple(sorted({r.command for r in records if r.command})),
         skipped=tuple(skipped),
+        folder=str(records[0].path.parent) if records else None,
     )
     return MonthDigest(
         scope=scope,
@@ -1189,6 +1279,7 @@ def build_month_digest(
         ledger=_build_ledger(records),
         comparability=_build_comparability(records, partitions),
         sources_digest=sources_digest(records),
+        sources=build_sources(records),
     )
 
 
@@ -1563,7 +1654,32 @@ def render_digest(digest: MonthDigest, prose: Mapping[str, str] | None = None) -
         out += ["", "## What to run next", ""]
         out += paragraph("next_runs")
 
-    out += ["", f"Source reports digest: {digest.sources_digest}"]
+    if digest.sources:
+        out += ["", "## Source reports", ""]
+        out.append(
+            "Every report this briefing was built from. The `report` column is the eight "
+            "characters that name the file, so a row worth following up can be opened."
+        )
+        out += ["", f"All under {scope.folder or 'the month folder'}/ :", ""]
+        out += _table(
+            ["report", "saved", "what", "file"],
+            [
+                [
+                    source.digest8,
+                    source.saved_at.strftime("%H:%M:%SZ") if source.saved_at else "n/a",
+                    source.label,
+                    source.filename,
+                ]
+                for source in digest.sources
+            ],
+        )
+
+    out += [
+        "",
+        f"Digest of this set of {scope.report_count} report(s), which is what a repeated run "
+        f"compares to recognize that it has already summarized them - not the digest of any "
+        f"one file above: {digest.sources_digest}",
+    ]
     return "\n".join(out).rstrip() + "\n"
 
 

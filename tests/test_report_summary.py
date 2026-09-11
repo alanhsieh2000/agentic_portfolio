@@ -891,3 +891,179 @@ def test_an_empty_month_renders_and_compacts_without_raising():
     assert "REPORTS: 0 total" in digest_for_llm(digest)
     # Prose offered for a month with no reports places nothing and does not raise.
     assert render_digest(digest, {"headline": "anything", "next_runs": "- x"})
+
+
+# --------------------------------------------------------------------------
+# The source-reports appendix
+# --------------------------------------------------------------------------
+
+def test_the_source_list_is_ordered_by_when_each_report_was_saved(tmp_path):
+    """Saved order, because that is the order the work happened in.
+
+    The digests are asserted against `saved_at` rather than as literals: these
+    are the fixture's own bodies, so its digests are not the real archive's.
+    """
+    records, notes = _real_month(tmp_path)
+
+    sources = build_month_digest(records, MONTH, notes).sources
+
+    assert len(sources) == 9
+    stamps = [source.saved_at for source in sources]
+    assert stamps == sorted(stamps)
+    assert [s.label for s in sources][:2] == [
+        "portfolio MV-benchmark @0.1225", "portfolio MSR",
+    ]
+
+
+def test_each_source_digest_is_the_first_eight_characters_of_its_filename(tmp_path):
+    """The claim the whole section rests on: the identifier printed beside a
+    portfolio is the token that names its file, so the reader can open it."""
+    records, notes = _real_month(tmp_path)
+
+    for source in build_month_digest(records, MONTH, notes).sources:
+        assert len(source.digest8) == 8
+        assert source.filename.endswith(f"-{source.digest8}.md")
+        assert source.digest.startswith(source.digest8)
+
+
+def test_a_label_shared_by_two_reports_is_qualified_by_its_window(tmp_path):
+    """Four of the nine real reports share a label - the held book and one
+    variant of it are each measured over two windows - so without the
+    qualifier this section could not answer the question it exists for."""
+    records, notes = _real_month(tmp_path)
+
+    sources = build_month_digest(records, MONTH, notes).sources
+    labels = [source.label for source in sources]
+
+    assert "whatif PFFA+VZ 60mo" in labels
+    assert "whatif PFFA+VZ 48mo" in labels
+    assert "whatif PFF+PFFA+VZ (held) 60mo" in labels
+    assert "whatif PFF+PFFA+VZ (held) 48mo" in labels
+    assert len(set(labels)) == len(labels)
+
+
+def test_an_unshared_label_is_left_exactly_as_the_leaderboard_spells_it(tmp_path):
+    records, notes = _real_month(tmp_path)
+    digest = build_month_digest(records, MONTH, notes)
+
+    labels = {source.label for source in digest.sources}
+    leaderboard = {row.label for partition in digest.partitions for row in partition.rows}
+
+    assert "portfolio MSR" in labels
+    assert "portfolio MSR" in leaderboard
+    # Every unqualified source label must be findable in the leaderboard, or a
+    # reader cannot get from a row to this list at all.
+    assert {name for name in labels if not name.endswith("mo")} <= leaderboard
+
+
+def test_a_report_with_no_saved_at_sorts_last_and_prints_n_a(tmp_path):
+    saved = _save_portfolio(tmp_path, "MSR", 2.0207, "2026-09-11T12:43:56Z")
+    _save_portfolio(tmp_path, "GMV", 0.2394, "2026-09-11T12:44:17Z")
+    text = saved.path.read_text(encoding="utf-8")
+    saved.path.write_text(
+        "\n".join(l for l in text.splitlines() if not l.startswith("saved_at:")) + "\n",
+        encoding="utf-8",
+    )
+
+    records, notes = load_month(tmp_path / "output", MONTH)
+    digest = build_month_digest(records, MONTH, notes)
+
+    assert digest.sources[-1].saved_at is None
+    assert digest.sources[-1].label == "portfolio MSR"
+    assert "n/a" in render_digest(digest)
+
+
+def test_the_appendix_names_the_folder_once_and_then_basenames(tmp_path):
+    records, notes = _real_month(tmp_path)
+    digest = build_month_digest(records, MONTH, notes)
+
+    text = render_digest(digest)
+    body = text[text.index("## Source reports"):]
+
+    assert f"All under {tmp_path / 'output' / MONTH}/ :" in body
+    rows = [l for l in body.splitlines() if "-portfolio-" in l or "-whatif-" in l]
+    assert len(rows) == 9
+    assert all("/" not in row for row in rows)
+
+
+def test_the_appendix_lists_every_report_and_not_an_earlier_summary(tmp_path):
+    records, notes = _real_month(tmp_path)
+    save_report(
+        "# Portfolio archive summary - 2026-09\n\nan earlier briefing",
+        _archive(tmp_path, "summary"),
+        {"month": MONTH, "report_count": 9},
+    )
+
+    records, notes = load_month(tmp_path / "output", MONTH)
+    digest = build_month_digest(records, MONTH, notes)
+
+    assert len(digest.sources) == 9
+    assert all("summary" not in source.filename for source in digest.sources)
+    assert all(source.kind in ("portfolio", "whatif") for source in digest.sources)
+
+
+def test_the_trailing_digest_says_it_identifies_the_set_and_not_a_file(tmp_path):
+    records, notes = _real_month(tmp_path)
+    digest = build_month_digest(records, MONTH, notes)
+
+    text = render_digest(digest)
+
+    assert "Digest of this set of 9 report(s)" in text
+    assert "not the digest of any one file above" in text
+    assert digest.sources_digest in text
+
+
+def test_the_llm_facts_sheet_carries_no_report_digests(tmp_path):
+    """The model never sees a digest, and that is a safety property rather than
+    an omission.
+
+    `verify_narrative` in `src/agents/report_summary.py` rejects prose stating a
+    figure absent from this sheet, and it finds figures with a digit-run regex.
+    A hex digest is full of digit runs - `02a118b3` alone would make `02`, `118`
+    and `3` count as supported - so putting nine of them in the sheet would
+    quietly widen the set of numbers the verifier accepts and weaken the one
+    mechanism that stops a small model inventing figures.
+    """
+    records, notes = _real_month(tmp_path)
+    digest = build_month_digest(records, MONTH, notes)
+
+    facts = digest_for_llm(digest)
+
+    for source in digest.sources:
+        assert source.digest8 not in facts
+        assert source.filename not in facts
+
+
+def test_an_empty_month_renders_no_source_reports_section():
+    digest = build_month_digest([], "2026-10", [])
+
+    assert digest.sources == ()
+    assert digest.scope.folder is None
+    assert "## Source reports" not in render_digest(digest)
+
+
+def test_two_reports_that_cannot_be_told_apart_by_window_keep_their_digests(tmp_path):
+    """The documented end of the qualifying rule.
+
+    When two reports share a label and neither records a returns window, there
+    is nothing left to qualify with, so no qualifier is invented - the digest
+    and saved-time columns are what tell them apart. Asserted so the fallback
+    stays a decision rather than becoming a surprise.
+    """
+    from pathlib import Path
+
+    from src.flow.report_summary import ReportRecord, build_sources
+
+    shared = {"kind": "whatif", "variant": "what-if", "positions": "PFFA:1"}
+    first = ReportRecord(
+        path=Path("a.md"), facts={**shared, "saved_at": "2026-09-11T12:00:00Z"}, body="x"
+    )
+    second = ReportRecord(
+        path=Path("b.md"), facts={**shared, "saved_at": "2026-09-11T12:01:00Z"}, body="y"
+    )
+
+    sources = build_sources([first, second])
+
+    assert [s.label for s in sources] == ["whatif PFFA", "whatif PFFA"]
+    assert sources[0].digest8 != sources[1].digest8
+    assert sources[0].saved_at < sources[1].saved_at

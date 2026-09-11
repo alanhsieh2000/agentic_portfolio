@@ -97,6 +97,21 @@ def _summaries(tmp_path):
     return sorted(p for p in folder.glob("*summary*.md")) if folder.is_dir() else []
 
 
+def _restamp(path, saved_at: str) -> None:
+    """Rewrite one saved report's `saved_at` line.
+
+    `save_report` stamps it from the clock to the nearest second, so two files
+    written by one test carry the same time. A test about which of them is newer
+    has to set the times itself.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("saved_at:"):
+            lines[index] = f"saved_at: {saved_at}"
+            break
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _fake_narrative(monkeypatch, narrative=None, replaced=(), raises=None):
     """Patch `generate_narrative` and hand back the list of calls it received."""
     calls: list = []
@@ -421,3 +436,111 @@ def test_provenance_distinguishes_every_way_the_prose_can_be_absent():
     assert "none - 429" in provenance("openai/gpt-5-nano", (), "429 rate limited")
     assert "2 section(s) replaced" in provenance("m", ("a", "b"), None)
     assert "not written by the model" in provenance("m", (), None)
+
+
+def test_the_saved_summary_carries_the_source_reports_section(monkeypatch, tmp_path):
+    """The appendix has to survive the round trip through the archive, because
+    the saved file is the one a reader comes back to days later."""
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch)
+
+    _run(monkeypatch, tmp_path)
+    facts, body = load_report(_summaries(tmp_path)[0])
+
+    assert "## Source reports" in body
+    covered = sorted(
+        p.name for p in (tmp_path / "output" / MONTH).glob("*.md")
+        if "summary" not in p.name
+    )
+    assert len(covered) == 2
+    for name in covered:
+        assert name in body
+    assert facts["report_count"] == "2"
+
+
+def test_no_line_of_the_appendix_looks_like_a_front_matter_fence(monkeypatch, tmp_path, capsys):
+    """A new section is the likeliest thing to break the promise that the body
+    never contains a bare `---`, which would read as a fence to any parser less
+    careful than `load_report`."""
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch)
+
+    _run(monkeypatch, tmp_path, "--stdout")
+    out = capsys.readouterr().out
+
+    assert "## Source reports" in out
+    assert not any(line.strip() == "---" for line in out.splitlines())
+
+
+def test_the_appendix_lets_a_leaderboard_row_be_traced_to_a_file(monkeypatch, tmp_path, capsys):
+    """The whole point of the section, asserted end to end: a label read off the
+    leaderboard appears in the source list beside a filename that exists."""
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch)
+
+    _run(monkeypatch, tmp_path, "--stdout")
+    out = capsys.readouterr().out
+    appendix = out[out.index("## Source reports"):]
+
+    row = next(line for line in appendix.splitlines() if "portfolio MSR" in line)
+    digest8, _saved, *_rest = row.split()
+    filename = row.split()[-1]
+
+    assert len(digest8) == 8
+    assert filename.endswith(f"-{digest8}.md")
+    assert (tmp_path / "output" / MONTH / filename).is_file()
+
+
+def test_after_force_a_repeat_run_names_the_newer_summary(monkeypatch, tmp_path, capsys):
+    """Two summaries can cover one set of reports, and the reader wants the
+    later one.
+
+    `--force` is the way to get a changed briefing format into a saved file, so
+    it leaves two summaries with the same `sources_digest`. Pointing at whichever
+    sorted first by filename would name the older one, because those filenames
+    carry content digests and so carry no order at all.
+
+    The two are restamped an hour apart because `save_report` stamps `saved_at`
+    from the clock to the nearest second, and two summaries written in one test
+    tie - which is the one case where this ordering has nothing to work with.
+    """
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch)
+    _run(monkeypatch, tmp_path)
+    older = _summaries(tmp_path)[0]
+
+    _fake_narrative(monkeypatch, _narrative(headline="A later briefing entirely."))
+    _run(monkeypatch, tmp_path, "--force")
+    newer = next(path for path in _summaries(tmp_path) if path != older)
+    _restamp(older, "2026-09-11T10:00:00Z")
+    _restamp(newer, "2026-09-11T11:00:00Z")
+    capsys.readouterr()
+
+    _run(monkeypatch, tmp_path)
+    out = capsys.readouterr().out
+
+    assert len(_summaries(tmp_path)) == 2
+    assert f"Summary already saved for these 2 reports: {newer}" in out
+    assert str(older) not in out
+
+
+def test_the_older_of_two_summaries_wins_only_if_it_is_actually_newer(
+    monkeypatch, tmp_path, capsys
+):
+    """The mirror of the test above, so it cannot pass by accident: with the
+    timestamps swapped, the OTHER file is the one named."""
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch)
+    _run(monkeypatch, tmp_path)
+    first = _summaries(tmp_path)[0]
+
+    _fake_narrative(monkeypatch, _narrative(headline="A different briefing."))
+    _run(monkeypatch, tmp_path, "--force")
+    second = next(path for path in _summaries(tmp_path) if path != first)
+    _restamp(first, "2026-09-11T11:00:00Z")
+    _restamp(second, "2026-09-11T10:00:00Z")
+    capsys.readouterr()
+
+    _run(monkeypatch, tmp_path)
+
+    assert f"Summary already saved for these 2 reports: {first}" in capsys.readouterr().out

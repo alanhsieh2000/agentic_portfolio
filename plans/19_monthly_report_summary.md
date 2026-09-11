@@ -147,6 +147,18 @@ is the fallback when `OPENAI_API_KEY` is unset.
       `uv run pytest tests/test_*.py --collect-only -q` now reports `1033 tests collected`. The
       runtime FELL, from the 455.73s recorded in `plans/18_saved_report_archive.md`, which is the
       reassuring direction: nothing in the new code reaches the network.
+- [x] (2026-09-11 15:10Z) Milestone 6: the `Source reports` appendix, so a row of the briefing can
+      be traced to the file behind it. `build_sources` and `SourceReport` in
+      `src/flow/report_summary.py`, the rendered section, and the reworded trailing set digest.
+      Added after the feature was in use: see the amendment note at the foot of this file.
+- [x] (2026-09-11 15:25Z) Milestone 6, follow-on found while verifying it: `existing_summary` in
+      `src/flow/summary_cli.py` returned the FIRST matching summary by filename, which after a
+      `--force` run means the older briefing. Now returns the newest by `saved_at`. Evidence in
+      `Surprises & Discoveries`.
+- [x] (2026-09-11 15:30Z) Milestone 6 tests: 16 added in total -
+      `tests/test_report_summary.py` 57 -> 68 and `tests/test_summary_cli.py` 30 -> 35.
+      `uv run pytest tests/test_report_summary.py tests/test_report_summary_agent.py
+      tests/test_summary_cli.py -q` reports 122 passed.
 
 ## Surprises & Discoveries
 
@@ -205,6 +217,25 @@ is the fallback when `OPENAI_API_KEY` is unset.
   but neither the benchmark's volatility nor its Sharpe, and deriving the Sharpe gives
   `(0.1225 - 0.0380) / 0.1481 = 0.5706` where the report prints `0.5704`. `parse_benchmark` reads
   the body line instead.
+
+- Observation: (Milestone 6) `existing_summary` named the WRONG summary once a month had two of
+  them. It returned the first match in filename order, and a summary's filename carries a digest of
+  its own text, which has no chronological meaning at all. So after a `--force` run - the very thing
+  a reader does to pick up a changed briefing format - a later run pointed them back at the
+  superseded file.
+  Evidence: with `473f6f15` saved at `13:58:53Z` and `81849599` at `14:48:43Z`, both covering the
+  same nine reports, `portfolio-summary 2026-09` reported `473f6f15`. It now reports `81849599`.
+  Found only by regenerating the real archive rather than by any test, which is the argument for
+  running a feature against real data after changing it: the bug needed two summaries of one month
+  to exist, and no test had created that situation.
+
+- Observation: (Milestone 6) `save_report` stamps `saved_at` to the nearest second, so two summaries
+  written by one test tie and no ordering can separate them. The tests that are about which summary
+  is newer therefore set the timestamps themselves, and the production tiebreak falls back to the
+  filename - arbitrary but stable.
+  Evidence: the first draft of `test_after_force_a_repeat_run_names_the_newer_summary` failed
+  because both files carried the same `saved_at`, and the test's own `max` and the code's
+  `(saved_at, name)` key broke the tie in opposite directions.
 
 - Observation: on a live call, `openai/gpt-5-nano` wrote grounded prose but produced one suggested
   command containing a figure nobody computed, and `verify_narrative` dropped it. The mechanism
@@ -300,6 +331,48 @@ is the fallback when `OPENAI_API_KEY` is unset.
   Rationale: `save_report` builds the filename from a digest of the body, and the body contains the
   prose, which differs between runs. So the filename cannot answer "have these reports already been
   summarized"; only the fact can. Date/Author: 2026-09-11.
+- Decision: (Milestone 6) The briefing gains a `Source reports` appendix and NOTHING else - no
+  `report` column on the leaderboard, no inline `[digest8]` beside any label.
+  Rationale: the user's explicit choice among three presented options, taken to keep the briefing's
+  body reading exactly as it already did. The cost is recorded here so it is not later rediscovered
+  as a bug: tracing a row to a file is a manual, by-label step, and the two sections most likely to
+  send a reader to the source - the what-if ledger and the window-sensitivity pairs - still name no
+  file. Adding the inline digests later is small, and `SourceReport` is already the data it would
+  need. Date/Author: 2026-09-11.
+- Decision: (Milestone 6) The appendix qualifies a label with its returns window, but only when
+  another report in the month shares the unqualified form.
+  Rationale: load bearing, not cosmetic. In the real `output/2026-09/`, `label()` names a whatif
+  report by its positions, so four of the nine reports collide: the held book appears twice
+  (`3b1de978` at 60 months, `5b860aeb` at 48) and so does one variant of it (`b3e81204`,
+  `6d095826`). A bare appendix would print `whatif PFFA+VZ` twice and answer nothing. Qualifying
+  only where needed keeps the other seven labels matching the leaderboard verbatim, which is how a
+  reader gets from a row into this list at all. Where two reports still collide after qualification
+  - the same positions over the same window, which happens when a book is re-priced - the digest
+  and saved-time columns already tell them apart and no further qualifier is invented.
+  Date/Author: 2026-09-11.
+- Decision: (Milestone 6) The appendix is built from the records, not from `LeaderRow`s, and
+  `LeaderRow.digest` is left alone as documented dead data.
+  Rationale: `_collapse` merges rows sharing a label and figures, keeping only the first digest, so
+  a `LeaderRow` cannot identify its sources. The appendix is a per-file listing and the records are
+  the per-file data. Widening `LeaderRow.digest` to a tuple would be unused code, so `_collapse`'s
+  docstring now warns the next reader not to trust that field instead. Date/Author: 2026-09-11.
+- Decision: (Milestone 6) `Scope.folder` is derived from `records[0].path.parent` rather than
+  threading an `output_dir` argument into `build_month_digest`.
+  Rationale: the records know where they came from, and a new parameter would have touched every
+  existing caller and test for no gain. Date/Author: 2026-09-11.
+- Decision: (Milestone 6) `existing_summary` returns the NEWEST summary matching a source set, not
+  the first by filename.
+  Rationale: a filename here carries a content digest, which is not an order. After `--force` a
+  month legitimately holds two summaries of the same reports, and the one to point a reader at is
+  the later one, because it is the one the current version of the command wrote. Ties at
+  one-second resolution fall back to the filename, which is arbitrary but stable and is the only
+  thing left. Date/Author: 2026-09-11.
+- Decision: (Milestone 6) `digest_for_llm` does NOT carry the source list, and a test enforces it.
+  Rationale: the model has no use for a filename, and - the reason that matters - `verify_narrative`
+  finds figures with the digit-run regex `[0-9][0-9,]*(?:\.[0-9]+)?`, so a hex digest is full of
+  them. `02a118b3` alone would make `02`, `118` and `3` count as supported figures. Nine digests in
+  the facts sheet would quietly widen the set of numbers the verifier accepts and weaken the one
+  mechanism that stops a small model inventing them. Date/Author: 2026-09-11.
 - Decision: A month with fewer than two reports gets no LLM call at all.
   Rationale: the direct analogue of `generate_signal`'s empty-headlines short-circuit at
   `src/agents/llm_f.py:104` - there is nothing to compare, so calling anyway would either waste a
@@ -329,6 +402,14 @@ every figure in it is real. Checking a suggestion against the actual argument pa
 that, and is the obvious next increment; it was not attempted here because the failure is visible
 to anyone who types the command, whereas a wrong Sharpe ratio is not, and the two do not deserve
 the same weight of machinery.
+
+A gap this plan originally shipped and Milestone 6 closed: the briefing named portfolios and the
+archive names files, and nothing connected the two, so a reader who wanted the full report behind a
+leaderboard row had to guess among nine filenames. The `Source reports` appendix now answers that,
+and it needed no new data - every report's front matter already carried the digest whose first
+eight characters `report_filename` builds the filename from. The lesson is that a summary is only
+half a tool if it cannot point back at what it summarized, and that is worth designing in rather
+than discovering from use.
 
 Also left undone on purpose: no cross-month mode, per the scope decided with the user; no `weights`
 front-matter fact, per the `Decision Log`; and no attempt to reconcile `src/agents/llm_f.py`'s
@@ -947,3 +1028,39 @@ In `src/flow/summary_cli.py`, define:
 
 In `pyproject.toml`, add `portfolio-summary = "src.flow.summary_cli:main"` to
 `[project.scripts]`.
+
+
+## Amendment note - 2026-09-11, Milestone 6
+
+**What changed.** A `Source reports` appendix was added to the end of the rendered briefing, listing
+every report it was built from with the eight characters that name that report's file, the time it
+was saved, and what it is. Supporting it: a `SourceReport` dataclass, `build_sources`, a
+`sources` field on `MonthDigest` and a `folder` field on `Scope`, all in
+`src/flow/report_summary.py`; 13 new tests; and a `README.md` sentence. The document's trailing
+`Source reports digest:` line was reworded to say that it identifies the SET of reports rather than
+any one file, because printing it directly beneath a heading called `Source reports` would otherwise
+read as the digest of that section.
+
+**Why.** From use. The briefing succeeded at comparing portfolios and failed at the next thing a
+reader does with it: having picked `whatif CSPX.L+PFFA+VZ` out of the leaderboard, they had no way
+to tell which of the month's files to open. The identifier needed was already in the data and simply
+never printed.
+
+**Why as an amendment rather than `plans/20_*.md`.** `PLANS.md` makes ExecPlans living documents,
+and this is a refinement of a delivered feature rather than a step of its own. Splitting it off
+would have left this plan's `Outcomes & Retrospective` describing a command that no longer matched
+it - and in particular still listing the traceability gap as an open one.
+
+**A bug this amendment found.** Verifying the appendix against the real archive meant regenerating
+it with `--force`, which left `output/2026-09/` holding two summaries of the same nine reports - and
+that revealed `existing_summary` returning the first match by filename, i.e. the older briefing. A
+summary's filename carries a digest of its own text and therefore no order, so the fix is to compare
+`saved_at`. Worth recording how it was found: no test had put two summaries of one month in a folder,
+so only running the thing against real data surfaced it.
+
+**One behaviour worth knowing about, which this amendment exposed rather than introduced.** Repeat
+detection compares the digest of the SET of source reports, not of the briefing text (see the
+`Decision Log`). So a change to the briefing's FORMAT does not invalidate an already-saved summary:
+a month summarized before this amendment still reports `Summary already saved for these 9 reports:`,
+and `--force` is how the new layout reaches a saved file. That is the right trade - the alternative
+writes a new file on every run - but it is not obvious, so `README.md` now says it.
