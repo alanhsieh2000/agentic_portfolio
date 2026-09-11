@@ -159,6 +159,11 @@ is the fallback when `OPENAI_API_KEY` is unset.
       `tests/test_report_summary.py` 57 -> 68 and `tests/test_summary_cli.py` 30 -> 35.
       `uv run pytest tests/test_report_summary.py tests/test_report_summary_agent.py
       tests/test_summary_cli.py -q` reports 122 passed.
+- [x] (2026-09-11 15:50Z) Full suite green on the finished code: `uv run pytest tests/test_*.py`
+      reports `1049 passed, 3 warnings in 422.13s`, and `--collect-only -q` confirms 1049 - the
+      1033 baseline plus the 16 tests of Milestone 6. The runtime fell again, from 443s, so nothing
+      in the appendix reaches the network. Note the earlier 436s/1046 run predates the
+      `existing_summary` fix and is superseded by this one.
 
 ## Surprises & Discoveries
 
