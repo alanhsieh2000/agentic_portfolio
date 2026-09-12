@@ -1,7 +1,7 @@
-"""Tests for src/flow/interactive.py's `edit_candidates`,
+"""Tests for src/agentic_portfolio/flow/interactive.py's `edit_candidates`,
 `validate_and_edit_candidates`, `open_pipeline_session` routing, and
 `run_pipeline`/`run_scan` selection-mode branching, plus
-src/flow/backtest.py's turnover-cost/gross-return/Sharpe-ratio arithmetic.
+src/agentic_portfolio/flow/backtest.py's turnover-cost/gross-return/Sharpe-ratio arithmetic.
 
 The `user_provided` selection's tests monkeypatch `build_live_snapshot`
 (that selection always routes through it, even for a backtest date, so it
@@ -23,7 +23,7 @@ network access too) - and asserting the one `selection` says to skip is,
 via a spy, genuinely never called - not just result-discarded. Live mode
 (any `rebalance_date` outside the stored 2020-2024 window) is not
 exercised here at all: it always makes real Wikipedia/yfinance/SEC EDGAR
-calls by design (see `src/flow/live.py`), verified instead by the real,
+calls by design (see `src/agentic_portfolio/flow/live.py`), verified instead by the real,
 manual runs recorded in `plans/06_interactive_flow.md`.
 """
 
@@ -34,25 +34,25 @@ from unittest.mock import MagicMock
 
 import duckdb
 import pandas as pd
-from src.optimizer.dividends import DividendFloorError
-from src.dataset.ticker_profile import RawTickerProfile
-from src.flow.interactive import (
+from agentic_portfolio.optimizer.dividends import DividendFloorError
+from agentic_portfolio.dataset.ticker_profile import RawTickerProfile
+from agentic_portfolio.flow.interactive import (
     CLAMP_EPSILON,
     CONCENTRATION_THRESHOLD,
     _concentration_note,
     _optimize_clamping_an_unreachable_target,
 )
-from src.optimizer.benchmark import ResolvedObjective
-from src.optimizer.portfolio import (
+from agentic_portfolio.optimizer.benchmark import ResolvedObjective
+from agentic_portfolio.optimizer.portfolio import (
     UnreachableTargetReturnError,
     compute_weights_and_stats,
 )
 import pytest
 
-from src.agents.llm_s_schema import ScreeningRule
-from src.flow.backtest import _gross_return, _turnover_cost, compute_sharpe_ratio
-from src.dataset.ticker_currency import MixedCurrencyPoolError
-from src.flow.interactive import (
+from agentic_portfolio.agents.llm_s_schema import ScreeningRule
+from agentic_portfolio.flow.backtest import _gross_return, _turnover_cost, compute_sharpe_ratio
+from agentic_portfolio.dataset.ticker_currency import MixedCurrencyPoolError
+from agentic_portfolio.flow.interactive import (
     compute_weights_and_allocation,
     edit_candidates,
     open_pipeline_session,
@@ -63,13 +63,13 @@ from src.flow.interactive import (
     run_scan,
     validate_and_edit_candidates,
 )
-from src.flow.live import (
+from agentic_portfolio.flow.live import (
     _init_empty_price_and_returns_tables,
     build_live_snapshot,
     build_scratch_snapshot,
 )
-from src.optimizer.benchmark import BENCHMARK_MIN_MONTHS, BenchmarkSource
-from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
+from agentic_portfolio.optimizer.benchmark import BENCHMARK_MIN_MONTHS, BenchmarkSource
+from agentic_portfolio.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
 # ---------------------------------------------------------------------------
 # edit_candidates
@@ -154,8 +154,8 @@ def test_run_pipeline_llm_s_only_never_calls_llm_f_signal_function(tmp_path, mon
 
     fake_rule = _rule(buy_condition="mom12m > 0.5", sell_condition="mom12m < -0.5")
     screen_month_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.generate_rule", lambda year, model=None, db_path=None: fake_rule)
-    monkeypatch.setattr("src.flow.interactive.screen_month", screen_month_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.generate_rule", lambda year, model=None, db_path=None: fake_rule)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.screen_month", screen_month_spy)
 
     result = run_pipeline(date(2024, 3, 1), "GMV", 1000.0, selection="llm_s_only", db_path=db_path)
 
@@ -172,8 +172,8 @@ def test_run_pipeline_llm_f_only_never_calls_llm_s_rule_generation(tmp_path, mon
 
     fake_signals = pd.DataFrame({"ticker": ["AAA"], "signal": ["buy"]})
     generate_rule_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.generate_rule", generate_rule_spy)
-    monkeypatch.setattr("src.flow.interactive.screen_month", lambda year, month, db_path=None: fake_signals)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.generate_rule", generate_rule_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.screen_month", lambda year, month, db_path=None: fake_signals)
 
     result = run_pipeline(date(2024, 3, 1), "GMV", 1000.0, selection="llm_f_only", db_path=db_path)
 
@@ -190,8 +190,8 @@ def test_run_pipeline_llm_s_and_f_calls_both_agents(tmp_path, monkeypatch):
 
     fake_rule = _rule(buy_condition="mom12m > 0.5", sell_condition="mom12m < -0.5")
     fake_signals = pd.DataFrame({"ticker": ["AAA"], "signal": ["buy"]})
-    monkeypatch.setattr("src.flow.interactive.generate_rule", lambda year, model=None, db_path=None: fake_rule)
-    monkeypatch.setattr("src.flow.interactive.screen_month", lambda year, month, db_path=None: fake_signals)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.generate_rule", lambda year, model=None, db_path=None: fake_rule)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.screen_month", lambda year, month, db_path=None: fake_signals)
 
     result = run_pipeline(date(2024, 3, 1), "GMV", 1000.0, selection="llm_s_and_f", db_path=db_path)
 
@@ -291,7 +291,7 @@ def test_run_pipeline_stats_agree_with_the_flat_weights_key(tmp_path, monkeypatc
     def fake_snapshot(as_of, selection, source_db_path, **_kwargs):
         yield db_path
 
-    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.build_live_snapshot", fake_snapshot)
 
     result = run_pipeline(
         date(2024, 3, 1), "GMV", 1000.0, selection="user_provided", db_path=db_path, candidates=["AAA"]
@@ -310,7 +310,7 @@ def test_run_pipeline_target_return_defaults_and_can_be_overridden(tmp_path, mon
     def fake_snapshot(as_of, selection, source_db_path, **_kwargs):
         yield db_path
 
-    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.build_live_snapshot", fake_snapshot)
 
     defaulted = run_pipeline(
         date(2024, 3, 1), "MV", 1000.0, selection="user_provided", db_path=db_path, candidates=["AAA"]
@@ -338,10 +338,10 @@ def test_run_scan_user_provided_never_calls_either_agent_or_the_scanner(monkeypa
     screen_spy = MagicMock()
     screen_month_spy = MagicMock()
     scan_with_detail_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.generate_rule", generate_rule_spy)
-    monkeypatch.setattr("src.flow.interactive.screen", screen_spy)
-    monkeypatch.setattr("src.flow.interactive.screen_month", screen_month_spy)
-    monkeypatch.setattr("src.flow.interactive.scan_with_detail", scan_with_detail_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.generate_rule", generate_rule_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.screen", screen_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.screen_month", screen_month_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.scan_with_detail", scan_with_detail_spy)
 
     scan = run_scan(date(2026, 9, 5), "user_provided", "unused.duckdb", candidates=["MSFT", "AAPL", "AAPL"])
 
@@ -380,7 +380,7 @@ def test_open_pipeline_session_user_provided_uses_a_snapshot_even_for_a_backtest
         yield "/tmp/fake-snapshot.duckdb"
 
     snapshot_spy = MagicMock(side_effect=fake_snapshot)
-    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", snapshot_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.build_live_snapshot", snapshot_spy)
 
     with open_pipeline_session(date(2024, 3, 1), "user_provided", "data/portfolio.duckdb") as (db_path, mode):
         assert db_path == "/tmp/fake-snapshot.duckdb"
@@ -391,7 +391,7 @@ def test_open_pipeline_session_user_provided_uses_a_snapshot_even_for_a_backtest
 
 def test_open_pipeline_session_backtest_date_still_reads_the_cache_for_other_selections(monkeypatch):
     snapshot_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", snapshot_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.build_live_snapshot", snapshot_spy)
 
     with open_pipeline_session(date(2024, 3, 1), "llm_s_only", "data/portfolio.duckdb") as (db_path, mode):
         assert db_path == "data/portfolio.duckdb"
@@ -402,11 +402,11 @@ def test_open_pipeline_session_backtest_date_still_reads_the_cache_for_other_sel
 
 def _fake_ingest(monkeypatch, valid, invalid, currencies):
     monkeypatch.setattr(
-        "src.flow.interactive.validate_and_ingest_tickers",
+        "agentic_portfolio.flow.interactive.validate_and_ingest_tickers",
         lambda tickers, as_of, db_path: (valid, invalid, currencies),
     )
     monkeypatch.setattr(
-        "src.flow.interactive.load_ticker_currencies",
+        "agentic_portfolio.flow.interactive.load_ticker_currencies",
         lambda tickers, db_path: {t: currencies.get(t, "USD") for t in tickers},
     )
 
@@ -431,9 +431,9 @@ def test_validate_and_edit_candidates_removes_without_validating(monkeypatch):
     trigger one either.
     """
     ingest_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", ingest_spy)
     monkeypatch.setattr(
-        "src.flow.interactive.load_ticker_currencies", lambda tickers, db_path: {"AAPL": "USD"}
+        "agentic_portfolio.flow.interactive.load_ticker_currencies", lambda tickers, db_path: {"AAPL": "USD"}
     )
 
     edit = validate_and_edit_candidates(
@@ -498,9 +498,9 @@ def test_run_pipeline_user_provided_optimizes_the_supplied_candidates(tmp_path, 
 
     generate_rule_spy = MagicMock()
     screen_month_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", fake_snapshot)
-    monkeypatch.setattr("src.flow.interactive.generate_rule", generate_rule_spy)
-    monkeypatch.setattr("src.flow.interactive.screen_month", screen_month_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.build_live_snapshot", fake_snapshot)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.generate_rule", generate_rule_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.screen_month", screen_month_spy)
 
     result = run_pipeline(
         date(2024, 3, 1), "GMV", 1000.0, selection="user_provided", db_path=db_path, candidates=["AAA"]
@@ -515,7 +515,7 @@ def test_run_pipeline_user_provided_optimizes_the_supplied_candidates(tmp_path, 
 
 
 # ---------------------------------------------------------------------------
-# src/flow/backtest.py's turnover-cost / gross-return / Sharpe-ratio arithmetic
+# src/agentic_portfolio/flow/backtest.py's turnover-cost / gross-return / Sharpe-ratio arithmetic
 # ---------------------------------------------------------------------------
 
 
@@ -569,7 +569,7 @@ def test_compute_sharpe_ratio_matches_hand_computed_value():
 
 
 def test_compute_sharpe_ratio_uses_settings_default_risk_free_rate():
-    from src.config.settings import settings
+    from agentic_portfolio.config.settings import settings
 
     net_returns = pd.Series([0.01, 0.02, -0.005])
     expected = (net_returns.mean() - settings.risk_free_rate / 12) / net_returns.std() * (12**0.5)
@@ -628,8 +628,8 @@ def _fake_benchmark_fetch(monkeypatch, scratch_db_path, rows, currency="USD", in
         _insert_returns(db_path, tickers[0], rows)
         return list(tickers), {}, {tickers[0]: currency}
 
-    monkeypatch.setattr("src.flow.interactive.build_scratch_snapshot", fake_scratch)
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fake_ingest)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.build_scratch_snapshot", fake_scratch)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", fake_ingest)
 
 
 def test_prepare_benchmark_reads_existing_returns_without_fetching(tmp_path, monkeypatch):
@@ -639,7 +639,7 @@ def test_prepare_benchmark_reads_existing_returns_without_fetching(tmp_path, mon
     db_path = str(tmp_path / "session.duckdb")
     _build_fixture_db(db_path, include_factors=False)
     ingest_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", ingest_spy)
 
     source = prepare_benchmark("AAA", "USD", date(2024, 3, 1), db_path)
 
@@ -735,7 +735,7 @@ def test_prepare_benchmark_respects_allow_fetch_false(tmp_path, monkeypatch):
     db_path = str(tmp_path / "session.duckdb")
     _build_fixture_db(db_path, include_factors=False)
     ingest_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", ingest_spy)
 
     source = prepare_benchmark("SPY", "USD", date(2024, 3, 1), db_path, allow_fetch=False)
 
@@ -784,7 +784,7 @@ def test_run_pipeline_against_without_a_benchmark_source_reports_none(tmp_path):
 
 
 def test_build_scratch_snapshot_yields_empty_tables_and_always_deletes_the_file():
-    """`src/flow/live.py`'s scratch database: usable immediately by the
+    """`src/agentic_portfolio/flow/live.py`'s scratch database: usable immediately by the
     ingestion path, and gone afterwards even when the body raises.
     """
     with build_scratch_snapshot() as db_path:
@@ -830,22 +830,22 @@ def _patch_snapshot_builds(monkeypatch, dividends_raises: Exception | None = Non
             raise dividends_raises
         return None
 
-    monkeypatch.setattr("src.flow.live.write_membership_table", lambda *a, **k: None)
-    monkeypatch.setattr("src.flow.live.build_price_history", lambda *a, **k: calls.append("prices"))
-    monkeypatch.setattr("src.flow.live.build_factors", lambda *a, **k: calls.append("factors"))
+    monkeypatch.setattr("agentic_portfolio.flow.live.write_membership_table", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.live.build_price_history", lambda *a, **k: calls.append("prices"))
+    monkeypatch.setattr("agentic_portfolio.flow.live.build_factors", lambda *a, **k: calls.append("factors"))
     monkeypatch.setattr(
-        "src.flow.live.build_momentum_factors", lambda *a, **k: calls.append("momentum")
+        "agentic_portfolio.flow.live.build_momentum_factors", lambda *a, **k: calls.append("momentum")
     )
-    monkeypatch.setattr("src.flow.live.build_returns", lambda *a, **k: calls.append("returns"))
-    monkeypatch.setattr("src.flow.live.build_dividends", dividends)
+    monkeypatch.setattr("agentic_portfolio.flow.live.build_returns", lambda *a, **k: calls.append("returns"))
+    monkeypatch.setattr("agentic_portfolio.flow.live.build_dividends", dividends)
     monkeypatch.setattr(
-        "src.flow.live.fetch_and_normalize_membership",
+        "agentic_portfolio.flow.live.fetch_and_normalize_membership",
         lambda *a, **k: (pd.DataFrame({"ticker": ["AAA"], "company": ["A"]}), pd.DataFrame()),
     )
-    monkeypatch.setattr("src.flow.live.apply_changes_asof", lambda cur, ch, d: cur)
+    monkeypatch.setattr("agentic_portfolio.flow.live.apply_changes_asof", lambda cur, ch, d: cur)
     # Timestamps, not dates: `_causal_masking_date` calls `.date()` on them.
     monkeypatch.setattr(
-        "src.flow.live.compute_rebalance_dates",
+        "agentic_portfolio.flow.live.compute_rebalance_dates",
         lambda *a, **k: [pd.Timestamp("2025-12-01")],
     )
     return calls
@@ -861,7 +861,7 @@ def test_build_live_snapshot_builds_dividends_for_every_screened_selection(
     it, because the snapshot is discarded when the run ends.
     """
     calls = _patch_snapshot_builds(monkeypatch)
-    monkeypatch.setattr("src.flow.live._copy_news_archive", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.live._copy_news_archive", lambda *a, **k: None)
 
     with build_live_snapshot(date(2026, 9, 8), selection, "data/portfolio.duckdb"):
         pass
@@ -936,7 +936,7 @@ def test_open_pipeline_session_passes_the_dividend_fetch_choice_to_the_snapshot(
         seen["allow"] = allow_dividend_fetch
         yield "snapshot.duckdb"
 
-    monkeypatch.setattr("src.flow.interactive.build_live_snapshot", snapshot_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.build_live_snapshot", snapshot_spy)
 
     with open_pipeline_session(
         date(2026, 9, 8), "llm_s_only", "data/portfolio.duckdb", allow_dividend_fetch=False
@@ -952,18 +952,18 @@ def test_compute_weights_and_allocation_can_skip_consulting_dividends(monkeypatc
     first, not imply a lookup that never happened.
     """
     figures_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.load_dividend_figures", figures_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.load_dividend_figures", figures_spy)
     stats_spy = MagicMock(return_value=_stats_stub())
-    monkeypatch.setattr("src.flow.interactive.compute_weights_and_stats", stats_spy)
-    monkeypatch.setattr("src.flow.interactive._require_single_currency", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.compute_weights_and_stats", stats_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive._require_single_currency", lambda *a, **k: None)
     monkeypatch.setattr(
-        "src.flow.interactive.load_returns_matrix",
+        "agentic_portfolio.flow.interactive.load_returns_matrix",
         lambda *a, **k: pd.DataFrame({"AAA": [0.01] * 24}),
     )
     monkeypatch.setattr(
-        "src.flow.interactive.load_latest_prices", lambda *a, **k: pd.Series({"AAA": 10.0})
+        "agentic_portfolio.flow.interactive.load_latest_prices", lambda *a, **k: pd.Series({"AAA": 10.0})
     )
-    monkeypatch.setattr("src.flow.interactive.allocate_shares", lambda *a, **k: ({}, 0.0))
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.allocate_shares", lambda *a, **k: ({}, 0.0))
 
     compute_weights_and_allocation(
         ["AAA"], "GMV", 1000.0, date(2026, 9, 8), "db.duckdb", consult_dividends=False
@@ -999,19 +999,19 @@ def test_run_pipeline_against_reports_an_unsatisfiable_request_and_keeps_the_sca
             },
         }
 
-    monkeypatch.setattr("src.flow.interactive.run_scan", scan)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.run_scan", scan)
     # The pipeline now loads the matrix itself, to know the window the
     # benchmark has to be measured over.
     monkeypatch.setattr(
-        "src.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
+        "agentic_portfolio.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
     )
-    monkeypatch.setattr("src.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
     monkeypatch.setattr(
-        "src.flow.interactive.compute_weights_and_allocation",
+        "agentic_portfolio.flow.interactive.compute_weights_and_allocation",
         MagicMock(side_effect=DividendFloorError("floor 0.0300 is unreachable")),
     )
     benchmark_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.benchmark_stats_for_window", benchmark_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.benchmark_stats_for_window", benchmark_spy)
 
     result = run_pipeline_against(
         date(2026, 9, 8), "MV", 100000.0, "llm_s_only", "db.duckdb", "live"
@@ -1033,11 +1033,11 @@ def test_run_pipeline_against_reports_an_unsatisfiable_request_and_keeps_the_sca
 def test_run_pipeline_against_marks_a_satisfiable_run_as_unsatisfiable_none(monkeypatch):
     """So a caller reads one field either way rather than probing for a key."""
     monkeypatch.setattr(
-        "src.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
+        "agentic_portfolio.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
     )
-    monkeypatch.setattr("src.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
     monkeypatch.setattr(
-        "src.flow.interactive.run_scan",
+        "agentic_portfolio.flow.interactive.run_scan",
         lambda *a, **k: {
             "rule": None, "llm_s_signals": None, "llm_f_signals": None,
             "scan_detail": {"branch": "b", "buy_s_size": 1, "buy_f_size": 0,
@@ -1048,10 +1048,10 @@ def test_run_pipeline_against_marks_a_satisfiable_run_as_unsatisfiable_none(monk
     stats.returns_window_start = date(2021, 9, 1)
     stats.returns_window_end = date(2026, 9, 1)
     monkeypatch.setattr(
-        "src.flow.interactive.compute_weights_and_allocation",
+        "agentic_portfolio.flow.interactive.compute_weights_and_allocation",
         lambda *a, **k: (stats, ({}, 0.0)),
     )
-    monkeypatch.setattr("src.flow.interactive.benchmark_stats_for_window", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.benchmark_stats_for_window", lambda *a, **k: None)
 
     result = run_pipeline_against(
         date(2026, 9, 8), "GMV", 100000.0, "llm_s_only", "db.duckdb", "live"
@@ -1066,11 +1066,11 @@ def test_run_pipeline_against_still_raises_anything_that_is_not_unsatisfiable(mo
     keep escaping.
     """
     monkeypatch.setattr(
-        "src.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
+        "agentic_portfolio.flow.interactive.load_returns_matrix", lambda *a, **k: _income_matrix()
     )
-    monkeypatch.setattr("src.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive._benchmark_over_matrix", lambda *a, **k: None)
     monkeypatch.setattr(
-        "src.flow.interactive.run_scan",
+        "agentic_portfolio.flow.interactive.run_scan",
         lambda *a, **k: {
             "rule": None, "llm_s_signals": None, "llm_f_signals": None,
             "scan_detail": {"branch": "b", "buy_s_size": 1, "buy_f_size": 0,
@@ -1078,7 +1078,7 @@ def test_run_pipeline_against_still_raises_anything_that_is_not_unsatisfiable(mo
         },
     )
     monkeypatch.setattr(
-        "src.flow.interactive.compute_weights_and_allocation",
+        "agentic_portfolio.flow.interactive.compute_weights_and_allocation",
         MagicMock(side_effect=ValueError("objective must be one of ...")),
     )
 
@@ -1112,13 +1112,13 @@ def test_a_derived_target_is_clamped_to_what_the_pool_can_reach(monkeypatch, tmp
     matrix = _income_matrix()
     ceiling = max(compute_weights_and_stats(matrix, "GMV").expected_returns.values())
 
-    monkeypatch.setattr("src.flow.interactive._require_single_currency", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive._require_single_currency", lambda *a, **k: None)
     monkeypatch.setattr(
-        "src.flow.interactive.load_latest_prices",
+        "agentic_portfolio.flow.interactive.load_latest_prices",
         lambda tickers, **k: pd.Series({t: 100.0 for t in tickers}),
     )
-    monkeypatch.setattr("src.flow.interactive.allocate_shares", lambda *a, **k: ({}, 0.0))
-    monkeypatch.setattr("src.flow.interactive.load_dividend_figures", lambda *a, **k: ({}, {}, {}, {}))
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.allocate_shares", lambda *a, **k: ({}, 0.0))
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.load_dividend_figures", lambda *a, **k: ({}, {}, {}, {}))
 
     stats, _alloc, resolved = _optimize_clamping_an_unreachable_target(
         ["STEADY", "SWINGY"], _resolved(0.90), 100000.0, date(2026, 9, 8), db,
@@ -1156,8 +1156,8 @@ def test_a_target_the_user_typed_is_never_clamped(monkeypatch, tmp_path):
     """Silently moving a number somebody chose would be worse than telling
     them it cannot be met - which `origin` is what distinguishes.
     """
-    monkeypatch.setattr("src.flow.interactive._require_single_currency", lambda *a, **k: None)
-    monkeypatch.setattr("src.flow.interactive.load_dividend_figures", lambda *a, **k: ({}, {}, {}, {}))
+    monkeypatch.setattr("agentic_portfolio.flow.interactive._require_single_currency", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.load_dividend_figures", lambda *a, **k: ({}, {}, {}, {}))
 
     with pytest.raises(UnreachableTargetReturnError):
         _optimize_clamping_an_unreachable_target(
@@ -1237,7 +1237,7 @@ def _fake_profile_fetch(monkeypatch, quote_type: str = "ETF") -> MagicMock:
             fund_data_reason="no fund data in this test",
         )
     )
-    monkeypatch.setattr("src.flow.interactive.fetch_ticker_profile", spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.fetch_ticker_profile", spy)
     return spy
 
 
@@ -1251,7 +1251,7 @@ def test_prepare_ticker_summary_reads_a_pool_ticker_from_the_session_database(
     _insert_returns(db_path, "AAA", _bench_months(36))
     _fake_profile_fetch(monkeypatch)
     ingest_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", ingest_spy)
 
     summary = prepare_ticker_summary(
         "AAA", date(2024, 3, 1), ["AAA"], db_path, rates_path=None
@@ -1382,7 +1382,7 @@ def test_prepare_ticker_summary_with_fetching_disabled_neither_fetches_nor_inges
     _insert_returns(db_path, "AAA", _bench_months(36))
     fetch_spy = _fake_profile_fetch(monkeypatch)
     ingest_spy = MagicMock()
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", ingest_spy)
 
     summary = prepare_ticker_summary(
         "SPY", date(2024, 3, 1), ["AAA"], db_path, rates_path=None, allow_fetch=False

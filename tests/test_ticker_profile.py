@@ -1,4 +1,4 @@
-"""Tests for `src/dataset/ticker_profile.py`.
+"""Tests for `src/agentic_portfolio/dataset/ticker_profile.py`.
 
 Per `AGENTS.md` no test here calls Yahoo Finance. The fixtures below are
 literal excerpts of real responses captured live from yfinance 1.5.2 on
@@ -6,7 +6,7 @@ literal excerpts of real responses captured live from yfinance 1.5.2 on
 to the keys this module reads plus the ones it must be proven NOT to read.
 
 The unit traps these tests exist to pin are documented in
-`src/dataset/ticker_profile.py`'s docstring: `info` reports the same expense
+`src/agentic_portfolio/dataset/ticker_profile.py`'s docstring: `info` reports the same expense
 ratio as `1.01` that `fundProfile` reports as `0.0101`, the same YTD return
 as `24.96513` that `fundPerformance` reports as `0.2496513`, and a
 `dividendYield` whose unit differs between tickers. Every one of those keys
@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.dataset.ticker_profile import (
+from agentic_portfolio.dataset.ticker_profile import (
     INFO_FETCH_FAILED_REASON,
     RawTickerProfile,
     build_ticker_profile,
@@ -312,7 +312,7 @@ def test_no_yield_is_ever_read_from_yahoo():
     """`info["dividendYield"]` is a percentage for AMLP, SPY and MSFT but a
     fraction for AVB. Nothing in a `TickerProfile` may come from it, or from
     `info["yield"]`; the summary's yield is computed by
-    `src/optimizer/ticker_stats.py` from dividend history this project
+    `src/agentic_portfolio/optimizer/ticker_stats.py` from dividend history this project
     downloaded itself.
     """
     for ticker, raw in (("AMLP", _amlp_raw()), ("AVB", _avb_raw())):
@@ -421,9 +421,9 @@ def test_fetch_ticker_profile_translates_dotted_share_class_symbols(monkeypatch)
     price fetch applies - so the description belongs to the very series that
     was priced."""
     ticker_spy = MagicMock(return_value=MagicMock(info={"quoteType": "EQUITY"}))
-    monkeypatch.setattr("src.dataset.ticker_profile.yf.Ticker", ticker_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.ticker_profile.yf.Ticker", ticker_spy)
     monkeypatch.setattr(
-        "src.dataset.ticker_profile._fetch_fund_modules", lambda symbol: (None, None, "no")
+        "agentic_portfolio.dataset.ticker_profile._fetch_fund_modules", lambda symbol: (None, None, "no")
     )
 
     raw = fetch_ticker_profile("BRK.B", pause_seconds=0.0)
@@ -437,9 +437,9 @@ def test_fetch_ticker_profile_never_raises_when_the_info_request_fails(monkeypat
     def boom(symbol):
         raise RuntimeError("rate limited")
 
-    monkeypatch.setattr("src.dataset.ticker_profile.yf.Ticker", boom)
+    monkeypatch.setattr("agentic_portfolio.dataset.ticker_profile.yf.Ticker", boom)
     monkeypatch.setattr(
-        "src.dataset.ticker_profile._fetch_fund_modules", lambda symbol: (None, None, None)
+        "agentic_portfolio.dataset.ticker_profile._fetch_fund_modules", lambda symbol: (None, None, None)
     )
 
     raw = fetch_ticker_profile("AMLP", pause_seconds=0.0)
@@ -452,7 +452,7 @@ def test_fetch_ticker_profile_still_reads_info_when_the_fund_request_fails(monke
     """Every company share fails the fund request, so one failing must never
     cost the other."""
     monkeypatch.setattr(
-        "src.dataset.ticker_profile.yf.Ticker",
+        "agentic_portfolio.dataset.ticker_profile.yf.Ticker",
         lambda symbol: MagicMock(info=dict(_AVB_INFO)),
     )
 
@@ -468,7 +468,7 @@ def test_the_fund_module_fetch_reports_a_reason_rather_than_raising(monkeypatch)
     """`_fetch_fund_modules` imports the non-public `yfinance.data.YfData`
     inside itself, so even that module disappearing is just another reason
     string - it must never break the profile's identity fields."""
-    import src.dataset.ticker_profile as module
+    import agentic_portfolio.dataset.ticker_profile as module
 
     def boom(*args, **kwargs):
         raise ImportError("no module named yfinance.data")

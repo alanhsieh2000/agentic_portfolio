@@ -1,0 +1,39 @@
+# Deny everything, then allow only what the build needs.
+#
+# The leading `*` is the whole point of this file's shape. A new file at the repository root
+# - a scratch script, a second .env, a colleague's notebook - is excluded by DEFAULT and can
+# only enter the build context by someone deliberately adding it below. An allowlist of
+# denials cannot give that property: it protects only against the files someone thought of.
+#
+# Second, independent barrier: the Dockerfile never uses `COPY . .`. Every COPY names an
+# explicit path. So a mistake in this file alone cannot leak anything into an image; it would
+# take two independent mistakes.
+#
+# What this keeps out, specifically, and why it matters: `.env` holds live API keys;
+# `memory/portfolio.json` holds the author's actual stock holdings and share counts;
+# `memory/candidates.json` and `memory/rates.json` hold their candidate pools and remembered
+# rates; `output/` holds their generated portfolio reports; `data/holdings.duckdb` is a price
+# cache for only the tickers they personally own. None of that belongs in a published image.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!NOTICE
+!src/
+!docker/
+
+# data/ must be un-ignored for Docker to traverse into it, then its contents re-denied, so
+# that exactly one file can be re-admitted by name. `portfolio.duckdb` is market data and is
+# the bundled dataset. `holdings.duckdb` is personal (see above). `news_archive_source.parquet`
+# is 9.2 MB whose contents are already materialized into the news table inside
+# `portfolio.duckdb`, so shipping it would waste space for nothing.
+!data/
+data/*
+!data/portfolio.duckdb
+
+# Re-deny build artifacts inside otherwise-allowed directories.
+**/__pycache__/
+**/*.pyc
+**/*.pyo

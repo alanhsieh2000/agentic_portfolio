@@ -1,4 +1,4 @@
-"""Tests for src/dataset/holdings_cache.py: the monthly staleness rule that
+"""Tests for src/agentic_portfolio/dataset/holdings_cache.py: the monthly staleness rule that
 decides when a held ticker's prices are refetched, and the refresh that
 touches only the tickers a report actually asked about.
 
@@ -20,7 +20,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.dataset.holdings_cache import (
+from agentic_portfolio.dataset.holdings_cache import (
     cached_month_ends,
     latest_expected_rebalance_date,
     refresh_holdings_cache,
@@ -90,7 +90,7 @@ def _stub_fetch(monkeypatch, currencies: dict[str, str] | None = None) -> list[l
             con.close()
         return sorted(tickers), {}, {t: (currencies or {}).get(t, "USD") for t in tickers}
 
-    monkeypatch.setattr("src.dataset.holdings_cache.validate_and_ingest_tickers", fake)
+    monkeypatch.setattr("agentic_portfolio.dataset.holdings_cache.validate_and_ingest_tickers", fake)
     return fetched
 
 
@@ -120,7 +120,7 @@ def test_the_expected_month_uses_the_same_grid_the_returns_table_was_written_on(
     that can never look fresh, so this is pinned against the function that
     wrote the rows.
     """
-    from src.dataset.membership import compute_rebalance_dates
+    from agentic_portfolio.dataset.membership import compute_rebalance_dates
 
     as_of = date(2026, 2, 20)
     expected = compute_rebalance_dates("2026-02-01", as_of.isoformat())[-1].date()
@@ -208,7 +208,7 @@ def test_force_makes_every_requested_ticker_stale(tmp_path, monkeypatch):
 
 
 def test_a_null_monthly_return_does_not_count_as_cached(tmp_path):
-    """`src/dataset/returns.py` writes a full month-by-ticker cross product,
+    """`src/agentic_portfolio/dataset/returns.py` writes a full month-by-ticker cross product,
     so a row can exist with a null return. Counting that as coverage would
     make the cache look fresh while holding nothing usable.
     """

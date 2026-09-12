@@ -1,6 +1,6 @@
 """Tests for the merge-write (upsert) layer added for the `user_provided`
-selection: src/dataset/prices.py's `upsert_prices_tables` /
-`fetch_and_reshape_for_tickers` and src/dataset/returns.py's
+selection: src/agentic_portfolio/dataset/prices.py's `upsert_prices_tables` /
+`fetch_and_reshape_for_tickers` and src/agentic_portfolio/dataset/returns.py's
 `upsert_returns_table` / `build_returns_for_tickers`.
 
 Unlike `tests/test_dataset.py` (pure in-memory fixtures), these functions
@@ -15,13 +15,13 @@ from unittest.mock import MagicMock
 import duckdb
 import pandas as pd
 
-from src.dataset.prices import (
+from agentic_portfolio.dataset.prices import (
     fetch_and_reshape_for_tickers,
     upsert_prices_tables,
     write_prices_tables,
 )
-from src.dataset.returns import build_returns_for_tickers, upsert_returns_table
-from src.dataset.ticker_currency import load_ticker_currencies, upsert_ticker_currency_table
+from agentic_portfolio.dataset.returns import build_returns_for_tickers, upsert_returns_table
+from agentic_portfolio.dataset.ticker_currency import load_ticker_currencies, upsert_ticker_currency_table
 
 # ---------------------------------------------------------------------------
 # upsert_prices_tables
@@ -216,7 +216,7 @@ def test_fetch_and_reshape_for_tickers_delegates_to_existing_primitives(monkeypa
     )
     raw.columns = pd.MultiIndex.from_tuples(raw.columns)
     fetch_spy = MagicMock(return_value=raw)
-    monkeypatch.setattr("src.dataset.prices.fetch_price_history", fetch_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.prices.fetch_price_history", fetch_spy)
 
     long_prices, unresolved = fetch_and_reshape_for_tickers(["AAPL", "GHOST"], "2021-04-05", "2026-09-10")
 
@@ -239,7 +239,7 @@ def test_fetch_and_reshape_for_tickers_translates_dotted_share_class_symbols(mon
     )
     raw.columns = pd.MultiIndex.from_tuples(raw.columns)
     fetch_spy = MagicMock(return_value=raw)
-    monkeypatch.setattr("src.dataset.prices.fetch_price_history", fetch_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.prices.fetch_price_history", fetch_spy)
 
     long_prices, unresolved = fetch_and_reshape_for_tickers(["BRK.B"], "2021-04-05", "2026-09-10")
 

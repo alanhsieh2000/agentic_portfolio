@@ -1,4 +1,4 @@
-"""Tests for src/flow/candidate_memory.py's memory/candidates.json
+"""Tests for src/agentic_portfolio/flow/candidate_memory.py's memory/candidates.json
 read/write round trip, including the per-currency pools it holds, each
 pool's optional benchmark ticker, and the migration of the old single-pool
 file shape.
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from src.flow.candidate_memory import (
+from agentic_portfolio.flow.candidate_memory import (
     load_all_pools,
     load_candidate_benchmark,
     load_candidate_pool,

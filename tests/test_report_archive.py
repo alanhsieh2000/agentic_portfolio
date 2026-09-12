@@ -1,4 +1,4 @@
-"""Tests for `src/flow/report_archive.py`, the archive that stores each
+"""Tests for `src/agentic_portfolio/flow/report_archive.py`, the archive that stores each
 printed portfolio report under `output/<YYYY-MM>/`.
 
 Per `AGENTS.md` these are hermetic: nothing here touches Yahoo Finance, no
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from src.flow.report_archive import (
+from agentic_portfolio.flow.report_archive import (
     FRONT_MATTER_FENCE,
     command_line,
     ReportArchive,

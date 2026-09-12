@@ -1,4 +1,4 @@
-"""Tests for src/flow/cli.py's two interactive loops - the `user_provided`
+"""Tests for src/agentic_portfolio/flow/cli.py's two interactive loops - the `user_provided`
 selection's candidate-confirmation loop and the shared post-run edit loop.
 
 These loops are thin `input()` shells over logic tested elsewhere
@@ -23,12 +23,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
-from src.dataset.ticker_profile import RawTickerProfile, TickerProfile
-from src.optimizer.benchmark import ResolvedObjective
-from src.optimizer.ticker_stats import TickerStats
+from agentic_portfolio.dataset.ticker_profile import RawTickerProfile, TickerProfile
+from agentic_portfolio.optimizer.benchmark import ResolvedObjective
+from agentic_portfolio.optimizer.ticker_stats import TickerStats
 import pytest
 
-from src.flow.cli import (
+from agentic_portfolio.flow.cli import (
     _choose_pool_to_resume,
     _resolve_mixed_persisted_pool,
     _run_edit_loop,
@@ -47,19 +47,19 @@ from src.flow.cli import (
     print_weights_and_allocation,
     print_pipeline_result,
 )
-from src.config.settings import settings
-from src.optimizer.benchmark import BenchmarkSource, BenchmarkStats
-from src.optimizer.dividends import DividendFloor, DividendFloorError
-from src.flow.backtest import compute_sharpe_ratio
-from src.flow.report_archive import ReportArchive, load_report
-from src.flow.rate_memory import (
+from agentic_portfolio.config.settings import settings
+from agentic_portfolio.optimizer.benchmark import BenchmarkSource, BenchmarkStats
+from agentic_portfolio.optimizer.dividends import DividendFloor, DividendFloorError
+from agentic_portfolio.flow.backtest import compute_sharpe_ratio
+from agentic_portfolio.flow.report_archive import ReportArchive, load_report
+from agentic_portfolio.flow.rate_memory import (
     DEFAULT_RATES_PATH,
     load_all_risk_free_rates,
     load_risk_free_rate,
     save_risk_free_rate,
 )
-from src.optimizer.holdings import unavailable_holdings
-from src.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
+from agentic_portfolio.optimizer.holdings import unavailable_holdings
+from agentic_portfolio.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats
 
 REBALANCE_DATE = date(2026, 9, 5)
 
@@ -87,12 +87,12 @@ def _fake_ingestion(
         good = [t for t in cleaned if t not in bad]
         return good, bad, {t: (currencies or {}).get(t, "USD") for t in good}
 
-    monkeypatch.setattr("src.flow.cli.validate_and_ingest_tickers", fake)
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fake)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.validate_and_ingest_tickers", fake)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", fake)
     # `validate_and_edit_candidates` re-derives the pool currency from the
     # database after a removal; there is none in these tests.
     monkeypatch.setattr(
-        "src.flow.interactive.load_ticker_currencies",
+        "agentic_portfolio.flow.interactive.load_ticker_currencies",
         lambda tickers, db_path: {t: (currencies or {}).get(t, "USD") for t in tickers},
     )
 
@@ -105,7 +105,7 @@ def _fake_ingestion(
 def test_confirm_loop_add_then_done_persists_pool_once(monkeypatch):
     _fake_ingestion(monkeypatch)
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "a", "AAPL MSFT", "d")
 
     pool, _currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
@@ -117,7 +117,7 @@ def test_confirm_loop_add_then_done_persists_pool_once(monkeypatch):
 
 def test_confirm_loop_reports_bad_ticker_and_still_adds_the_good_ones(monkeypatch, capsys):
     _fake_ingestion(monkeypatch, invalid={"ZZZZ"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL ZZZZ", "d")
 
     pool, _currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
@@ -131,7 +131,7 @@ def test_confirm_loop_reports_bad_ticker_and_still_adds_the_good_ones(monkeypatc
 def test_confirm_loop_rejects_finishing_with_an_empty_pool(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "d", "a", "AAPL", "d")
 
     pool, _currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
@@ -143,7 +143,7 @@ def test_confirm_loop_rejects_finishing_with_an_empty_pool(monkeypatch, capsys):
 
 def test_confirm_loop_shows_the_persisted_pool_and_can_remove_from_it(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "", "r", "MSFT", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -156,7 +156,7 @@ def test_confirm_loop_shows_the_persisted_pool_and_can_remove_from_it(monkeypatc
 
 def test_confirm_loop_names_a_removal_that_was_not_in_the_pool(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "", "r", "GHOST", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -168,7 +168,7 @@ def test_confirm_loop_names_a_removal_that_was_not_in_the_pool(monkeypatch, caps
 
 def test_confirm_loop_refuses_an_edit_that_would_empty_the_pool(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "", "r", "AAPL", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -180,7 +180,7 @@ def test_confirm_loop_refuses_an_edit_that_would_empty_the_pool(monkeypatch, cap
 
 def test_confirm_loop_drops_a_saved_ticker_that_no_longer_resolves(monkeypatch, capsys):
     _fake_ingestion(monkeypatch, invalid={"DEAD"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -193,7 +193,7 @@ def test_confirm_loop_drops_a_saved_ticker_that_no_longer_resolves(monkeypatch, 
 
 def test_confirm_loop_reprompts_on_an_unrecognized_choice(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "", "x", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -206,7 +206,7 @@ def test_confirm_loop_reprompts_on_an_unrecognized_choice(monkeypatch, capsys):
 def test_confirm_loop_blank_input_confirms_the_pool(monkeypatch):
     _fake_ingestion(monkeypatch)
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "", "")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -223,7 +223,7 @@ def test_confirm_loop_first_ticker_establishes_the_pool_currency_and_refuses_oth
     from a yen pool, by name, with the reason, and the pool is untouched.
     """
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "7203.T", "a", "AAPL", "d")
 
     pool, currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
@@ -242,7 +242,7 @@ def test_confirm_loop_currency_is_established_by_what_was_typed_first(monkeypatc
     even though '7203.T' sorts ahead of 'AAPL'.
     """
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL 7203.T", "d")
 
     pool, currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
@@ -255,7 +255,7 @@ def test_confirm_loop_currency_is_established_by_what_was_typed_first(monkeypatc
 def test_confirm_loop_same_line_partial_accept_across_currencies(monkeypatch, capsys):
     """A refused ticker never blocks a good one typed beside it."""
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY", "6758.T": "JPY"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "7203.T", "a", "AAPL 6758.T", "d")
 
     pool, currency = _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
@@ -273,7 +273,7 @@ def test_confirm_loop_reports_a_mixed_persisted_pool_and_asks_which_to_keep(monk
     """
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "", "JPY", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -294,7 +294,7 @@ def test_confirm_loop_reports_a_mixed_persisted_pool_and_asks_which_to_keep(monk
 
 def test_confirm_loop_reprompts_on_an_unrecognized_currency_choice(monkeypatch, capsys):
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "", "EUR", "USD", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -374,7 +374,7 @@ def test_confirm_loop_resumes_a_chosen_pool_and_saves_it_under_its_own_currency(
     """
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY", "6758.T": "JPY"})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "JPY", "a", "6758.T", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -444,15 +444,15 @@ def stub_optimizer(monkeypatch):
     Returns the spy so a test can assert what the loop asked to recompute.
     """
     spy = MagicMock(return_value=(_stats(), ({}, 0.0)))
-    monkeypatch.setattr("src.flow.cli.compute_weights_and_allocation", spy)
-    monkeypatch.setattr("src.flow.cli.print_weights_and_allocation", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.compute_weights_and_allocation", spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_weights_and_allocation", lambda *args, **kwargs: None)
     return spy
 
 
 def test_run_edit_loop_user_provided_persists_each_accepted_edit(monkeypatch, stub_optimizer):
     _fake_ingestion(monkeypatch)
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "a", "NVDA", "r", "AAPL", "f")
 
     _run_edit_loop(
@@ -468,7 +468,7 @@ def test_run_edit_loop_user_provided_persists_each_accepted_edit(monkeypatch, st
 def test_run_edit_loop_user_provided_validates_added_tickers(monkeypatch, stub_optimizer, capsys):
     _fake_ingestion(monkeypatch, invalid={"ZZZZ"})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "a", "NVDA ZZZZ", "f")
 
     _run_edit_loop(
@@ -486,9 +486,9 @@ def test_run_edit_loop_non_user_provided_never_touches_candidate_memory(monkeypa
     """
     ingest_spy = MagicMock()
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.validate_and_ingest_tickers", ingest_spy)
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", ingest_spy)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.validate_and_ingest_tickers", ingest_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", ingest_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "a", "NVDA", "f")
 
     _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb", selection="llm_s_only")
@@ -503,7 +503,7 @@ def test_run_edit_loop_keeps_previous_list_when_an_edit_would_empty_it(monkeypat
     """
     _fake_ingestion(monkeypatch)
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "r", "AAPL", "r", "GHOST", "f")
 
     _run_edit_loop(
@@ -621,8 +621,8 @@ def test_run_edit_loop_an_unoptimizable_edit_is_reverted_instead_of_ending_the_s
             raise ValueError("target_return must be lower than the maximum possible return")
         return _stats(), ({}, 0.0)
 
-    monkeypatch.setattr("src.flow.cli.compute_weights_and_allocation", fake_optimizer)
-    monkeypatch.setattr("src.flow.cli.print_weights_and_allocation", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.compute_weights_and_allocation", fake_optimizer)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_weights_and_allocation", lambda *args, **kwargs: None)
     # The refused target, then an unrelated edit that recomputes without
     # naming a target - so the value it carries is whatever survived.
     _script(monkeypatch, "t", "0.99", "o", "GMV", "f")
@@ -641,12 +641,12 @@ def test_run_edit_loop_an_unoptimizable_edit_is_never_persisted(monkeypatch, cap
     """
     _fake_ingestion(monkeypatch)
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     monkeypatch.setattr(
-        "src.flow.cli.compute_weights_and_allocation",
+        "agentic_portfolio.flow.cli.compute_weights_and_allocation",
         MagicMock(side_effect=ValueError("no solution")),
     )
-    monkeypatch.setattr("src.flow.cli.print_weights_and_allocation", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_weights_and_allocation", lambda *args, **kwargs: None)
     _script(monkeypatch, "a", "NVDA", "f")
 
     _run_edit_loop(
@@ -693,7 +693,7 @@ def test_run_edit_loop_refuses_a_cross_currency_add_and_does_not_persist(
 ):
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "a", "AAPL", "f")
 
     _run_edit_loop(
@@ -714,11 +714,11 @@ def test_run_edit_loop_passes_the_currency_into_every_recompute(monkeypatch, stu
     """
     printed: list[str] = []
     monkeypatch.setattr(
-        "src.flow.cli.print_weights_and_allocation",
+        "agentic_portfolio.flow.cli.print_weights_and_allocation",
         lambda stats, allocation, objective, currency=None, **kwargs: printed.append(currency),
     )
     _fake_ingestion(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "r", "MSFT", "f")
 
     _run_edit_loop(
@@ -752,7 +752,7 @@ def test_print_weights_and_allocation_defaults_to_usd(capsys):
 
 
 def test_format_money_falls_back_to_the_iso_code_alone():
-    from src.flow.cli import format_money
+    from agentic_portfolio.flow.cli import format_money
 
     assert format_money(5.0, "SGD") == "5.00 SGD"
     assert format_money(1234.5, "USD") == "$1,234.50 USD"
@@ -793,30 +793,30 @@ def _stub_main_pipeline(monkeypatch) -> tuple[MagicMock, MagicMock, MagicMock]:
     pipeline_spy = MagicMock(return_value={"scan_detail": {"candidates": ["AAPL"]}})
     edit_spy = MagicMock()
     benchmark_spy = MagicMock(return_value=_benchmark_source("SPY"))
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", fake_session)
-    monkeypatch.setattr("src.flow.cli.run_pipeline_against", pipeline_spy)
-    monkeypatch.setattr("src.flow.cli.print_pipeline_result", lambda result, **kwargs: None)
-    monkeypatch.setattr("src.flow.cli._run_edit_loop", edit_spy)
-    monkeypatch.setattr("src.flow.cli._settle_benchmark", benchmark_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", fake_session)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.run_pipeline_against", pipeline_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_pipeline_result", lambda result, **kwargs: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli._run_edit_loop", edit_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli._settle_benchmark", benchmark_spy)
     monkeypatch.setattr(
-        "src.flow.cli.prepare_holdings",
+        "agentic_portfolio.flow.cli.prepare_holdings",
         MagicMock(return_value=unavailable_holdings("USD", {}, 0.02, "stubbed")),
     )
-    monkeypatch.setattr("src.flow.cli.load_portfolio", MagicMock(return_value={}))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_portfolio", MagicMock(return_value={}))
     # The rate memory is stubbed for the same reason `load_portfolio` is: left
     # real, these tests would read - and, for any run passing
     # `--risk-free-rate`, WRITE - the developer's own `memory/rates.json`,
     # passing on a clean checkout and failing on a machine that has ever
     # remembered a rate. The tests that exercise the file itself use
     # `_rates_argv` instead, which points a real path into `tmp_path`.
-    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", MagicMock(return_value=None))
-    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", MagicMock(return_value=True))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_risk_free_rate", MagicMock(return_value=None))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_risk_free_rate", MagicMock(return_value=True))
     # And `load_all_pools`, for the third time the same reason: a
     # `--selection user_provided` test would otherwise read the developer's
     # own `memory/candidates.json` and be shown - or asked about - whatever
     # pools happen to be saved there. The tests that exercise the pool
     # listing itself pass their own dict to the confirm loop directly.
-    monkeypatch.setattr("src.flow.cli.load_all_pools", MagicMock(return_value={}))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_all_pools", MagicMock(return_value={}))
     return pipeline_spy, edit_spy, benchmark_spy
 
 
@@ -826,7 +826,7 @@ def _stub_main_confirm_loop(monkeypatch, pool=None, currency="USD") -> MagicMock
     driving the interactive add/remove loop or touching Yahoo Finance.
     """
     confirm_spy = MagicMock(return_value=(pool or ["AAPL"], currency))
-    monkeypatch.setattr("src.flow.cli._run_user_provided_confirm_loop", confirm_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli._run_user_provided_confirm_loop", confirm_spy)
     return confirm_spy
 
 
@@ -851,8 +851,8 @@ def _stub_main_holdings(monkeypatch, positions=None) -> MagicMock:
     holdings_spy = MagicMock(
         return_value=unavailable_holdings("USD", positions or {}, 0.02, "stubbed")
     )
-    monkeypatch.setattr("src.flow.cli.prepare_holdings", holdings_spy)
-    monkeypatch.setattr("src.flow.cli.load_portfolio", MagicMock(return_value=positions or {}))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.prepare_holdings", holdings_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_portfolio", MagicMock(return_value=positions or {}))
     return holdings_spy
 
 
@@ -925,7 +925,7 @@ def test_run_edit_loop_carries_the_risk_free_rate_into_every_recompute(monkeypat
     --risk-free-rate would apply to the initial run only.
     """
     _fake_ingestion(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "NVDA", "f")
 
     _run_edit_loop(
@@ -978,7 +978,7 @@ def _fake_benchmark_prepare(monkeypatch, outcomes: dict[str, str | None]) -> Mag
             ticker, currency, outcomes.get(ticker, f"{ticker} is unknown to this stub")
         )
     )
-    monkeypatch.setattr("src.flow.cli.prepare_benchmark", spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.prepare_benchmark", spy)
     return spy
 
 
@@ -1062,8 +1062,8 @@ def test_choose_pool_to_resume_shows_each_pools_benchmark(monkeypatch, capsys):
 def test_settle_benchmark_takes_the_currency_default_without_asking(monkeypatch):
     prepare_spy = _fake_benchmark_prepare(monkeypatch, {"SPY": None})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
-    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_candidate_benchmark", lambda path, currency: None)
     _script(monkeypatch)  # any input() call would raise StopIteration
 
     source = _settle_benchmark(
@@ -1077,8 +1077,8 @@ def test_settle_benchmark_takes_the_currency_default_without_asking(monkeypatch)
 
 def test_settle_benchmark_prefers_what_the_pool_recorded(monkeypatch):
     _fake_benchmark_prepare(monkeypatch, {"VOO": None})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: "VOO")
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_candidate_benchmark", lambda path, currency: "VOO")
 
     source = _settle_benchmark(
         ["AAPL"], "USD", REBALANCE_DATE, "session.duckdb", pool_memory_path="mem.json"
@@ -1090,8 +1090,8 @@ def test_settle_benchmark_prefers_what_the_pool_recorded(monkeypatch):
 def test_settle_benchmark_persists_an_explicit_override(monkeypatch):
     _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
-    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_candidate_benchmark", lambda path, currency: None)
 
     _settle_benchmark(
         ["AAPL"], "USD", REBALANCE_DATE, "session.duckdb",
@@ -1105,8 +1105,8 @@ def test_settle_benchmark_persists_an_explicit_override(monkeypatch):
 def test_settle_benchmark_does_not_persist_an_override_that_was_refused(monkeypatch):
     _fake_benchmark_prepare(monkeypatch, {"QQQ": "QQQ trades in USD but this portfolio is JPY"})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
-    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_candidate_benchmark", lambda path, currency: None)
 
     source = _settle_benchmark(
         ["7203.T"], "JPY", REBALANCE_DATE, "session.duckdb",
@@ -1120,8 +1120,8 @@ def test_settle_benchmark_does_not_persist_an_override_that_was_refused(monkeypa
 def test_settle_benchmark_asks_when_the_currency_has_no_default(monkeypatch, capsys):
     _fake_benchmark_prepare(monkeypatch, {"1306.T": None})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
-    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_candidate_benchmark", lambda path, currency: None)
     _script(monkeypatch, "1306.t")
 
     source = _settle_benchmark(
@@ -1140,8 +1140,8 @@ def test_settle_benchmark_refuses_a_wrong_currency_answer_and_asks_again(monkeyp
         monkeypatch,
         {"SPY": "SPY trades in USD but this portfolio is JPY", "1306.T": None},
     )
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_candidate_benchmark", lambda path, currency: None)
     _script(monkeypatch, "SPY", "1306.T")
 
     source = _settle_benchmark(
@@ -1156,8 +1156,8 @@ def test_settle_benchmark_refuses_a_wrong_currency_answer_and_asks_again(monkeyp
 def test_settle_benchmark_skips_on_a_blank_answer(monkeypatch):
     prepare_spy = _fake_benchmark_prepare(monkeypatch, {})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
-    monkeypatch.setattr("src.flow.cli.load_candidate_benchmark", lambda path, currency: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_candidate_benchmark", lambda path, currency: None)
     _script(monkeypatch, "")
 
     _settle_benchmark(
@@ -1203,11 +1203,11 @@ def test_run_edit_loop_reprints_the_benchmark_after_every_edit(monkeypatch, stub
     """
     printed: list[object] = []
     monkeypatch.setattr(
-        "src.flow.cli.print_weights_and_allocation",
+        "agentic_portfolio.flow.cli.print_weights_and_allocation",
         lambda *args, benchmark=None, **kwargs: printed.append(benchmark),
     )
     _fake_ingestion(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "NVDA", "r", "NVDA", "f")
 
     _run_edit_loop(
@@ -1222,11 +1222,11 @@ def test_run_edit_loop_reprints_the_benchmark_after_every_edit(monkeypatch, stub
 def test_run_edit_loop_can_change_the_benchmark(monkeypatch, stub_optimizer, capsys):
     printed: list[object] = []
     monkeypatch.setattr(
-        "src.flow.cli.print_weights_and_allocation",
+        "agentic_portfolio.flow.cli.print_weights_and_allocation",
         lambda *args, benchmark=None, **kwargs: printed.append(benchmark),
     )
     _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "b", "QQQ", "f")
 
     _run_edit_loop(
@@ -1246,11 +1246,11 @@ def test_run_edit_loop_keeps_the_previous_benchmark_when_a_new_one_fails(
     """
     printed: list[object] = []
     monkeypatch.setattr(
-        "src.flow.cli.print_weights_and_allocation",
+        "agentic_portfolio.flow.cli.print_weights_and_allocation",
         lambda *args, benchmark=None, **kwargs: printed.append(benchmark),
     )
     _fake_benchmark_prepare(monkeypatch, {"ZZZZ": "no price data found"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "b", "ZZZZ", "", "f")
 
     _run_edit_loop(
@@ -1265,7 +1265,7 @@ def test_run_edit_loop_keeps_the_previous_benchmark_when_a_new_one_fails(
 def test_run_edit_loop_persists_a_changed_benchmark_for_user_provided(monkeypatch, stub_optimizer):
     _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "b", "QQQ", "f")
 
     _run_edit_loop(
@@ -1281,7 +1281,7 @@ def test_run_edit_loop_persists_a_changed_benchmark_for_user_provided(monkeypatc
 def test_run_edit_loop_non_user_provided_never_persists_a_benchmark(monkeypatch, stub_optimizer):
     _fake_benchmark_prepare(monkeypatch, {"QQQ": None})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "b", "QQQ", "f")
 
     _run_edit_loop(
@@ -1476,8 +1476,8 @@ def test_main_threads_one_resolved_rate_into_all_three_report_blocks(monkeypatch
 
 def test_main_remembers_a_rate_given_on_the_command_line(monkeypatch, tmp_path, capsys):
     _stub_main_pipeline(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
-    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_risk_free_rate", save_risk_free_rate)
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
 
     main()
@@ -1498,9 +1498,9 @@ def test_main_writes_the_rate_to_the_given_rates_path_and_not_the_default(monkey
     prevent, so it must not do it either.
     """
     _stub_main_pipeline(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_risk_free_rate", load_risk_free_rate)
     save_spy = MagicMock(return_value=True)
-    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_risk_free_rate", save_spy)
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
 
     main()
@@ -1511,7 +1511,7 @@ def test_main_writes_the_rate_to_the_given_rates_path_and_not_the_default(monkey
 
 def test_main_applies_a_remembered_rate_when_the_flag_is_left_out(monkeypatch, tmp_path):
     pipeline_spy, _edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_risk_free_rate", load_risk_free_rate)
     save_risk_free_rate(0.0425, path=str(tmp_path / "rates.json"), currency="USD")
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path))
 
@@ -1525,9 +1525,9 @@ def test_main_does_not_rewrite_a_rate_it_merely_inherited(monkeypatch, tmp_path)
     rate must not restamp its `updated_at`.
     """
     _stub_main_pipeline(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_risk_free_rate", load_risk_free_rate)
     save_spy = MagicMock(return_value=True)
-    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_risk_free_rate", save_spy)
     save_risk_free_rate(0.0425, path=str(tmp_path / "rates.json"), currency="USD")
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path))
 
@@ -1541,7 +1541,7 @@ def test_main_refuses_a_nan_rate_before_opening_a_session(monkeypatch, tmp_path,
     refused before that cost is paid, not after.
     """
     session_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session_spy)
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "nan"))
 
     with pytest.raises(SystemExit) as excinfo:
@@ -1557,7 +1557,7 @@ def test_main_refuses_a_mistyped_percentage_rate_before_opening_a_session(
     monkeypatch, tmp_path, capsys
 ):
     session_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session_spy)
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "4.5"))
 
     with pytest.raises(SystemExit) as excinfo:
@@ -1574,10 +1574,10 @@ def test_main_does_not_remember_a_rate_when_the_run_never_produced_a_report(monk
     pins for the candidate pool.
     """
     _pipeline_spy, _edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
-    monkeypatch.setattr("src.flow.cli.save_risk_free_rate", save_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_risk_free_rate", save_risk_free_rate)
     monkeypatch.setattr(
-        "src.flow.cli.run_pipeline_against",
+        "agentic_portfolio.flow.cli.run_pipeline_against",
         MagicMock(side_effect=ValueError("at least one of the assets must have an expected return")),
     )
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.05"))
@@ -1591,8 +1591,8 @@ def test_main_does_not_remember_a_rate_when_the_run_never_produced_a_report(monk
 def test_main_reports_which_source_the_rate_came_from(monkeypatch, tmp_path):
     print_spy = MagicMock()
     _stub_main_pipeline(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.print_pipeline_result", print_spy)
-    monkeypatch.setattr("src.flow.cli.load_risk_free_rate", load_risk_free_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_pipeline_result", print_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_risk_free_rate", load_risk_free_rate)
     save_risk_free_rate(0.005, path=str(tmp_path / "rates.json"), currency="USD")
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path))
 
@@ -1618,7 +1618,7 @@ def test_main_carries_the_rates_origin_into_the_edit_loop(monkeypatch, tmp_path)
 
 def test_run_edit_loop_reprints_the_rates_origin_on_every_recompute(monkeypatch, stub_optimizer):
     print_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.print_weights_and_allocation", print_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_weights_and_allocation", print_spy)
     _script(monkeypatch, "a", "NVDA", "f")
 
     _run_edit_loop(
@@ -1630,7 +1630,7 @@ def test_run_edit_loop_reprints_the_rates_origin_on_every_recompute(monkeypatch,
 
 
 def test_a_remembered_rate_never_reaches_the_backtest_sharpe_ratio(tmp_path):
-    """`src/flow/backtest.py` produces the figure this project compares
+    """`src/agentic_portfolio/flow/backtest.py` produces the figure this project compares
     against the paper's published 0.6324 baseline. A per-currency rate must
     not move it.
     """
@@ -1653,7 +1653,7 @@ def test_main_names_the_rates_source_in_the_holdings_block_too(monkeypatch, tmp_
     _stub_main_pipeline(monkeypatch)
     _stub_main_holdings(monkeypatch, {"SPY": 1000.0})
     print_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.print_user_portfolio", print_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_user_portfolio", print_spy)
     monkeypatch.setattr("sys.argv", _rates_argv(tmp_path, "--risk-free-rate", "0.045"))
 
     main()
@@ -1736,7 +1736,7 @@ def test_confirm_loop_with_an_override_refuses_a_foreign_ticker_on_the_first_add
     immediately rather than establishing a dollar pool.
     """
     _fake_ingestion(monkeypatch, currencies={"AAPL": "USD"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "d")
 
     with pytest.raises(StopIteration):
@@ -1753,7 +1753,7 @@ def test_confirm_loop_with_an_override_refuses_a_foreign_ticker_on_the_first_add
 def test_confirm_loop_with_an_override_saves_under_that_currency(monkeypatch):
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
     save_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", save_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", save_spy)
     _script(monkeypatch, "a", "7203.T", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -1766,8 +1766,8 @@ def test_confirm_loop_with_an_override_saves_under_that_currency(monkeypatch):
 
 def test_confirm_loop_with_an_override_resumes_that_pool_without_prompting(monkeypatch):
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    monkeypatch.setattr("src.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
     _script(monkeypatch, "d")  # only the [d]one answer; no resume prompt to answer
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -1789,8 +1789,8 @@ def test_a_mixed_pool_with_an_override_keeps_that_group_without_prompting(monkey
     first would still leave a scripted run waiting here.
     """
     _fake_ingestion(monkeypatch, currencies={"AAPL": "USD", "7203.T": "JPY"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    monkeypatch.setattr("src.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
     _script(monkeypatch, "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -1837,8 +1837,8 @@ def test_a_resumed_pool_that_now_prices_elsewhere_reports_the_disagreement(monke
     Tokyo really is JPY now - but the override losing must not be silent.
     """
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
-    monkeypatch.setattr("src.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.load_pool_benchmarks", MagicMock(return_value={}))
     _script(monkeypatch, "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -1908,7 +1908,7 @@ def test_main_refuses_a_currency_for_an_agent_driven_selection(monkeypatch, tmp_
     JPY - the silent contradiction this codebase refuses everywhere else.
     """
     session_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session_spy)
     monkeypatch.setattr(
         "sys.argv",
         _rates_argv(tmp_path, "--selection", "llm_s_only", "--currency", "JPY"),
@@ -1930,7 +1930,7 @@ def test_an_add_that_refuses_everything_does_not_forget_the_override(monkeypatch
     currency can be settled before the pool is non-empty.
     """
     _fake_ingestion(monkeypatch, currencies={"AAPL": "USD", "SPY": "USD"})
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "a", "SPY", "d")
 
     with pytest.raises(StopIteration):
@@ -2233,8 +2233,8 @@ def test_run_edit_loop_an_unreachable_dividend_floor_reverts_instead_of_ending_t
             raise DividendFloorError("the highest-yielding candidate is T at 0.0397")
         return _dividend_stats(), ({}, 0.0)
 
-    monkeypatch.setattr("src.flow.cli.compute_weights_and_allocation", fake_optimizer)
-    monkeypatch.setattr("src.flow.cli.print_weights_and_allocation", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.compute_weights_and_allocation", fake_optimizer)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_weights_and_allocation", lambda *a, **k: None)
     # A floor the VALIDATOR accepts (it is under MAX_DIVIDEND_YIELD) but this
     # pool cannot reach, then an unrelated edit whose recompute shows what
     # actually survived the revert. A floor the validator would refuse never
@@ -2308,7 +2308,7 @@ def test_settle_dividend_floor_refuses_both_flags_rather_than_reconciling_them()
 def _split_context(
     ex_date=date(2025, 12, 29), ratio=4.0, payments=((date(2025, 9, 29), 5.5), (date(2026, 3, 30), 5.5))
 ):
-    from src.dataset.dividends import SplitContext
+    from agentic_portfolio.dataset.dividends import SplitContext
 
     return SplitContext(splits=[(ex_date, ratio)], payments=list(payments))
 
@@ -2349,7 +2349,7 @@ def test_format_split_restatement_names_only_a_payment_the_split_restated():
 
 
 def test_format_split_restatement_covers_two_splits_in_one_window():
-    from src.dataset.dividends import SplitContext
+    from agentic_portfolio.dataset.dividends import SplitContext
 
     line = format_split_restatement(
         {
@@ -2381,8 +2381,8 @@ def test_format_stale_share_counts_warns_and_prints_a_runnable_command(tmp_path)
     thousands separators would not parse, so a suggestion that has to be
     edited first is no suggestion at all.
     """
-    from src.dataset.dividends import write_dividends_tables, coverage_frame
-    from src.flow.user_portfolio import save_portfolio
+    from agentic_portfolio.dataset.dividends import write_dividends_tables, coverage_frame
+    from agentic_portfolio.flow.user_portfolio import save_portfolio
 
     portfolio = str(tmp_path / "p.json")
     save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
@@ -2411,8 +2411,8 @@ def test_format_stale_share_counts_warns_and_prints_a_runnable_command(tmp_path)
 
 
 def test_format_stale_share_counts_is_silent_when_the_count_postdates_the_split(tmp_path):
-    from src.dataset.dividends import write_dividends_tables, coverage_frame
-    from src.flow.user_portfolio import save_portfolio
+    from agentic_portfolio.dataset.dividends import write_dividends_tables, coverage_frame
+    from agentic_portfolio.flow.user_portfolio import save_portfolio
 
     portfolio = str(tmp_path / "p.json")
     save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
@@ -2433,7 +2433,7 @@ def test_format_stale_share_counts_is_silent_without_a_splits_table(tmp_path):
     """A database predating the splits table must change no existing
     output.
     """
-    from src.flow.user_portfolio import save_portfolio
+    from agentic_portfolio.flow.user_portfolio import save_portfolio
 
     portfolio = str(tmp_path / "p.json")
     save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
@@ -2463,7 +2463,7 @@ def test_main_refuses_no_dividend_fetch_alongside_a_dividend_floor(
     which is a poor way to learn you typed two incompatible flags.
     """
     session_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session_spy)
     monkeypatch.setattr(
         "sys.argv",
         ["portfolio", "--date", "today", "--objective", "GMV", "--value", "100000",
@@ -2498,10 +2498,10 @@ def test_main_threads_the_dividend_fetch_choice_into_the_session_and_the_pipelin
             "currency": "USD", "benchmark": None,
         }
 
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
-    monkeypatch.setattr("src.flow.cli.run_pipeline_against", pipeline)
-    monkeypatch.setattr("src.flow.cli.print_pipeline_result", lambda *a, **k: None)
-    monkeypatch.setattr("src.flow.cli._run_edit_loop", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.run_pipeline_against", pipeline)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.print_pipeline_result", lambda *a, **k: None)
+    monkeypatch.setattr("agentic_portfolio.flow.cli._run_edit_loop", lambda *a, **k: None)
     monkeypatch.setattr(
         "sys.argv",
         ["portfolio", "--date", "today", "--objective", "GMV", "--value", "100000",
@@ -2593,15 +2593,15 @@ def _patch_main_for_unsatisfiable(monkeypatch, error, loop_return):
         seen["candidates"] = candidates
         return loop_return
 
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session)
     monkeypatch.setattr(
-        "src.flow.cli.run_pipeline_against", lambda *a, **k: _unsatisfiable_result(error)
+        "agentic_portfolio.flow.cli.run_pipeline_against", lambda *a, **k: _unsatisfiable_result(error)
     )
-    monkeypatch.setattr("src.flow.cli._run_edit_loop", loop)
+    monkeypatch.setattr("agentic_portfolio.flow.cli._run_edit_loop", loop)
     remember_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli._remember_risk_free_rate", remember_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli._remember_risk_free_rate", remember_spy)
     holdings_spy = MagicMock()
-    monkeypatch.setattr("src.flow.cli.prepare_holdings", holdings_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.prepare_holdings", holdings_spy)
     seen["remember"] = remember_spy
     seen["holdings"] = holdings_spy
     monkeypatch.setattr(
@@ -2670,9 +2670,9 @@ def test_main_still_propagates_an_error_that_is_not_an_unsatisfiable_request(mon
     def session(*_a, **_k):
         yield "session.duckdb", "live"
 
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session)
     monkeypatch.setattr(
-        "src.flow.cli.run_pipeline_against",
+        "agentic_portfolio.flow.cli.run_pipeline_against",
         MagicMock(side_effect=RuntimeError("a real bug")),
     )
     monkeypatch.setattr(
@@ -2725,9 +2725,9 @@ def test_main_no_longer_requires_an_objective(monkeypatch):
             "concentration_note": None,
         }
 
-    monkeypatch.setattr("src.flow.cli.open_pipeline_session", session)
-    monkeypatch.setattr("src.flow.cli.run_pipeline_against", pipeline)
-    monkeypatch.setattr("src.flow.cli._run_edit_loop", lambda *a, **k: True)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.open_pipeline_session", session)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.run_pipeline_against", pipeline)
+    monkeypatch.setattr("agentic_portfolio.flow.cli._run_edit_loop", lambda *a, **k: True)
     monkeypatch.setattr(
         "sys.argv",
         ["portfolio", "--date", "today", "--value", "100000", "--benchmark", "none",
@@ -2795,7 +2795,7 @@ def test_print_pipeline_result_prints_the_concentration_note(capsys):
 # The block these tests pin is printed inside an interactive loop, so its
 # conventions matter more than usual: every ratio is a four-decimal fraction
 # (Yahoo publishes several of the same figures as percentages - see
-# `src/dataset/ticker_profile.py`), and each half of the block fails
+# `src/agentic_portfolio/dataset/ticker_profile.py`), and each half of the block fails
 # independently of the other.
 
 
@@ -3047,9 +3047,9 @@ def _fake_summary_sources(monkeypatch, stats: TickerStats | None = None) -> Magi
             fund_data_reason="no fund data in this test",
         )
     )
-    monkeypatch.setattr("src.flow.interactive.fetch_ticker_profile", fetch_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.fetch_ticker_profile", fetch_spy)
     monkeypatch.setattr(
-        "src.flow.interactive.ticker_stats",
+        "agentic_portfolio.flow.interactive.ticker_stats",
         lambda ticker, as_of, db_path, **kw: (stats or _ticker_stats_fixture(ticker=ticker)),
     )
     return fetch_spy
@@ -3060,7 +3060,7 @@ def test_confirm_loop_summary_choice_prints_a_block_without_changing_the_pool(
 ):
     _fake_ingestion(monkeypatch)
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     prompts = _script_recording(monkeypatch, "a", "AAPL", "s", "AAPL", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -3083,7 +3083,7 @@ def test_confirm_loop_summary_of_a_ticker_outside_the_pool_leaves_the_pool_alone
     """
     _fake_ingestion(monkeypatch)
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "s", "AMLP", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -3111,14 +3111,14 @@ def test_a_summary_only_ticker_is_never_ingested_into_the_session_database(monke
         cleaned = sorted({t.strip().upper() for t in tickers if t.strip()})
         return cleaned, {}, {t: "USD" for t in cleaned}
 
-    monkeypatch.setattr("src.flow.cli.validate_and_ingest_tickers", fake_ingest)
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fake_ingest)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.validate_and_ingest_tickers", fake_ingest)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", fake_ingest)
     monkeypatch.setattr(
-        "src.flow.interactive.load_ticker_currencies",
+        "agentic_portfolio.flow.interactive.load_ticker_currencies",
         lambda tickers, db_path: {t: "USD" for t in tickers},
     )
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "s", "AMLP", "d")
 
     _run_user_provided_confirm_loop({}, REBALANCE_DATE, "session.duckdb", memory_path="mem.json")
@@ -3133,7 +3133,7 @@ def test_a_summary_only_ticker_is_never_ingested_into_the_session_database(monke
 def test_confirm_loop_summary_of_an_unresolvable_symbol_reports_it_by_name(monkeypatch, capsys):
     _fake_ingestion(monkeypatch, invalid={"ZZZZQQQ"})
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "s", "ZZZZQQQ", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -3149,7 +3149,7 @@ def test_confirm_loop_summary_of_an_unresolvable_symbol_reports_it_by_name(monke
 def test_confirm_loop_summary_with_no_ticker_typed_says_so_and_carries_on(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "s", "", "d")
 
     pool, _currency = _run_user_provided_confirm_loop(
@@ -3166,7 +3166,7 @@ def test_a_ticker_in_another_currency_can_be_summarized_though_an_add_would_refu
     """Looking is always allowed; only joining a pool is gated on currency."""
     _fake_ingestion(monkeypatch, currencies={"7203.T": "JPY"})
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "s", "7203.T", "a", "7203.T", "d")
 
     pool, currency = _run_user_provided_confirm_loop(
@@ -3183,7 +3183,7 @@ def test_a_ticker_in_another_currency_can_be_summarized_though_an_add_would_refu
 def test_confirm_loop_summarizes_every_added_ticker_in_typed_order(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "MSFT AAPL", "d")
 
     _run_user_provided_confirm_loop(
@@ -3199,7 +3199,7 @@ def test_no_ticker_summary_suppresses_the_automatic_half_but_not_the_choice(
 ):
     _fake_ingestion(monkeypatch)
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "s", "AAPL", "d")
 
     _run_user_provided_confirm_loop(
@@ -3217,7 +3217,7 @@ def test_a_summarized_profile_is_fetched_once_per_session(monkeypatch):
     per-session cache makes re-reading one free."""
     _fake_ingestion(monkeypatch)
     fetch_spy = _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "s", "AAPL", "s", "AAPL", "d")
     cache = {}
 
@@ -3233,15 +3233,15 @@ def test_a_summarized_profile_is_fetched_once_per_session(monkeypatch):
 def test_a_yahoo_failure_still_prints_this_projects_own_figures(monkeypatch, capsys):
     _fake_ingestion(monkeypatch)
     monkeypatch.setattr(
-        "src.flow.interactive.ticker_stats",
+        "agentic_portfolio.flow.interactive.ticker_stats",
         lambda ticker, as_of, db_path, **kw: _ticker_stats_fixture(ticker=ticker),
     )
 
     def boom(ticker, **kw):
         raise RuntimeError("rate limited")
 
-    monkeypatch.setattr("src.flow.interactive.fetch_ticker_profile", boom)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.fetch_ticker_profile", boom)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "a", "AAPL", "d")
 
     _run_user_provided_confirm_loop(
@@ -3288,7 +3288,7 @@ def test_edit_loop_summary_choice_prints_a_block_without_recomputing(
 ):
     _fake_ingestion(monkeypatch)
     _fake_summary_sources(monkeypatch)
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     prompts = _script_recording(monkeypatch, "s", "AAPL", "f")
 
     printed_a_report = _run_edit_loop(
@@ -3314,7 +3314,7 @@ def test_edit_loop_summary_uses_the_rate_the_session_already_settled_on(
     _fake_summary_sources(
         monkeypatch, stats=_ticker_stats_fixture(ticker="AAPL", risk_free_rate=0.005)
     )
-    monkeypatch.setattr("src.flow.cli.save_candidate_pool", MagicMock())
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
     _script(monkeypatch, "s", "AAPL", "f")
 
     _run_edit_loop(
@@ -3331,7 +3331,7 @@ def test_edit_loop_summary_uses_the_rate_the_session_already_settled_on(
 #
 # The archive itself - digests, filenames, front matter, deduplication - is
 # tested in tests/test_report_archive.py. What is tested here is only what
-# `src/flow/cli.py` is responsible for: which section of the report is
+# `src/agentic_portfolio/flow/cli.py` is responsible for: which section of the report is
 # archived, which facts reach it, that the two flags arrive, and that the
 # interactive edit loop keeps archiving after the initial report. Every test
 # points the archive at `tmp_path`; note that `tests/conftest.py` also
@@ -3499,7 +3499,7 @@ def test_main_builds_the_archive_from_its_flags(monkeypatch, tmp_path):
     seen = {}
     _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
-        "src.flow.cli.print_pipeline_result",
+        "agentic_portfolio.flow.cli.print_pipeline_result",
         lambda result, **kwargs: seen.update(kwargs),
     )
     monkeypatch.setattr(
@@ -3523,7 +3523,7 @@ def test_main_disables_the_archive_with_no_save_reports(monkeypatch):
     seen = {}
     _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
-        "src.flow.cli.print_pipeline_result",
+        "agentic_portfolio.flow.cli.print_pipeline_result",
         lambda result, **kwargs: seen.update(kwargs),
     )
     monkeypatch.setattr(
@@ -3544,7 +3544,7 @@ def test_main_passes_one_archive_to_both_the_report_and_the_edit_loop(monkeypatc
     seen = {}
     _pipeline_spy, edit_spy, _benchmark_spy = _stub_main_pipeline(monkeypatch)
     monkeypatch.setattr(
-        "src.flow.cli.print_pipeline_result",
+        "agentic_portfolio.flow.cli.print_pipeline_result",
         lambda result, **kwargs: seen.update(kwargs),
     )
     monkeypatch.setattr(
@@ -3568,7 +3568,7 @@ def _stub_optimizer_that_prints(monkeypatch, stats_by_objective):
     def recompute(candidates, objective, *args, **kwargs):
         return stats_by_objective[objective], ({"AAA": 10}, 0.0)
 
-    monkeypatch.setattr("src.flow.cli.compute_weights_and_allocation", recompute)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.compute_weights_and_allocation", recompute)
 
 
 def test_the_edit_loop_archives_each_recompute(monkeypatch, tmp_path):

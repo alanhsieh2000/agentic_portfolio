@@ -1,4 +1,4 @@
-"""Tests for src/flow/user_portfolio.py's memory/portfolio.json read/write
+"""Tests for src/agentic_portfolio/flow/user_portfolio.py's memory/portfolio.json read/write
 round trip: the per-currency portfolios it holds, the share-count
 validation a hand-editable file needs, and the per-currency independence
 that keeps saving one portfolio from disturbing another.
@@ -14,7 +14,7 @@ import pandas as pd
 from datetime import date, datetime, timezone
 import pytest
 
-from src.flow.user_portfolio import (
+from agentic_portfolio.flow.user_portfolio import (
     load_all_portfolios,
     load_portfolio,
     save_portfolio,

@@ -1,4 +1,4 @@
-"""Tests for src/optimizer/holdings.py and src/flow/interactive.py's
+"""Tests for src/agentic_portfolio/optimizer/holdings.py and src/agentic_portfolio/flow/interactive.py's
 `prepare_holdings`: turning saved share counts into value weights, the
 three figures behind them, and the exclusion rules for a holding that
 cannot be measured.
@@ -24,9 +24,9 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.optimizer.benchmark import benchmark_stats_for_window, BenchmarkSource
-from src.optimizer.dividends import NO_DIVIDEND_FIGURES, dividend_figures
-from src.optimizer.holdings import (
+from agentic_portfolio.optimizer.benchmark import benchmark_stats_for_window, BenchmarkSource
+from agentic_portfolio.optimizer.dividends import NO_DIVIDEND_FIGURES, dividend_figures
+from agentic_portfolio.optimizer.holdings import (
     DEFAULT_LOOKBACK_MONTHS,
     HOLDINGS_MIN_MONTHS,
     holdings_stats,
@@ -35,12 +35,12 @@ from src.optimizer.holdings import (
     validate_lookback_months,
     weights_from_positions,
 )
-from src.flow.interactive import (
+from agentic_portfolio.flow.interactive import (
     measure_holdings,
     open_holdings_session,
     prepare_holdings,
 )
-from src.optimizer.portfolio import compute_weights_and_stats
+from agentic_portfolio.optimizer.portfolio import compute_weights_and_stats
 
 
 def _monthly_returns(n: int, ticker: str, start: str = "2020-01-01", shift: int = 0) -> pd.Series:
@@ -346,9 +346,9 @@ def test_stored_month_counts_counts_each_tickers_own_months(tmp_path):
 def _no_fetch(monkeypatch):
     """Fail the test if anything tries to reach Yahoo Finance.
 
-    Patched on BOTH importing modules. `src/flow/interactive.py` still holds
+    Patched on BOTH importing modules. `src/agentic_portfolio/flow/interactive.py` still holds
     its own reference, but since the holdings cache landed the fetch a
-    holdings report makes goes through `src/dataset/holdings_cache.py`'s
+    holdings report makes goes through `src/agentic_portfolio/dataset/holdings_cache.py`'s
     reference instead - and patching only the old one let a real network
     call escape into the suite, which is exactly why this project's rule is
     to patch the importing module's own symbol rather than the definition.
@@ -357,8 +357,8 @@ def _no_fetch(monkeypatch):
     def fail(tickers, as_of, db_path):
         raise AssertionError(f"fetched {tickers} when it should not have")
 
-    monkeypatch.setattr("src.flow.interactive.validate_and_ingest_tickers", fail)
-    monkeypatch.setattr("src.dataset.holdings_cache.validate_and_ingest_tickers", fail)
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.validate_and_ingest_tickers", fail)
+    monkeypatch.setattr("agentic_portfolio.dataset.holdings_cache.validate_and_ingest_tickers", fail)
 
 
 def test_a_session_measures_every_variant_over_one_window(tmp_path, monkeypatch):
@@ -481,11 +481,11 @@ def test_prepare_holdings_never_writes_to_the_session_database(tmp_path, monkeyp
     scratch = tmp_path / "scratch.duckdb"
     _make_db(str(scratch), [_monthly_returns(60, "NEWCO")], {"NEWCO": 25.0})
     monkeypatch.setattr(
-        "src.flow.interactive.build_scratch_snapshot",
+        "agentic_portfolio.flow.interactive.build_scratch_snapshot",
         lambda prefix="x": _fake_scratch(str(scratch)),
     )
     monkeypatch.setattr(
-        "src.dataset.holdings_cache.validate_and_ingest_tickers",
+        "agentic_portfolio.dataset.holdings_cache.validate_and_ingest_tickers",
         lambda tickers, as_of, path: (list(tickers), {}, {t: "USD" for t in tickers}),
     )
 
@@ -526,7 +526,7 @@ def test_prepare_holdings_turns_an_ingest_failure_into_a_reported_reason(tmp_pat
     db_path = str(tmp_path / "session.duckdb")
     _make_db(db_path, [], {})
     monkeypatch.setattr(
-        "src.dataset.holdings_cache.validate_and_ingest_tickers",
+        "agentic_portfolio.dataset.holdings_cache.validate_and_ingest_tickers",
         lambda tickers, as_of, path: (_ for _ in ()).throw(RuntimeError("yfinance exploded")),
     )
 
@@ -585,7 +585,7 @@ def test_prepare_holdings_never_writes_to_the_shared_price_cache(tmp_path, monke
     cache = str(tmp_path / "holdings.duckdb")
 
     monkeypatch.setattr(
-        "src.dataset.holdings_cache.validate_and_ingest_tickers",
+        "agentic_portfolio.dataset.holdings_cache.validate_and_ingest_tickers",
         lambda tickers, as_of, path: (list(tickers), {}, {t: "USD" for t in tickers}),
     )
 

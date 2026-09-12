@@ -1,4 +1,4 @@
-"""Tests for src/dataset/backfill_snapshot.py.
+"""Tests for src/agentic_portfolio/dataset/backfill_snapshot.py.
 
 Per AGENTS.md's testing guidance, every network-touching call (Wikipedia,
 SEC EDGAR, yfinance) is monkeypatched out; `build_snapshot_for_date` is
@@ -15,7 +15,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.dataset import backfill_snapshot
+from agentic_portfolio.dataset import backfill_snapshot
 
 
 def _make_prices_db(db_path: str, rows: list[tuple[str, str, float, float]]) -> None:

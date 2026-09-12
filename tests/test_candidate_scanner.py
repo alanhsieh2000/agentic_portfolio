@@ -1,4 +1,4 @@
-"""Tests for src/scanner/candidate_scanner.py.
+"""Tests for src/agentic_portfolio/scanner/candidate_scanner.py.
 
 Pure set arithmetic over hand-built fixture DataFrames - no database, no
 yfinance, no LLM calls, per AGENTS.md's testing guidance.
@@ -7,7 +7,7 @@ yfinance, no LLM calls, per AGENTS.md's testing guidance.
 import pandas as pd
 import pytest
 
-from src.scanner.candidate_scanner import scan, scan_with_detail
+from agentic_portfolio.scanner.candidate_scanner import scan, scan_with_detail
 
 
 def _signals(*ticker_signal_pairs: tuple[str, str]) -> pd.DataFrame:

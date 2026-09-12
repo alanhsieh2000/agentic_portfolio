@@ -1,4 +1,4 @@
-"""Tests for src/optimizer/benchmark.py.
+"""Tests for src/agentic_portfolio/optimizer/benchmark.py.
 
 Per AGENTS.md's testing guidance these are hermetic: the pure estimator and
 windowing logic is exercised against hand-built `pd.Series` fixtures, and the
@@ -21,7 +21,7 @@ import pandas as pd
 import pytest
 from pypfopt import expected_returns, risk_models
 
-from src.optimizer.benchmark import (
+from agentic_portfolio.optimizer.benchmark import (
     BENCHMARK_MIN_MONTHS,
     DEFAULT_BENCHMARKS,
     BenchmarkSource,
@@ -33,7 +33,7 @@ from src.optimizer.benchmark import (
     DEFAULT_OBJECTIVE_WITHOUT_BENCHMARK,
     objective_from_benchmark,
 )
-from src.optimizer.portfolio import compute_weights_and_stats
+from agentic_portfolio.optimizer.portfolio import compute_weights_and_stats
 
 
 def _monthly_returns(n: int, ticker: str = "SPY", start: str = "2020-01-01") -> pd.Series:

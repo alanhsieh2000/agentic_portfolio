@@ -1,4 +1,4 @@
-"""Tests for `src/optimizer/ticker_stats.py`: one candidate ticker's annual
+"""Tests for `src/agentic_portfolio/optimizer/ticker_stats.py`: one candidate ticker's annual
 return, annual volatility, Sharpe ratio and trailing dividend yield.
 
 Per `AGENTS.md` these are hermetic. The arithmetic runs against tiny fixture
@@ -19,8 +19,8 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.optimizer.benchmark import BenchmarkSource, benchmark_stats_for_window
-from src.optimizer.ticker_stats import (
+from agentic_portfolio.optimizer.benchmark import BenchmarkSource, benchmark_stats_for_window
+from agentic_portfolio.optimizer.ticker_stats import (
     DEFAULT_LOOKBACK_MONTHS,
     TICKER_MIN_MONTHS,
     ticker_stats,
@@ -306,6 +306,6 @@ def test_the_minimum_history_bar_matches_the_optimizers_own(tmp_path):
     `apply_min_history_rule` and `BENCHMARK_MIN_MONTHS` require, so a
     candidate whose summary promised figures cannot then be silently dropped
     from the optimizer for having too little history."""
-    from src.optimizer.benchmark import BENCHMARK_MIN_MONTHS
+    from agentic_portfolio.optimizer.benchmark import BENCHMARK_MIN_MONTHS
 
     assert TICKER_MIN_MONTHS == BENCHMARK_MIN_MONTHS == 24

@@ -1,4 +1,4 @@
-"""Tests for `src/agents/report_summary.py`, the prose half of the monthly
+"""Tests for `src/agentic_portfolio/agents/report_summary.py`, the prose half of the monthly
 report summary.
 
 Per AGENTS.md, no test here calls any LLM. `ReportSummaryCrew` is
@@ -17,8 +17,8 @@ tested without spending money. So most of what follows is about the verifier.
 
 import pytest
 
-from src.agents import report_summary
-from src.agents.report_summary import (
+from agentic_portfolio.agents import report_summary
+from agentic_portfolio.agents.report_summary import (
     FALLBACKS,
     NarrativeUnavailable,
     api_key_problem,
@@ -26,8 +26,8 @@ from src.agents.report_summary import (
     stated_figures,
     verify_narrative,
 )
-from src.agents.summary_schema import NOT_APPLICABLE, MonthNarrative
-from src.config.settings import settings
+from agentic_portfolio.agents.summary_schema import NOT_APPLICABLE, MonthNarrative
+from agentic_portfolio.config.settings import settings
 
 FACTS = """MONTH: 2026-09
 REPORTS: 9 total, 4 portfolio, 5 whatif

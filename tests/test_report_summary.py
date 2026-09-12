@@ -1,10 +1,10 @@
-"""Tests for `src/flow/report_summary.py`, the deterministic half of the
+"""Tests for `src/agentic_portfolio/flow/report_summary.py`, the deterministic half of the
 monthly report summary.
 
 Per AGENTS.md, no test here calls yfinance's live API or any LLM. There is
 nothing in this module to mock: it reads saved report files and does
 arithmetic. Inputs are built by writing real archive files with
-`src/flow/report_archive.py`'s own `save_report`, so these tests exercise the
+`src/agentic_portfolio/flow/report_archive.py`'s own `save_report`, so these tests exercise the
 front-matter format the writer actually produces rather than a hand-rolled
 imitation of it. The one exception is `saved_at`, which `save_report` stamps
 from the clock; `_restamp` rewrites that single line afterwards, because the
@@ -20,8 +20,8 @@ from datetime import date
 
 import pytest
 
-from src.flow.report_archive import ReportArchive, load_report, save_report
-from src.flow.report_summary import (
+from agentic_portfolio.flow.report_archive import ReportArchive, load_report, save_report
+from agentic_portfolio.flow.report_summary import (
     NEGLIGIBLE_WEIGHT,
     build_month_digest,
     digest_for_llm,
@@ -856,7 +856,7 @@ def test_digest_for_llm_is_compact_and_carries_the_computed_figures(tmp_path):
 
 
 def test_digest_for_llm_says_when_it_truncated_a_partition(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.flow.report_summary.LLM_MAX_ROWS_PER_PARTITION", 2)
+    monkeypatch.setattr("agentic_portfolio.flow.report_summary.LLM_MAX_ROWS_PER_PARTITION", 2)
     records, notes = _real_month(tmp_path)
 
     facts = digest_for_llm(build_month_digest(records, MONTH, notes))
@@ -871,7 +871,7 @@ def test_a_report_stripped_of_almost_every_fact_still_renders_without_leaking_no
     halves of that promise in step."""
     from pathlib import Path
 
-    from src.flow.report_summary import ReportRecord
+    from agentic_portfolio.flow.report_summary import ReportRecord
 
     bare = ReportRecord(path=Path("mangled.md"), facts={"kind": "portfolio"}, body="")
 
@@ -1017,7 +1017,7 @@ def test_the_llm_facts_sheet_carries_no_report_digests(tmp_path):
     """The model never sees a digest, and that is a safety property rather than
     an omission.
 
-    `verify_narrative` in `src/agents/report_summary.py` rejects prose stating a
+    `verify_narrative` in `src/agentic_portfolio/agents/report_summary.py` rejects prose stating a
     figure absent from this sheet, and it finds figures with a digit-run regex.
     A hex digest is full of digit runs - `02a118b3` alone would make `02`, `118`
     and `3` count as supported - so putting nine of them in the sheet would
@@ -1052,7 +1052,7 @@ def test_two_reports_that_cannot_be_told_apart_by_window_keep_their_digests(tmp_
     """
     from pathlib import Path
 
-    from src.flow.report_summary import ReportRecord, build_sources
+    from agentic_portfolio.flow.report_summary import ReportRecord, build_sources
 
     shared = {"kind": "whatif", "variant": "what-if", "positions": "PFFA:1"}
     first = ReportRecord(

@@ -1,4 +1,4 @@
-"""Tests for src/dataset/news_archive.py.
+"""Tests for src/agentic_portfolio/dataset/news_archive.py.
 
 Per AGENTS.md, no test here downloads the real Hugging Face parquet file;
 `build_news_archive` is exercised against a small hand-written Parquet
@@ -10,7 +10,7 @@ letting `requests.get` be called.
 import duckdb
 import pytest
 
-from src.dataset.news_archive import build_news_archive, download_news_archive
+from agentic_portfolio.dataset.news_archive import build_news_archive, download_news_archive
 
 
 def _write_fixture_parquet(path) -> None:
@@ -73,7 +73,7 @@ def test_download_news_archive_skips_fetch_when_file_exists(tmp_path, monkeypatc
     def _fail_if_called(*args, **kwargs):
         raise AssertionError("requests.get must not be called when the destination already exists")
 
-    monkeypatch.setattr("src.dataset.news_archive.requests.get", _fail_if_called)
+    monkeypatch.setattr("agentic_portfolio.dataset.news_archive.requests.get", _fail_if_called)
 
     result = download_news_archive(dest_path=str(dest))
     assert result == dest

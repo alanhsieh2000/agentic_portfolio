@@ -1,12 +1,12 @@
-"""Tests for src/flow/holdings_cli.py (`uv run portfolio-holdings`) and
-src/flow/cli.py's `print_user_portfolio`: recording and retiring holdings,
+"""Tests for src/agentic_portfolio/flow/holdings_cli.py (`uv run portfolio-holdings`) and
+src/agentic_portfolio/flow/cli.py's `print_user_portfolio`: recording and retiring holdings,
 the per-currency routing that decides which portfolio an edit lands in, and
 the exact wording of the report block both commands share.
 
 Per AGENTS.md's testing guidance these are hermetic. Yahoo Finance is
 reached only through `validate_and_ingest_tickers` and the risk figures
 only through `prepare_holdings`, both monkeypatched on
-`src.flow.holdings_cli`'s own symbols, so nothing here touches the network
+`agentic_portfolio.flow.holdings_cli`'s own symbols, so nothing here touches the network
 or the real `memory/portfolio.json`.
 """
 
@@ -17,26 +17,26 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.config.settings import settings
-from src.flow.holdings_cli import (
+from agentic_portfolio.config.settings import settings
+from agentic_portfolio.flow.holdings_cli import (
     NOT_SAVED,
     WHATIF_PROMPT,
     _normalize_ticker,
     _parse_pairs,
     main,
 )
-from src.flow.interactive import HoldingsSession
-from src.flow.report_archive import load_report
-from src.flow.rate_memory import load_all_risk_free_rates, load_risk_free_rate
-from src.flow.user_portfolio import load_all_portfolios, load_portfolio
-from src.optimizer.holdings import HoldingsStats, unavailable_holdings
-from src.flow.cli import (
+from agentic_portfolio.flow.interactive import HoldingsSession
+from agentic_portfolio.flow.report_archive import load_report
+from agentic_portfolio.flow.rate_memory import load_all_risk_free_rates, load_risk_free_rate
+from agentic_portfolio.flow.user_portfolio import load_all_portfolios, load_portfolio
+from agentic_portfolio.optimizer.holdings import HoldingsStats, unavailable_holdings
+from agentic_portfolio.flow.cli import (
     format_holdings_delta,
     format_holdings_dividend_total,
     format_share_count,
     print_user_portfolio,
 )
-from src.optimizer.dividends import dividend_figures
+from agentic_portfolio.optimizer.dividends import dividend_figures
 
 
 def _stub_ingest(monkeypatch, currencies: dict[str, str], invalid: dict[str, str] | None = None):
@@ -50,7 +50,7 @@ def _stub_ingest(monkeypatch, currencies: dict[str, str], invalid: dict[str, str
         missing = {t: "not found on Yahoo Finance" for t in tickers if t not in currencies}
         return valid, {**missing, **invalid}, {t: currencies[t] for t in valid}
 
-    monkeypatch.setattr("src.flow.holdings_cli.validate_and_ingest_tickers", fake)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.validate_and_ingest_tickers", fake)
     # Also on the cache module's own reference. Since the holdings cache
     # landed, `whatif`'s add path goes through `refresh_holdings_cache`,
     # which holds its own import - so patching only `holdings_cli`'s left
@@ -58,7 +58,7 @@ def _stub_ingest(monkeypatch, currencies: dict[str, str], invalid: dict[str, str
     # creating a DuckDB file in the repository root. Worse than failing: a
     # test asserting that `7203.T` is refused as JPY passed anyway, because
     # the live lookup agreed with the stub it had bypassed.
-    monkeypatch.setattr("src.dataset.holdings_cache.validate_and_ingest_tickers", fake)
+    monkeypatch.setattr("agentic_portfolio.dataset.holdings_cache.validate_and_ingest_tickers", fake)
 
 
 def _stub_report(monkeypatch) -> list[tuple[str, dict]]:
@@ -72,7 +72,7 @@ def _stub_report(monkeypatch) -> list[tuple[str, dict]]:
         seen.append((currency, dict(positions), risk_free_rate))
         return unavailable_holdings(currency, dict(positions), risk_free_rate, "stubbed")
 
-    monkeypatch.setattr("src.flow.holdings_cli.prepare_holdings", fake)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.prepare_holdings", fake)
     return seen
 
 
@@ -621,7 +621,7 @@ def test_a_mistyped_percentage_rate_is_refused_before_any_ticker_lookup(
     def _fail_if_called(tickers, as_of, db_path):
         raise AssertionError("validated the tickers before refusing the rate")
 
-    monkeypatch.setattr("src.flow.holdings_cli.validate_and_ingest_tickers", _fail_if_called)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.validate_and_ingest_tickers", _fail_if_called)
     _stub_report(monkeypatch)
 
     with pytest.raises(SystemExit) as excinfo:
@@ -749,8 +749,8 @@ def _stub_session(
             window_months=lookback_months,
         )
 
-    monkeypatch.setattr("src.flow.holdings_cli.open_holdings_session", fake_session)
-    monkeypatch.setattr("src.flow.holdings_cli.measure_holdings", fake_measure)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.open_holdings_session", fake_session)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.measure_holdings", fake_measure)
     return seen
 
 
@@ -760,8 +760,8 @@ def _no_writes(monkeypatch) -> tuple[MagicMock, MagicMock]:
     """
     save_positions = MagicMock()
     save_rate = MagicMock(return_value=True)
-    monkeypatch.setattr("src.flow.holdings_cli.save_portfolio", save_positions)
-    monkeypatch.setattr("src.flow.holdings_cli.save_risk_free_rate", save_rate)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.save_portfolio", save_positions)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.save_risk_free_rate", save_rate)
     return save_positions, save_rate
 
 
@@ -933,7 +933,7 @@ def test_whatif_refuses_a_new_ticker_when_fetching_is_disabled(monkeypatch, tmp_
     def _fail_if_called(tickers, as_of, db_path):
         raise AssertionError("ingested into the shared cache under --no-fetch")
 
-    monkeypatch.setattr("src.flow.holdings_cli.validate_and_ingest_tickers", _fail_if_called)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.validate_and_ingest_tickers", _fail_if_called)
     _stub_session(monkeypatch, can_ingest=False)
     _script(monkeypatch, "s", "NVDA 100", "f")
     _run(monkeypatch, path, ["whatif", "--no-fetch"])
@@ -1412,9 +1412,9 @@ def test_a_whatif_report_without_figures_records_no_figures(monkeypatch, tmp_pat
     def fake_session(*_args, **_kwargs):
         yield HoldingsSession(db_path="session.duckdb", can_ingest=True)
 
-    monkeypatch.setattr("src.flow.holdings_cli.open_holdings_session", fake_session)
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.open_holdings_session", fake_session)
     monkeypatch.setattr(
-        "src.flow.holdings_cli.measure_holdings",
+        "agentic_portfolio.flow.holdings_cli.measure_holdings",
         lambda positions, currency, *a, **k: unavailable_holdings(
             currency, dict(positions), 0.02, "not enough history"
         ),

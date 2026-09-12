@@ -1,5 +1,5 @@
-"""Tests for the dividend data layer (`src/dataset/dividends.py`) and the
-dividend constraint's pure parts (`src/optimizer/dividends.py`).
+"""Tests for the dividend data layer (`src/agentic_portfolio/dataset/dividends.py`) and the
+dividend constraint's pure parts (`src/agentic_portfolio/optimizer/dividends.py`).
 
 Per AGENTS.md, every test here is deterministic and hermetic: yfinance
 responses are hand-built fixtures shaped like the real `actions=True`
@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.dataset.dividends import (
+from agentic_portfolio.dataset.dividends import (
     DIVIDEND_UNRESOLVED_COLUMNS,
     DIVIDENDS_LONG_COLUMNS,
     SPLITS_LONG_COLUMNS,
@@ -40,7 +40,7 @@ from src.dataset.dividends import (
     upsert_dividends_tables,
     write_dividends_tables,
 )
-from src.optimizer.dividends import (
+from agentic_portfolio.optimizer.dividends import (
     MAX_DIVIDEND_YIELD,
     DividendFloor,
     DividendFloorError,
@@ -621,7 +621,7 @@ def test_dividend_figures_uses_shares_times_dividends_per_share():
 
 
 def test_dividend_figures_not_consulted_reports_the_no_figures_shape():
-    from src.optimizer.dividends import NO_DIVIDEND_FIGURES
+    from agentic_portfolio.optimizer.dividends import NO_DIVIDEND_FIGURES
 
     assert dividend_figures({"T": 1.0}, {"T": 10.0}, None) is NO_DIVIDEND_FIGURES
 

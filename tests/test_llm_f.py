@@ -1,6 +1,6 @@
-"""Tests for src/agents/news.py's `fetch_headlines`,
-src/agents/llm_f.py's `generate_signal`/`compute_decayed_score`, and
-src/agents/llm_f_signals.py's `screen_month`.
+"""Tests for src/agentic_portfolio/agents/news.py's `fetch_headlines`,
+src/agentic_portfolio/agents/llm_f.py's `generate_signal`/`compute_decayed_score`, and
+src/agentic_portfolio/agents/llm_f_signals.py's `screen_month`.
 
 Per AGENTS.md, no test here calls yfinance's live API or any LLM. The
 archive path is exercised against a small hand-built `news_articles_hf`
@@ -22,11 +22,11 @@ from datetime import date
 import duckdb
 import pytest
 
-from src.agents import llm_f
-from src.agents.llm_f import compute_decayed_score, generate_signal
-from src.agents.llm_f_schema import HeadlineSentiment, HeadlineSentimentBatch, SentimentSignal
-from src.agents.llm_f_signals import screen_month
-from src.agents.news import fetch_headlines
+from agentic_portfolio.agents import llm_f
+from agentic_portfolio.agents.llm_f import compute_decayed_score, generate_signal
+from agentic_portfolio.agents.llm_f_schema import HeadlineSentiment, HeadlineSentimentBatch, SentimentSignal
+from agentic_portfolio.agents.llm_f_signals import screen_month
+from agentic_portfolio.agents.news import fetch_headlines
 
 
 def _build_archive_db(db_path, rows: list[tuple[str, str, str]]) -> None:
@@ -94,7 +94,7 @@ def test_fetch_headlines_falls_back_to_yfinance_outside_archive_range(tmp_path, 
                 {"content": {"title": "outside month", "pubDate": "2025-07-01T00:00:00Z"}},
             ]
 
-    monkeypatch.setattr("src.agents.news.yf.Ticker", FakeTicker)
+    monkeypatch.setattr("agentic_portfolio.agents.news.yf.Ticker", FakeTicker)
 
     headlines = fetch_headlines("AAPL", 2025, 6, db_path=str(db_path))
 
@@ -115,7 +115,7 @@ def test_fetch_headlines_yfinance_fallback_respects_limit(tmp_path, monkeypatch)
                 {"content": {"title": f"item {i}", "pubDate": "2025-06-01T00:00:00Z"}} for i in range(5)
             ]
 
-    monkeypatch.setattr("src.agents.news.yf.Ticker", FakeTicker)
+    monkeypatch.setattr("agentic_portfolio.agents.news.yf.Ticker", FakeTicker)
 
     headlines = fetch_headlines("AAPL", 2025, 6, limit=2, db_path=str(db_path))
 
@@ -134,7 +134,7 @@ def test_fetch_headlines_yfinance_fallback_raises_clear_error_when_content_key_m
         def news(self):
             return [{"unexpected_key": "no content here"}]
 
-    monkeypatch.setattr("src.agents.news.yf.Ticker", FakeTicker)
+    monkeypatch.setattr("agentic_portfolio.agents.news.yf.Ticker", FakeTicker)
 
     with pytest.raises(ValueError, match="content"):
         fetch_headlines("AAPL", 2025, 6, db_path=str(db_path))
@@ -293,7 +293,7 @@ def test_screen_month_resolves_rebalance_date_and_returns_ticker_signal_frame(tm
         signal = "buy" if headlines else "hold"
         return SentimentSignal(ticker=ticker, month=month_str, signal=signal, score=0.2 if headlines else 0.0)
 
-    monkeypatch.setattr("src.agents.llm_f_signals.generate_signal", fake_generate_signal)
+    monkeypatch.setattr("agentic_portfolio.agents.llm_f_signals.generate_signal", fake_generate_signal)
 
     result = screen_month(2024, 3, db_path=str(db_path))
 

@@ -1,4 +1,4 @@
-"""Tests for src/optimizer/portfolio.py.
+"""Tests for src/agentic_portfolio/optimizer/portfolio.py.
 
 Per AGENTS.md's testing guidance, the returns-matrix drop-logic is tested
 against hand-built fixture DataFrames standing in for the `returns` table,
@@ -22,16 +22,16 @@ import cvxpy as cp
 import inspect
 from pypfopt.exceptions import OptimizationError
 
-from src.config.settings import settings
-from src.dataset.prices import load_latest_close
-from src.dataset.ticker_currency import MixedCurrencyPoolError
-from src.errors import UnsatisfiableRequestError
-from src.optimizer.dividends import (
+from agentic_portfolio.config.settings import settings
+from agentic_portfolio.dataset.prices import load_latest_close
+from agentic_portfolio.dataset.ticker_currency import MixedCurrencyPoolError
+from agentic_portfolio.errors import UnsatisfiableRequestError
+from agentic_portfolio.optimizer.dividends import (
     DividendFloor,
     DividendFloorError,
     DividendYieldUnavailableError,
 )
-from src.optimizer.portfolio import (
+from agentic_portfolio.optimizer.portfolio import (
     MV_RETURN_TOLERANCE,
     RiskFreeRateTooHighError,
     UnreachableTargetReturnError,
@@ -216,7 +216,7 @@ def _spy_on_max_sharpe(monkeypatch) -> dict:
         seen["risk_free_rate"] = risk_free_rate
         return real_max_sharpe(self, risk_free_rate=risk_free_rate)
 
-    monkeypatch.setattr("src.optimizer.portfolio.EfficientFrontier.max_sharpe", spy)
+    monkeypatch.setattr("agentic_portfolio.optimizer.portfolio.EfficientFrontier.max_sharpe", spy)
     return seen
 
 
@@ -234,7 +234,7 @@ def test_compute_weights_and_stats_msr_fits_at_the_configured_risk_free_rate(mon
 
 
 def test_compute_weights_msr_still_fits_at_zero_risk_free_rate(monkeypatch):
-    """The regression guard for src/flow/backtest.py: its 52-month run calls
+    """The regression guard for src/agentic_portfolio/flow/backtest.py: its 52-month run calls
     `compute_weights`, whose MSR results must not move just because the
     interactive path started fitting at a nonzero rate.
     """
@@ -514,7 +514,7 @@ def _floor(value: float, origin: str = "--min-dividend-yield") -> DividendFloor:
 
 
 def test_compute_weights_signature_cannot_express_a_dividend_floor():
-    """`compute_weights` feeds `src/flow/backtest.py`, whose published
+    """`compute_weights` feeds `src/agentic_portfolio/flow/backtest.py`, whose published
     52-month figures must not move. Leaving its signature alone makes "the
     backtest cannot acquire a dividend floor" a property of the type system
     rather than a promise in a docstring.
@@ -692,7 +692,7 @@ def test_a_floor_above_the_ceiling_is_refused_before_the_solver_runs(monkeypatch
 
 def test_a_solver_infeasibility_under_a_floor_is_wrapped_as_a_value_error(monkeypatch):
     """Belt and braces. `OptimizationError` subclasses plain `Exception`, so
-    an unwrapped one would sail past `src/flow/cli.py`'s `except ValueError`
+    an unwrapped one would sail past `src/agentic_portfolio/flow/cli.py`'s `except ValueError`
     and destroy live mode's only snapshot.
     """
     def boom(self):
@@ -768,7 +768,7 @@ def test_a_missing_yield_is_refused_under_a_floor_rather_than_read_as_zero():
 
 
 def test_a_missing_yield_with_no_floor_reports_its_own_denominator():
-    """`src/optimizer/holdings.py`'s rule applied to income: shrink the
+    """`src/agentic_portfolio/optimizer/holdings.py`'s rule applied to income: shrink the
     denominator and say so, rather than withhold a correct answer about the
     rest of the portfolio - or dilute the figure toward zero by reading an
     unknown as a zero.
@@ -845,7 +845,7 @@ def test_the_floor_and_its_origin_are_echoed_back_for_the_report():
 
 
 def test_every_unsatisfiable_request_shares_one_type():
-    """`src/flow/cli.py`'s `main` catches this base rather than `ValueError`,
+    """`src/agentic_portfolio/flow/cli.py`'s `main` catches this base rather than `ValueError`,
     which would also swallow genuine bugs. They stay `ValueError` too, so
     the interactive edit loop's pre-existing handler keeps reverting them.
     """

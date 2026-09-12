@@ -1,7 +1,7 @@
-"""Tests for `src/flow/summary_cli.py`, the `uv run portfolio-summary` command.
+"""Tests for `src/agentic_portfolio/flow/summary_cli.py`, the `uv run portfolio-summary` command.
 
 Per AGENTS.md, no test here calls any LLM or any network. `generate_narrative`
-is monkeypatched at `src.flow.summary_cli.generate_narrative` - the name as
+is monkeypatched at `agentic_portfolio.flow.summary_cli.generate_narrative` - the name as
 imported into the module under test - so both the success and the failure path
 are exercised without a provider. Argv goes in through
 `monkeypatch.setattr(sys, "argv", ...)` and output comes out through `capsys`,
@@ -18,12 +18,12 @@ from datetime import date
 
 import pytest
 
-from src.agents.report_summary import NarrativeUnavailable
-from src.agents.summary_schema import NOT_APPLICABLE, MonthNarrative
-from src.config.settings import settings
-from src.flow import summary_cli
-from src.flow.report_archive import ReportArchive, load_report, save_report
-from src.flow.summary_cli import census, default_month, main, parse_month, provenance
+from agentic_portfolio.agents.report_summary import NarrativeUnavailable
+from agentic_portfolio.agents.summary_schema import NOT_APPLICABLE, MonthNarrative
+from agentic_portfolio.config.settings import settings
+from agentic_portfolio.flow import summary_cli
+from agentic_portfolio.flow.report_archive import ReportArchive, load_report, save_report
+from agentic_portfolio.flow.summary_cli import census, default_month, main, parse_month, provenance
 
 MONTH = "2026-09"
 AS_OF = date(2026, 9, 11)
@@ -424,7 +424,7 @@ def test_the_model_is_handed_the_computed_facts_and_not_the_raw_reports(
 
 def test_the_census_line_counts_both_kinds_and_the_currencies(tmp_path):
     _two_reports(tmp_path)
-    from src.flow.report_summary import load_month
+    from agentic_portfolio.flow.report_summary import load_month
 
     records, _ = load_month(tmp_path / "output", MONTH)
 

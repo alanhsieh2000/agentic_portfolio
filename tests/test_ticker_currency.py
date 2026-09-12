@@ -1,4 +1,4 @@
-"""Tests for src/dataset/ticker_currency.py's pure helpers.
+"""Tests for src/agentic_portfolio/dataset/ticker_currency.py's pure helpers.
 
 Per AGENTS.md no test here calls yfinance: `fetch_ticker_currencies` is the
 one function in that module performing network I/O and is exercised only
@@ -12,7 +12,7 @@ price-upsert tests it mirrors.
 import pandas as pd
 import pytest
 
-from src.dataset.ticker_currency import (
+from agentic_portfolio.dataset.ticker_currency import (
     DEFAULT_CURRENCY,
     apply_price_multipliers,
     group_by_currency,
@@ -77,7 +77,7 @@ def test_apply_price_multipliers_scales_both_price_columns():
 
     Both must be scaled whatever the rest of the project reads: `close` is
     what prices a trade and values a holding (see
-    `src/dataset/prices.py`'s `load_latest_close`) while `adj_close` is what
+    `src/agentic_portfolio/dataset/prices.py`'s `load_latest_close`) while `adj_close` is what
     the monthly returns are computed from, so leaving either in pence would
     be wrong by a factor of a hundred somewhere.
     """

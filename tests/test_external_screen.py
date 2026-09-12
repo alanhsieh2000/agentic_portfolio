@@ -1,5 +1,5 @@
-"""Tests for src/agents/external_screen.py and
-src/dataset/fundamentals.py's get_factor_reference_stats.
+"""Tests for src/agentic_portfolio/agents/external_screen.py and
+src/agentic_portfolio/dataset/fundamentals.py's get_factor_reference_stats.
 
 Per AGENTS.md, no test here makes a network call: compute_raw_factors_for_ticker
 and compute_raw_factors_for_etf (which call yfinance) are exercised manually,
@@ -13,13 +13,13 @@ from datetime import date
 import duckdb
 import pytest
 
-from src.agents.external_screen import (
+from agentic_portfolio.agents.external_screen import (
     aggregate_price_to_book,
     screen_external_candidate,
     standardize_raw_factors,
 )
-from src.agents.llm_s_schema import ScreeningRule
-from src.dataset.fundamentals import get_factor_reference_stats
+from agentic_portfolio.agents.llm_s_schema import ScreeningRule
+from agentic_portfolio.dataset.fundamentals import get_factor_reference_stats
 
 
 def _rule(buy_condition: str, sell_condition: str) -> ScreeningRule:

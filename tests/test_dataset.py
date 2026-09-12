@@ -1,6 +1,6 @@
-"""Tests for src/dataset/membership.py, src/dataset/prices.py,
-src/dataset/fundamentals.py, src/dataset/sec_edgar.py, and
-src/dataset/momentum.py.
+"""Tests for src/agentic_portfolio/dataset/membership.py, src/agentic_portfolio/dataset/prices.py,
+src/agentic_portfolio/dataset/fundamentals.py, src/agentic_portfolio/dataset/sec_edgar.py, and
+src/agentic_portfolio/dataset/momentum.py.
 
 Per AGENTS.md, no test here calls yfinance, fetches the live Wikipedia
 page, or calls SEC EDGAR; all inputs are hand-written in-memory fixtures.
@@ -11,18 +11,18 @@ import math
 import pandas as pd
 import pytest
 
-from src.dataset.membership import (
+from agentic_portfolio.dataset.membership import (
     MembershipTableNotFoundError,
     _locate_table,
     apply_changes_asof,
     compute_rebalance_dates,
 )
-from src.dataset.prices import (
+from agentic_portfolio.dataset.prices import (
     detect_unresolved_tickers,
     reshape_prices_long,
     to_yfinance_symbol,
 )
-from src.dataset.fundamentals import (
+from agentic_portfolio.dataset.fundamentals import (
     BookEquityLineItemNotFoundError,
     add_cross_sectional_z,
     compute_bm,
@@ -34,15 +34,15 @@ from src.dataset.fundamentals import (
     most_recent_value_on_or_before,
     select_book_equity,
 )
-from src.dataset.sec_edgar import (
+from agentic_portfolio.dataset.sec_edgar import (
     dedupe_to_earliest_filed,
     extract_book_equity_facts_from_company_facts,
     has_sufficient_coverage,
     lookup_cik,
     select_book_equity_asof,
 )
-from src.dataset.momentum import compute_mom12m, compute_mom12m_column
-from src.dataset.returns import build_month_ticker_grid, compute_monthly_return, compute_monthly_return_column
+from agentic_portfolio.dataset.momentum import compute_mom12m, compute_mom12m_column
+from agentic_portfolio.dataset.returns import build_month_ticker_grid, compute_monthly_return, compute_monthly_return_column
 
 
 def _current_fixture() -> pd.DataFrame:

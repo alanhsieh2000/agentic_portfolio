@@ -1,4 +1,4 @@
-"""Tests for src/dataset/ticker_ingestion.py's validate-and-ingest step for
+"""Tests for src/agentic_portfolio/dataset/ticker_ingestion.py's validate-and-ingest step for
 arbitrary user-supplied tickers.
 
 Per AGENTS.md no test here calls yfinance: the two functions in the chain
@@ -17,8 +17,8 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from src.dataset.ticker_currency import CURRENCY_LOOKUP_FAILED_REASON
-from src.dataset.ticker_ingestion import validate_and_ingest_tickers
+from agentic_portfolio.dataset.ticker_currency import CURRENCY_LOOKUP_FAILED_REASON
+from agentic_portfolio.dataset.ticker_ingestion import validate_and_ingest_tickers
 
 AS_OF = date(2026, 9, 5)
 
@@ -62,13 +62,13 @@ def _patch_chain(monkeypatch, fetch_result, currencies: dict[str, str] | None = 
         return {t: currencies[t] for t in tickers if t in currencies}
 
     currency_spy = MagicMock(side_effect=fake_currencies)
-    monkeypatch.setattr("src.dataset.ticker_ingestion.fetch_and_reshape_for_tickers", fetch_spy)
-    monkeypatch.setattr("src.dataset.ticker_ingestion.upsert_prices_tables", upsert_prices_spy)
-    monkeypatch.setattr("src.dataset.ticker_ingestion.upsert_ticker_currency_table", upsert_currency_spy)
-    monkeypatch.setattr("src.dataset.ticker_ingestion.build_returns_for_tickers", build_returns_spy)
-    monkeypatch.setattr("src.dataset.ticker_ingestion.fetch_ticker_currencies", currency_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.ticker_ingestion.fetch_and_reshape_for_tickers", fetch_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.ticker_ingestion.upsert_prices_tables", upsert_prices_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.ticker_ingestion.upsert_ticker_currency_table", upsert_currency_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.ticker_ingestion.build_returns_for_tickers", build_returns_spy)
+    monkeypatch.setattr("agentic_portfolio.dataset.ticker_ingestion.fetch_ticker_currencies", currency_spy)
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.build_dividends_for_tickers", build_dividends_spy
+        "agentic_portfolio.dataset.ticker_ingestion.build_dividends_for_tickers", build_dividends_spy
     )
     _patch_chain.dividends = build_dividends_spy
     return fetch_spy, upsert_prices_spy, build_returns_spy, currency_spy, upsert_currency_spy
@@ -133,26 +133,26 @@ def test_validate_and_ingest_tickers_ingests_prices_then_currency_then_returns(m
     """
     call_order: list[str] = []
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.fetch_and_reshape_for_tickers",
+        "agentic_portfolio.dataset.ticker_ingestion.fetch_and_reshape_for_tickers",
         lambda *a, **k: (_prices("AAPL"), _unresolved()),
     )
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.fetch_ticker_currencies", lambda tickers, *a, **k: {"AAPL": "USD"}
+        "agentic_portfolio.dataset.ticker_ingestion.fetch_ticker_currencies", lambda tickers, *a, **k: {"AAPL": "USD"}
     )
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.upsert_prices_tables",
+        "agentic_portfolio.dataset.ticker_ingestion.upsert_prices_tables",
         lambda *a, **k: call_order.append("prices"),
     )
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.upsert_ticker_currency_table",
+        "agentic_portfolio.dataset.ticker_ingestion.upsert_ticker_currency_table",
         lambda *a, **k: call_order.append("currency"),
     )
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.build_returns_for_tickers",
+        "agentic_portfolio.dataset.ticker_ingestion.build_returns_for_tickers",
         lambda *a, **k: call_order.append("returns"),
     )
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.build_dividends_for_tickers",
+        "agentic_portfolio.dataset.ticker_ingestion.build_dividends_for_tickers",
         lambda *a, **k: call_order.append("dividends"),
     )
 
@@ -167,7 +167,7 @@ def test_validate_and_ingest_tickers_ingests_prices_then_currency_then_returns(m
 def test_validate_and_ingest_tickers_handles_symbol_collision_gracefully(monkeypatch):
     _, upsert_prices_spy, build_returns_spy, currency_spy, _ = _patch_chain(monkeypatch, None)
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.fetch_and_reshape_for_tickers",
+        "agentic_portfolio.dataset.ticker_ingestion.fetch_and_reshape_for_tickers",
         MagicMock(side_effect=ValueError("both map to yfinance symbol 'BRK-B'")),
     )
 
@@ -318,7 +318,7 @@ def test_validate_and_ingest_tickers_survives_a_failing_dividend_fetch(monkeypat
     """
     _patch_chain(monkeypatch, (_prices("AAPL"), _unresolved()))
     monkeypatch.setattr(
-        "src.dataset.ticker_ingestion.build_dividends_for_tickers",
+        "agentic_portfolio.dataset.ticker_ingestion.build_dividends_for_tickers",
         MagicMock(side_effect=RuntimeError("yfinance exploded")),
     )
     valid, invalid, currencies = validate_and_ingest_tickers(

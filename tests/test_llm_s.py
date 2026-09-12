@@ -1,6 +1,6 @@
-"""Tests for src/agents/condition_eval.py, src/agents/llm_s_apply.py,
-src/agents/llm_s_signals.py, and the 4 tools in
-src/agents/llm_s_crew/tools.py.
+"""Tests for src/agentic_portfolio/agents/condition_eval.py, src/agentic_portfolio/agents/llm_s_apply.py,
+src/agentic_portfolio/agents/llm_s_signals.py, and the 4 tools in
+src/agentic_portfolio/agents/llm_s_crew/tools.py.
 
 Per AGENTS.md, no test here calls an LLM (rule *generation* needs a real
 LLM call and is exercised manually, per plans/02_llm_s_agent.md's
@@ -14,15 +14,15 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.agents.condition_eval import evaluate_condition
-from src.agents.llm_s_apply import apply_rule
-from src.agents.llm_s_crew.tools import (
+from agentic_portfolio.agents.condition_eval import evaluate_condition
+from agentic_portfolio.agents.llm_s_apply import apply_rule
+from agentic_portfolio.agents.llm_s_crew.tools import (
     GetExtremeFirmsTool,
     QueryFirmDatabaseTool,
     TestComplexConditionTool,
 )
-from src.agents.llm_s_schema import ScreeningRule
-from src.agents.llm_s_signals import screen
+from agentic_portfolio.agents.llm_s_schema import ScreeningRule
+from agentic_portfolio.agents.llm_s_signals import screen
 
 
 def test_evaluate_condition_returns_correct_boolean():

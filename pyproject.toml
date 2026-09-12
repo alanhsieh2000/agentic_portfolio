@@ -27,28 +27,38 @@ dependencies = [
 ]
 
 [project.scripts]
-portfolio = "src.flow.cli:main"
-portfolio-backtest = "src.flow.backtest:main"
-portfolio-build-membership = "src.dataset.membership:main"
-portfolio-build-prices = "src.dataset.prices:main"
-portfolio-build-fundamentals = "src.dataset.fundamentals:main"
-portfolio-build-momentum = "src.dataset.momentum:main"
-portfolio-build-returns = "src.dataset.returns:main"
-portfolio-build-dividends = "src.dataset.dividends:main"
-portfolio-build-news-archive = "src.dataset.news_archive:main"
-portfolio-backfill-snapshot = "src.dataset.backfill_snapshot:main"
-portfolio-holdings = "src.flow.holdings_cli:main"
-portfolio-summary = "src.flow.summary_cli:main"
-portfolio-migrate-candidates = "src.flow.candidate_memory:main"
+portfolio = "agentic_portfolio.flow.cli:main"
+portfolio-backtest = "agentic_portfolio.flow.backtest:main"
+portfolio-build-membership = "agentic_portfolio.dataset.membership:main"
+portfolio-build-prices = "agentic_portfolio.dataset.prices:main"
+portfolio-build-fundamentals = "agentic_portfolio.dataset.fundamentals:main"
+portfolio-build-momentum = "agentic_portfolio.dataset.momentum:main"
+portfolio-build-returns = "agentic_portfolio.dataset.returns:main"
+portfolio-build-dividends = "agentic_portfolio.dataset.dividends:main"
+portfolio-build-news-archive = "agentic_portfolio.dataset.news_archive:main"
+portfolio-backfill-snapshot = "agentic_portfolio.dataset.backfill_snapshot:main"
+portfolio-holdings = "agentic_portfolio.flow.holdings_cli:main"
+portfolio-summary = "agentic_portfolio.flow.summary_cli:main"
+portfolio-migrate-candidates = "agentic_portfolio.flow.candidate_memory:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# The import root is `src` itself (every module imports as `src.<package>.<module>`),
-# so the wheel ships that directory as-is rather than a renamed distribution package.
-packages = ["src"]
+# Standard src-layout: the wheel's single top-level package is `agentic_portfolio`, so an
+# install never claims a generic name like `src` in the user's site-packages.
+#
+# The six `agents/*_crew/config/*.yaml` files ship because hatchling includes non-Python
+# files found inside a `packages` directory. They MUST be in the wheel and MUST stay beside
+# their crew module: CrewAI resolves `config/agents.yaml` relative to each crew module's own
+# file location (`crewai/project/crew_base.py`), never relative to the working directory.
+# They carry all of the LLM-S and LLM-F prompt text, so a wheel without them produces agents
+# with empty configuration.
+packages = ["src/agentic_portfolio"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+# Deliberately no `pythonpath` entry. Tests import the INSTALLED package, which `uv run`
+# provides, so that a packaging mistake - a prompt YAML missing from the wheel, say - fails
+# here rather than at a user. Pointing pythonpath at `src` would let the suite pass against
+# a source tree that was never packaged.

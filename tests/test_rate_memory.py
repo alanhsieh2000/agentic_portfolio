@@ -1,4 +1,4 @@
-"""Tests for src/flow/rate_memory.py's memory/rates.json read/write round
+"""Tests for src/agentic_portfolio/flow/rate_memory.py's memory/rates.json read/write round
 trip, the per-currency independence that keeps one currency's rate from
 disturbing another's, the validation a hand-editable rate file needs, and
 the four-deep precedence both CLI layers apply.
@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from src.flow.rate_memory import (
+from agentic_portfolio.flow.rate_memory import (
     MAX_ABS_RISK_FREE_RATE,
     load_all_risk_free_rates,
     load_risk_free_rate,
