@@ -26,6 +26,113 @@ Environment variables this project depends on:
 - `DIVIDEND_LOOKBACK_MONTHS` (optional) — the trailing window a per-ticker dividend yield is computed over, in months (default `12`, the trailing-twelve-month convention). A ticker's yield is the per-share dividends with an ex-date in this window divided by its latest price.
 - `DB_PATH` (optional) — overrides the default DuckDB file location (`data/portfolio.duckdb`).
 
+# How to Use
+
+Every command below is a console script installed by `pyproject.toml`'s `[project.scripts]`, run as `uv run <name>`. This section is a quick reference for flags and defaults; the prose above explains the *why* behind each one in far more depth.
+
+## Dataset build commands
+
+Offline, one-time (or occasional) setup that populates the shared `data/portfolio.duckdb` cache. None of these take flags unless noted; run them in this order for a fresh database.
+
+| Command | Arguments | What it does |
+|---|---|---|
+| `portfolio-build-membership` | none | Builds the S&P 500 historical membership table. |
+| `portfolio-build-prices` | none | Fetches price history for every member. |
+| `portfolio-build-fundamentals` | none | Builds the `mve` (log firm size) and `bm` (book-to-market) factors from SEC EDGAR filings and prices. |
+| `portfolio-build-momentum` | none | Builds the 12-month momentum (`mom12m`) factor. |
+| `portfolio-build-returns` | none | Builds the monthly returns table from prices. |
+| `portfolio-build-dividends [TICKER ...]` | optional positional ticker list | With no tickers, rebuilds dividend coverage for the whole membership universe (several minutes). With tickers (e.g. `portfolio-build-dividends AVB EA EQR LEG`), fetches and upserts only those and prints why any of them has no coverage — cheap enough to re-run while debugging a gap. Only needed for `uv run portfolio` at a historical date with a screened selection; every other path builds its own dividends. |
+| `portfolio-build-news-archive` | none | Downloads and builds the news archive LLM-F reads sentiment from. |
+| `portfolio-backfill-snapshot [YYYY-MM-DD]` | one optional positional date, default `2019-12-31` | Builds one historical snapshot (membership + prices + factors) for that date. |
+| `portfolio-migrate-candidates [--path FILE]` | `--path` (default `memory/candidates.json`) | Rewrites an old flat `candidates.json` into the per-currency shape in place, preserving tickers and timestamps. Safe to run on an already-migrated file (no-op). |
+
+## `portfolio-backtest`
+
+No arguments. Runs the full paper backtest (LLM-S-only selection, MSR objective, 2020-01-01 to 2024-04-30) and prints the realized annualized Sharpe ratio next to the paper's S&P 500 baseline (0.6324).
+
+## `portfolio` — solve for a portfolio
+
+`uv run portfolio --date <DATE> --value <AMOUNT> [flags]`
+
+Required:
+
+- `--date DATE` — rebalance date as `YYYY-MM-DD`, or `today` for Live Mode.
+- `--value VALUE` — total amount to allocate, in the portfolio's own currency (USD for every selection except `user_provided`, which can be any currency).
+
+Selection and objective:
+
+- `--selection {llm_s_only,llm_f_only,llm_s_and_f,user_provided}` (default `llm_s_only`) — which candidate set to screen. `user_provided` opens an interactive pool you build yourself; the other three screen the S&P 500 per the paper's methodology.
+- `--objective {GMV,MV,MSR}` (default: derived — MV targeting the benchmark's own expected return if one can be measured, else GMV) — which portfolio to solve for.
+- `--target-return RATE` — annual return `MV` optimizes toward (decimal, e.g. `0.12`); implies `--objective MV` if `--objective` is omitted. Ignored by `GMV`/`MSR`.
+- `--risk-free-rate RATE` — decimal (e.g. `0.0425`); what every Sharpe ratio in the report is measured against. Given here, it is **remembered** for this run's currency and reused by later `portfolio`/`portfolio-holdings` runs. Left out, falls back to the currency's remembered rate, then `RISK_FREE_RATE`, then 2%.
+- `--min-annual-dividend CASH` / `--min-dividend-yield YIELD` (mutually exclusive) — require the portfolio to pay at least this much (in portfolio currency) or yield at least this decimal fraction (ceiling `0.25`) over the coming year. Applies to `GMV`, `MV`, and `MSR` alike.
+- `--benchmark TICKER` / `--benchmark none` — what the report compares the portfolio against. Defaults to the pool's saved benchmark, else the currency's default (`SPY` for USD; other currencies are asked once and it's remembered). Must trade in the portfolio's own currency.
+
+Files and paths:
+
+- `--db-path PATH` (default `data/portfolio.duckdb`) — the shared S&P 500 universe database, read for screened selections.
+- `--memory-path PATH` (default `memory/candidates.json`) — where `user_provided` pools are persisted.
+- `--currency CCY` — which currency's saved `user_provided` pool to resume (or start fresh in), non-interactively. Applies only to `--selection user_provided`.
+- `--rates-path PATH` (default `memory/rates.json`) — where per-currency risk-free rates are remembered.
+- `--holdings-path PATH` (default `memory/portfolio.json`) — where your actually-held portfolio is read from, for the holdings block.
+- `--holdings-cache-path PATH` (default `data/holdings.duckdb`) — where the holdings block's prices/returns are cached.
+- `--output-dir DIR` (default `output`, or `OUTPUT_DIR`) — where every report is also saved, under `<dir>/<year>-<month>/`.
+
+Toggles (all `store_true`, default off):
+
+- `--no-dividend-fetch` — skip fetching dividend history; leaves dividend figures out of the report. Refused together with a dividend floor.
+- `--no-benchmark-fetch` — only use benchmark data already cached; never fetch. Reports the benchmark as unavailable if it's missing.
+- `--no-ticker-summary` — don't auto-print a ticker's performance summary when it's added to a `user_provided` pool (the `[s]ummary` prompt still works).
+- `--no-save-reports` — print reports but save no copy.
+- `--refresh-holdings` — refetch holdings' prices now instead of reusing the monthly cache.
+- `--no-holdings` — leave the holdings block out of the report entirely.
+- `--no-holdings-fetch` — measure holdings only from data already on disk; never fetch.
+
+When `--selection user_provided` runs interactively, you get two prompts:
+
+- Resuming: `[Enter]` resume the one saved pool, or pick a currency / `[n]ew` when several (or none) are saved.
+- Editing the pool: `[a]dd` tickers / `[r]emove` tickers / `[o]bjective` / `[t]arget-return` / `[d]ividend` / `[b]enchmark` / `[s]ummary` (this selection only) / `[f]inish`.
+
+## `portfolio-holdings` — maintain and report the portfolio you actually hold
+
+`uv run portfolio-holdings [show|set|remove|whatif] [args...] [flags]`
+
+Subcommands (positional `command`, default `show`):
+
+- `show` — report every saved portfolio (default when no subcommand is given).
+- `set TICKER SHARES [TICKER SHARES ...]` — record or update holdings; `SHARES 0` retires a holding. Which per-currency portfolio is edited follows from the ticker itself unless `--currency` is given.
+- `remove TICKER [TICKER ...]` — drop holdings.
+- `whatif` — interactive, saves nothing: `[s]et` shares (any ticker, including ones you don't own) / `[r]emove` / `[w]indow` (24–60 months) / `[u]ndo all` / `[f]inish`. Prints the exact `set` command that would apply the experiment.
+
+Flags:
+
+- `--path PATH` (default `memory/portfolio.json`) — where portfolios are stored.
+- `--currency CCY` — target a specific currency's portfolio explicitly.
+- `--db-path PATH` (default `data/portfolio.duckdb`) — read-only cache consulted before fetching.
+- `--date DATE` (default `today`) — as-of date for pricing and measurement, `YYYY-MM-DD` or `today`.
+- `--risk-free-rate RATE` — decimal; same remember-per-currency behavior as `portfolio`'s flag.
+- `--holdings-cache-path PATH` (default `data/holdings.duckdb`) — price/return cache, refreshed monthly per ticker.
+- `--refresh-holdings` — force a refetch now instead of reusing the cache.
+- `--rates-path PATH` (default `memory/rates.json`).
+- `--output-dir DIR` (default `output`) — where `whatif` saves its reports.
+- `--no-save-reports` — `whatif` prints but saves nothing.
+- `--no-holdings-fetch` / `--no-fetch` — measure only from data already on disk; never fetch.
+
+Examples: `portfolio-holdings set SPY 1000 T 500` · `portfolio-holdings remove T` · `portfolio-holdings --currency JPY set 1321.T 50` · `portfolio-holdings show` · `portfolio-holdings whatif`.
+
+## `portfolio-summary` — summarize a month of saved reports
+
+`uv run portfolio-summary [MONTH] [flags]`
+
+- `month` (optional positional, `YYYY-MM`, default: current calendar month) — which `output/<month>/` folder to summarize.
+- `--output-dir DIR` (default `output`) — where the archive is read from and the summary is written back to.
+- `--model NAME` — override `LLM_QUICK` for this run's prose.
+- `--no-llm` — print the computed tables with no prose and no network call.
+- `--stdout` — print the briefing without saving it.
+- `--force` — write a new summary even if one already covers exactly this set of source reports.
+
+Examples: `portfolio-summary` · `portfolio-summary 2026-09` · `portfolio-summary 2026-09 --no-llm --stdout`.
+
 # Backtest Mode
 
 The backtest period is from 2020-01-01 to 2024-04-30. There are 2 stages:
