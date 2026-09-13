@@ -118,6 +118,44 @@ Fifth, the command works with no LLM at all. `--no-llm` prints the same document
 sections omitted and a note saying so. That is what makes every test in this plan hermetic, and it
 is the fallback when `OPENAI_API_KEY` is unset.
 
+Two later milestones widened who the briefing is FOR, and they share this transcript. A document
+that is English and Markdown serves the person who ran the commands and nobody else. So:
+
+    $ uv run portfolio-summary 2026-09 --language zh-TW --pdf
+    Reading output/2026-09/ ... 9 reports (4 portfolio, 5 whatif), 1 currency.
+
+    # Portfolio archive summary - 2026-09
+    ... the briefing, in English, with prose ...
+
+    Saved report: output/2026-09/2026-09-11-summary-473f6f15.md
+    Saved PDF: output/2026-09/2026-09-11-summary-473f6f15.pdf
+
+    # 投資組合檔案摘要 - 2026-09
+    ... the same document, same tables, same figures, Chinese sentences ...
+
+      rank  what                       return  volatility  Sharpe   div yield  div income
+      1     portfolio MSR              0.2513  0.1056      2.0207   0.0475     4,753.20
+
+    Translation: zh-TW by openai/gpt-5-nano, from 2026-09-11-summary-473f6f15.md.
+    Every figure and every table above is the English original's.
+    Saved report: output/2026-09/2026-09-11-summary-zh-TW-91c40e7b.md
+    Saved PDF: output/2026-09/2026-09-11-summary-zh-TW-91c40e7b.pdf
+
+Four files, and three things in that transcript matter as much as the first five.
+
+Sixth, the leaderboard in the Chinese document is the SAME BYTES as the leaderboard in the English
+one. The translator is never shown a table. That is not a safety belt bolted on afterwards; it is
+the plan's own figures-in-Python split applied one level up, and it is what keeps the columns
+aligned - `_table` pads with `str.ljust` while a CJK glyph is double-width, so a translated header
+would break every row beneath it and the Chinese document would be HARDER to read than the English.
+
+Seventh, the English document is always written first and the translation is derived from it, so
+the two can be diffed and neither can quietly disagree with the other. A month that already has an
+English summary needs no prose call at all to gain a Chinese one.
+
+Eighth, the PDF is a rendering of the saved Markdown rather than a second document, and its tables
+are fixed-width text because that is the only thing that keeps seven columns in line on a page.
+
 
 ## Progress
 
@@ -164,6 +202,32 @@ is the fallback when `OPENAI_API_KEY` is unset.
       1033 baseline plus the 16 tests of Milestone 6. The runtime fell again, from 443s, so nothing
       in the appendix reaches the network. Note the earlier 436s/1046 run predates the
       `existing_summary` fix and is superseded by this one.
+- [x] (2026-09-13 07:20Z) Milestone 7: the translated briefing.
+      `src/agentic_portfolio/flow/briefing_blocks.py` (splitter plus token protection, 39
+      tests), `protected_literals` in `src/agentic_portfolio/flow/report_summary.py`,
+      `src/agentic_portfolio/agents/translation_schema.py`,
+      `src/agentic_portfolio/agents/translate_crew/`,
+      `src/agentic_portfolio/agents/report_translation.py` (40 tests), the `--language` flag and
+      the reuse-the-saved-English path in `src/agentic_portfolio/flow/summary_cli.py` (22 tests),
+      four new `FACT_ORDER` keys and a `language` filename token, `purpose`/`remedy` parameters
+      on `api_key_problem`, and `translate_crew` added to `CREW_PACKAGES`.
+- [x] (2026-09-13 07:45Z) Milestone 8: the PDF. `src/agentic_portfolio/flow/report_pdf.py` and
+      the packaged `report_pdf.css` (48 tests, WeasyPrint invoked for real), the `--pdf` flag
+      and `_render_pdf` in the CLI (12 tests), two packaging guards for the stylesheet, the
+      Pango/HarfBuzz/font packages in both container images, and the corrected
+      `pyproject.toml` dependency comment.
+- [x] (2026-09-13 07:50Z) Both milestones verified end to end against a copy of the real
+      22-report `output/2026-09/`. Transcript and measurements in `Artifacts and Notes`.
+- [x] (2026-09-13 08:35Z) Full suite green on the finished code: `uv run pytest tests/test_*.py`
+      reports `1261 passed, 3 warnings in 634.33s`. The runtime rise over the 422s recorded for
+      Milestone 6 was investigated rather than accepted and is not this amendment's: the 15
+      slowest tests are all in `tests/test_holdings.py` and `tests/test_holdings_cli.py`, which
+      import nothing changed here, while the nine affected files total 5.2s. See
+      `Artifacts and Notes`.
+- [ ] Not done: no live-model run of `--language`. Every translation path was exercised with a
+      stub, so the verifier, the gates and the CLI wiring are proven while the QUALITY of a real
+      `gpt-5-nano` Traditional Chinese translation is not. That is the one thing left to try, and
+      it costs one call.
 
 ## Surprises & Discoveries
 
@@ -250,6 +314,143 @@ is the fallback when `OPENAI_API_KEY` is unset.
   A separate imperfection the verifier does NOT catch is noted under
   `Outcomes & Retrospective`: it checks figures, not flag spelling, and the model invented a
   positional argument for `portfolio-holdings whatif`.
+
+- Observation: (Milestone 8) the briefing's tables are invisible to a Markdown parser. `_table`
+  in `src/agentic_portfolio/flow/report_summary.py` indents by TWO spaces and pads with
+  `str.ljust`, but CommonMark needs FOUR spaces to make a code block, so a 2-space indented line
+  is lazy paragraph continuation - and HTML then collapses the very runs of spaces that are the
+  column alignment. So the obvious implementation of "convert the Markdown to HTML and print it"
+  destroys every table in the document, which is the one thing the document exists for.
+  Evidence: the real saved briefing holds 95 indented lines across 13 blocks. This is why there is
+  no Markdown library in Milestone 8 and why every indented run becomes a `<pre>` element: a
+  generic converter would have needed a pre-processor that already knew this rule, at which point
+  the pre-processor is the converter.
+
+- Observation: (Milestone 8) a line too wide for the page is not reported by WeasyPrint. With
+  `white-space: pre` a 302-character line is laid out on ONE line 620pt wide inside 688pt of
+  content width and simply runs off the paper - no warning, no error, no visible sign in the
+  build. The document's widest indented line is 183 characters, in the every-window list.
+  Evidence: rendering `"  " + "W"*300` at 9pt lays out all 302 characters on a single line;
+  the same input under `white-space: pre-wrap` lays out 302 characters across two lines.
+  Consequence: `pre-wrap` plus a hanging indent is load-bearing rather than cosmetic, and each
+  block is additionally sized from its own widest line so that wrapping is the exception.
+
+- Observation: (Milestone 8) no font in this container has a single CJK glyph, and nothing says so.
+  `fc-list :lang=zh-tw` is empty and the only families present are DejaVu Sans, DejaVu Serif and
+  DejaVu Sans Mono. A Traditional Chinese PDF therefore renders as a page of empty boxes, and
+  WeasyPrint emits no warning at all while doing it.
+  Evidence: probing every `.ttf` under `/usr/share/fonts` shows all six map `A` and none maps
+  U+6708 (月). Consequence: `--pdf` REFUSES a CJK document when no CJK font is installed, naming
+  the font package, rather than writing a plausible-looking file full of boxes. A silent artifact
+  that gets emailed is worse than a refusal, and the Markdown is already on disk either way.
+
+- Observation: (Milestone 8) the released image could not have imported WeasyPrint at all.
+  `docker/Dockerfile.dev` installs `libpango-1.0-0`, `libpangoft2-1.0-0`, `libharfbuzz0b` and
+  `libharfbuzz-subset0`, but the runtime stage of the root `Dockerfile` installs only `libgomp1`
+  and `libatomic1`, and neither image installs any font package. WeasyPrint `dlopen`s Pango
+  through cffi at IMPORT time, so the failure would have been an `OSError` at the first `--pdf`
+  and in no build step. Note no cairo is needed: WeasyPrint has written PDF itself since v53.
+  Evidence: the two `apt-get install` lines, and a clean render in this container, which has no
+  `libcairo2`.
+
+- Observation: (Milestone 8) fontconfig can be asked which families exist WITHOUT a new
+  dependency and without shelling out to `fc-list`. WeasyPrint already holds a cffi handle on the
+  fontconfig library, so `from weasyprint.text.ffi import ffi, fontconfig` and an
+  `FcFontMatch` for a family name answers the question directly: a family that is installed
+  matches itself, and one that is absent matches the substituted default.
+  Evidence: `"DejaVu Serif" -> "DejaVu Serif"` while `"Noto Sans CJK TC" -> "DejaVu Sans"`.
+  Consequence: the glyph check needs no `fontTools` declaration, which the first draft of this
+  milestone had added, and no `fc-list` binary - fontconfig's LIBRARY is guaranteed wherever
+  WeasyPrint imports at all, but its command-line tool is a separate package and is not.
+
+- Observation: (Milestone 7) a naive "protect the tokens that must survive translation" regex
+  mangles ordinary English, and it does so because of this project's own data. `T` is a real
+  ticker in the September candidate pool, so matching protected literals as plain substrings
+  masked the `T` inside `THIN`, `The` and `Two`, turning `WITHIN` into `WI[[0]]HIN`. Separately, a
+  `provider/model` pattern greedily swallowed the sentence period in `Prose: openai/gpt-5-nano.`.
+  Evidence: masking the real saved briefing produced `Ranked by Sharpe ratio WI[[0]]HIN each
+  returns window` before the fix and the correct `WITHIN` after it. Consequence: protected
+  literals are anchored with `(?<![0-9A-Za-z])` and `(?![0-9A-Za-z])`, and a trailing dot is
+  excluded from the provider pattern. Recorded because it generalizes: the protected set is drawn
+  from real market data, so single-letter tickers WILL collide with English words, and any future
+  matching rule must be anchored.
+
+- Observation: (Milestone 7) the protected set should come from the month's own data, not from a
+  regex over capital letters. A `[A-Z]{2,}` rule looks right and is wrong: it protects `CAUTION`,
+  `WITHIN`, `SAME` and `NOT APPLICABLE`, all of which are English words this feature exists to
+  translate. The `MonthDigest` already knows every ticker, currency, objective, benchmark, label,
+  filename, report digest and window date in the month, so the exact list is available for free.
+  Evidence: masking all 34 prose lines of the real briefing with the digest-derived list plus five
+  narrow patterns leaves every English word intact and every ticker, command, filename, date and
+  64-character digest opaque - for example `Skipped: [[0]]: skipped, kind is summary` and
+  `- [[0]] - settle [[1]] under standard benchmark and risk-free settings.`
+
+- Observation: (Milestone 7) the marker check is BLIND to a lost heading, and the markers were
+  the whole verification story until this was noticed. `#` is not a figure and a heading often
+  carries no markers at all, so a model that translated `## Risk/return leaderboard` into a bare
+  sentence passed every check - and the rebuilt document then wrote that block without its `##`,
+  silently demoting a section to a paragraph. Found by reading the verifier rather than from a
+  failure, because the test helper standing in for a translator was reproducing the prefix by
+  accident.
+  Evidence: `verify_block("## Risk/return leaderboard", "風險報酬排行榜")` returned `None` before
+  the fix. `structure_prefix` now extracts the leading `#{1,6} ` or `- ` and the verifier requires
+  the translation to keep it - and to not GROW one, since a paragraph that came back as a heading
+  is the same defect mirrored. Twelve tests failed the moment it was added, all of them because
+  the helper had been translating the prefix away; the helper was wrong in exactly the way a live
+  model would be. The general lesson: a mechanical check covers what it measures, and structure is
+  not a figure.
+
+- Observation: (Milestone 7) a marker is lost to adjacent punctuation long before it is lost to
+  a bad translation. The first test helper written to stand in for a translator kept any word
+  that STARTED with a marker, which quietly dropped the marker in `([[1]]` - and a rendered
+  briefing puts punctuation against a marker constantly, in `([[1]] portfolio, [[2]] whatif)`
+  and every window caption.
+  Evidence: the helper produced a block the verifier rejected, and the run failed the coverage
+  gate at 71%. The helper was what was wrong, but the lesson is about the real thing: this is
+  the single likeliest way a live model loses a marker, which is an argument for the rule being
+  exact equality on an ordered list rather than anything fuzzier.
+
+- Observation: (Milestone 8) `--language --pdf` in THIS container produces three files, not
+  four, and that is the design working rather than a defect. The English pair is written, the
+  Chinese Markdown is written, and the Chinese PDF is refused by name because no CJK font is
+  installed. The refusal is per FILE, so forgetting to install a font costs the translation's
+  PDF and nothing else.
+  Evidence: `Warning: no PDF - ...-summary-zh-TW-....md contains characters that need a CJK
+  font, and none is installed, so every one of them would print as an empty box. Install one
+  (on Debian: apt-get install fonts-noto-cjk) ...`. A test written to assert four files failed
+  here, correctly, and was split into one test of the CLI wiring (with the font probe patched)
+  and one of the refusal (with it patched the other way) - because whether a machine has a
+  Chinese font must not decide whether the suite passes.
+
+- Observation: (Milestone 8) `<p[^>]*>` also matches `<pre ...>`, so the obvious regex for "find
+  every paragraph" reports every table as a paragraph. Worth one line because the test it broke
+  was the test asserting that no table is EVER rendered as a paragraph - the assertion that
+  matters most in that file was the one the regex silently inverted.
+  Evidence: the failure quoted `'  rank  what ... return'` as a paragraph's contents. The
+  pattern is now `<p(?:\s[^>]*)?>`.
+
+- Observation: (Milestone 7) importing `crewai` puts `.env` into `os.environ`, which makes
+  `monkeypatch.delenv` alone an unreliable way to simulate a missing key - and makes an ad-hoc
+  check of the missing-key path spend money instead of refusing.
+  Evidence: `os.environ.pop("OPENAI_API_KEY")` then `import crewai` leaves the variable SET
+  again, because CrewAI calls `load_dotenv()` at import time. A by-hand check of
+  `translate_briefing`'s refusal path, written as "clear the key, then import and call", therefore
+  sailed past `api_key_problem` and made one real model call. Consequence: within the test suite
+  this is harmless, because `crewai` is imported once before any test body runs and a `delenv`
+  after that sticks - which is why the existing tests work. But it is why those tests clear
+  `settings.openai_api_key` AS WELL as the environment variable, and why a refusal path must be
+  exercised from a test rather than from a scratch script.
+
+- Observation: (Milestone 7) CrewAI's brace interpolation is safe for a substituted value today,
+  but only by one implementation detail. `crewai.utilities.string_utils.interpolate_only` raises
+  `KeyError: "Template variable 'stray' not found in inputs dictionary"` for any `{name}` in the
+  TEMPLATE it cannot resolve, and interpolation runs once - so a brace arriving inside the
+  document being translated passes through untouched.
+  Evidence: `interpolate_only("Doc: {document}", {"document": "a {brace} here"})` returns
+  `"Doc: a {brace} here"`, while a stray `{stray}` in the template raises. Consequence: the
+  request text maps braces to brackets anyway. It is one line, it changes nothing observable - the
+  real summaries contain no braces - and it removes a dependency on the order in which a third
+  party interpolates.
 
 ## Decision Log
 
@@ -382,6 +583,137 @@ is the fallback when `OPENAI_API_KEY` is unset.
   Rationale: the direct analogue of `generate_signal`'s empty-headlines short-circuit at
   `src/agents/llm_f.py:104` - there is nothing to compare, so calling anyway would either waste a
   call or invite the model to invent a comparison. Date/Author: 2026-09-11.
+- Decision: (Milestone 7) The translator is never shown a table. Only the heading, paragraph and
+  bullet blocks are sent; every indented run is re-inserted byte-identical because it was never
+  sent anywhere.
+  Rationale: this is the same split the whole plan is built on, applied one level up. Three things
+  follow from it that no after-the-fact verification of a translated document can promise. Every
+  figure, ticker and filename inside a table survives exactly, because it did not travel. Column
+  alignment survives, which matters more than it sounds: `_table` pads with `str.ljust` while a
+  CJK glyph is double-width in a monospace face, so a translated table header would break every
+  row beneath it and the document would be less readable in Chinese than in English. And a failure
+  is localizable to one block instead of costing the whole briefing, which is what makes the
+  fallback usable rather than theoretical. Date/Author: 2026-09-13.
+- Decision: (Milestone 7) Inside a block that IS sent, the tokens that must survive are replaced
+  by opaque placeholders built from the month's own data - every ticker, currency, objective,
+  benchmark, label, filename, report digest, window date and command string the `MonthDigest`
+  knows - plus five narrow patterns for figures, ISO dates, long hex runs, `*.md` names and a
+  `uv run ...` command head.
+  Rationale: the alternative, a regex over capital letters, protects `CAUTION`, `WITHIN` and `SAME`
+  - English words this feature exists to translate - while still missing a lowercase model name.
+  Drawing the list from the digest is exact rather than heuristic, and it costs nothing because
+  the digest already holds all of it. See `Surprises & Discoveries` for the two bugs the prototype
+  found, both of which are about matching rather than about the idea. Date/Author: 2026-09-13.
+- Decision: (Milestone 7) The verifier requires the ordered list of placeholders in a translated
+  block to EQUAL the list in its source, rather than requiring its figures to be a subset of the
+  source's.
+  Rationale: strictly stronger than `verify_narrative`'s subset test, and available here only
+  because of the decision above - once every figure is an opaque token, equality is a cheap exact
+  check rather than an approximation. It catches a dropped ticker, a localized date and a mangled
+  digest in one rule. The fallback is deliberately per block, and the count is printed, which is
+  the principle `verify_narrative` already established: a silent substitution is worse than the
+  fabrication it replaces. Date/Author: 2026-09-13.
+- Decision: (Milestone 7) The prose is written in English and then translated, rather than written
+  natively in the target language.
+  Rationale: `verify_narrative` compares figures, not language, so a Chinese narrative would pass
+  it - this is a choice, not a constraint. Three reasons decide it. Only a handful of the
+  briefing's lines are model prose; the great majority are the renderer's own English headings,
+  captions and `n/a` reasons, so a native-language prose pass would leave the document mostly
+  English and fail exactly the reader this milestone is for - and once a document pass exists,
+  native prose buys nothing. The English file is always saved, so a native pass would mean either
+  an English file with no prose or two independent narratives of one month sharing one
+  `sources_digest`; a translation is a derivative that can be diffed against its source, two
+  narratives are two documents. And the mechanical check needs a source text: every translated
+  line has an English line to be checked against, which is what makes the guarantee auditable by
+  a reviewer who reads only English. Date/Author: 2026-09-13.
+- Decision: (Milestone 7) A translation is its own archive entry carrying a `language` fact, and a
+  repeat is recognized by `(sources_digest, language)`.
+  Rationale: the user's explicit choice among three options. The English document stays the
+  canonical artifact and the translation is traceable to it by `translated_from`, so the pair can
+  be diffed. Matching on the pair is what stops an English summary from blocking a Chinese one.
+  The `language` fact is ABSENT rather than `en` on an English file, because the two summaries
+  already in `output/2026-09/` have no such fact and a reader should not have to learn that absent
+  and `en` mean the same thing; the lookup normalizes instead. Date/Author: 2026-09-13.
+- Decision: (Milestone 7) `--language` accepts free-form text - a BCP-47 tag or a plain language
+  name - with no allow-list.
+  Rationale: the user's explicit choice. Adding Japanese is then not a code change. The cost is
+  stated rather than hidden: a typo becomes a strange translation instead of an argument error,
+  and a language name in its own script slugs to nothing in the filename, where `_slug` yields
+  `unknown` - the file is still correct and still unique, because the name ends in a digest of the
+  body, and the `language` fact carries the truth. Date/Author: 2026-09-13.
+- Decision: (Milestone 7) `_FIGURE` and `stated_figures` stay in
+  `src/agentic_portfolio/agents/report_summary.py`. An earlier draft of this milestone moved them
+  into `src/agentic_portfolio/flow/report_summary.py` and re-exported them, citing the
+  `api_key_problem` precedent; that was specified and then dropped.
+  Rationale: the precedent does not apply, because there is no consumer. It was written while the
+  translation verifier was still imagined as comparing FIGURES, which a `crewai`-free flow module
+  would have needed. Once the verifier became placeholder equality - see the entry above - the only
+  figure pattern left in the flow layer is one alternative among eight inside
+  `briefing_blocks._NARROW`, which answers a different question: not "what figures does this prose
+  state" but "which spans must not be translated". Those two happen to share a sub-pattern and are
+  not one definition in two places. Against that, the move has a real cost that was measured rather
+  than assumed: no module under `src/agentic_portfolio/agents/` imports from
+  `src/agentic_portfolio/flow/` today, while three flow modules import from agents, so the
+  dependency runs exactly one way. Re-exporting would have made it the first bidirectional
+  package dependency in the project, in exchange for nothing. Recorded rather than quietly deleted
+  because the reasoning, not the conclusion, is the reusable part: a shared helper needs a second
+  caller before it needs a new home. Date/Author: 2026-09-13.
+- Decision: (Milestone 8) No Markdown library. The converter for this document's four constructs
+  is written here instead.
+  Rationale: not a preference but a consequence of `Surprises & Discoveries`. A generic parser
+  reads the briefing's 2-space-indented tables as prose and collapses the padding that IS the
+  table, so it would need a pre-processor that already applied the "an indented run is
+  preformatted" rule - at which point the pre-processor is the converter and the library renders
+  the four remaining constructs. `render_digest` is the only producer of this text and its
+  construct set is closed - two heading levels, plain paragraphs, `- ` bullets, indented runs and
+  one inline backtick - so the mapping can be pinned by test. It also keeps faith with the
+  eleven packages `plans/20_packaging_and_release.md` removed for being unused in a container
+  image: bringing one back to do a tenth of a job we must code anyway would read as reversing that
+  decision without actually reversing it. Date/Author: 2026-09-13.
+- Decision: (Milestone 8) Each indented block is sized from its own widest line, clamped between
+  6.5pt and 9pt, rather than the document taking one uniform size.
+  Rationale: measured, not guessed. Usable width on A4 with 15mm margins is 510pt and DejaVu Sans
+  Mono advances 0.602em, so a size follows from a character count. The briefing's widest indented
+  line is 183 characters, in the every-window list; sizing the WHOLE document to fit that puts the
+  leaderboard at about 5.5pt and makes the table the document is built around unreadable in order
+  to protect a prose list that happened to be indented. Per-block sizing keeps ten of thirteen
+  blocks at full size. Width is measured with `unicodedata.east_asian_width` counting wide and
+  fullwidth characters as two, so a block is sized for the space its glyphs actually occupy.
+  Date/Author: 2026-09-13.
+- Decision: (Milestone 8) `--pdf` renders from the saved file on disk, via `load_report`, not from
+  the body this run rendered in memory.
+  Rationale: three things follow and each one is wanted. The PDF provably matches the saved bytes
+  rather than a parallel rendering of them. It works on the already-saved path, where no body was
+  rendered this run - which is what lets someone who forgot `--pdf` get one without `--force` and
+  without a second Markdown file. And it works for a translated file whose text this code never
+  saw, which is how one flag serves both milestones. Date/Author: 2026-09-13.
+- Decision: (Milestone 8) A CJK document with no CJK font installed is REFUSED, not rendered with
+  a warning.
+  Rationale: the two outcomes are not symmetric. A refusal leaves the reader the Markdown, which
+  is already on disk and readable. A warning leaves them a four-page PDF of empty boxes that looks
+  finished, and that is the artifact that gets emailed. The check runs before rendering, names the
+  font package to install, and names the Markdown file that is complete regardless. Note this is
+  the opposite disposition from a failed prose or translation pass, which degrades and continues -
+  there the document is still correct without the prose, here it is not. Date/Author: 2026-09-13.
+- Decision: (Milestone 8) The glyph check asks fontconfig through WeasyPrint's own cffi handle, so
+  no new distribution is declared.
+  Rationale: the first draft of this milestone declared `fontTools` to read font `cmap` tables
+  directly. It works, but `weasyprint.text.ffi` already exposes the fontconfig library, and an
+  `FcFontMatch` answers exactly the question being asked. Shelling out to `fc-list` was the third
+  option and is the worst: fontconfig's library is guaranteed wherever WeasyPrint imports at all,
+  while its command-line tool is a separate package that the release image does not install.
+  Date/Author: 2026-09-13.
+- Decision: (Milestone 8) The PDF is not written through `save_report`, and no `pdf_status` fact is
+  recorded.
+  Rationale: `save_report` is a text-body API - it normalizes, digests, composes a filename from
+  archive facts, writes front matter, and refuses a path that exists. A PDF has no body to digest
+  independently of the Markdown it renders, no front matter, and an identity that is derived
+  rather than archived. Routing it through the archive would need either a second digest scheme or
+  a second archive kind, and either would let a PDF's name drift from the Markdown's. So
+  `report_filename` keeps sole ownership of `.md` naming and the PDF is only ever a suffix swap. A
+  `pdf_status` fact is refused for a sharper reason: front matter is written before the PDF exists,
+  so recording it would make the Markdown's own digest and filename depend on whether a PDF
+  succeeded. Date/Author: 2026-09-13.
 
 ## Outcomes & Retrospective
 
@@ -427,6 +759,19 @@ less varied than the real reports': the archive dedupes by body digest, so a bod
 the real reports carry silently merges two reports into one and shrinks the month under test.
 Nine tests failed at once for that reason, and the failure looked like nine bugs rather than one
 fixture.
+
+As of 2026-09-13 the plan has grown two further milestones, 7 and 8, which are SPECIFIED here and
+not yet delivered - `Progress` records them unchecked. They do not change any figure or any section
+of the briefing; they change who can read it. Milestone 7 saves a translated copy beside the
+English one, Milestone 8 renders a PDF beside each saved Markdown file, and the second amendment
+note at the foot of this file records what they turn on and what they deliberately leave undone.
+
+One claim in this retrospective is worth re-reading in their light. The paragraph above says the
+briefing "is only half a tool if it cannot point back at what it summarized". The same sentence
+shape applies again and was the argument for both milestones: a briefing is only half a tool if the
+person who needs to be shown it cannot read it. Milestone 6 was discovered from use, and so were
+these - which suggests the next gap will be too, and will be about reaching somebody this document
+still does not.
 
 ## Context and Orientation
 
@@ -857,6 +1202,290 @@ about 460 seconds means something in the new code is reaching the network and mu
 accepted.
 
 
+### Milestone 7 - the translated briefing
+
+
+At the end of this milestone `uv run portfolio-summary --language zh-TW` saves a second file beside
+the English one: the same briefing with its sentences in Traditional Chinese and every table, every
+figure and every ticker byte-identical to the English original.
+
+A note on paths before anything else. This plan was written before
+`plans/20_packaging_and_release.md` moved the package, so every `src/flow/...` and `src/agents/...`
+path above now reads `src/agentic_portfolio/flow/...` and `src/agentic_portfolio/agents/...`. This
+milestone and the next use the current paths throughout.
+
+**The shared splitter.** Create `src/agentic_portfolio/flow/briefing_blocks.py`, standard library
+only, no `crewai` and no `pydantic`, with a module docstring saying it is shared by the translator
+and the PDF renderer and that it makes no LLM call. Define a `Block` named tuple of `kind` and
+`text`, where `kind` is one of `heading`, `paragraph`, `bullet`, `preformatted` and `blank`, and
+`split_briefing(body) -> tuple[Block, ...]` plus `join_briefing(blocks) -> str`.
+
+The classification rule is short because `render_digest` is the only thing that produces this text.
+A line beginning `#` is a heading. A line beginning `- ` at column zero is a bullet. **Any line
+indented two or more spaces is preformatted**, and contiguous preformatted lines group into one
+block - including a blank line between two indented runs, so a window-sensitivity subject and the
+4-space table beneath it stay together. Everything else is a paragraph. Against the real saved
+briefing that rule classifies every line: 95 preformatted, 31 paragraph, 9 heading, 4 bullet, 49
+blank. `join_briefing(split_briefing(text)) == text` is a round-trip law, it deserves its own test,
+and it is what makes reassembly safe rather than hopeful.
+
+**Token protection.** In the same module, add
+`protect_tokens(text, literals) -> tuple[str, tuple[str, ...]]` and
+`restore_tokens(text, tokens) -> str`. `protect_tokens` replaces each protected span with a
+placeholder the model is told to copy, and returns the masked text alongside the spans in order.
+Protected spans are the `literals` it is given, matched with `(?<![0-9A-Za-z])` and
+`(?![0-9A-Za-z])` on both sides - single-letter tickers exist, `T` is one, and an unanchored match
+turns `WITHIN` into a masked fragment - plus five narrow patterns: an ISO date, a figure (the same
+`[0-9][0-9,]*(?:\.[0-9]+)?` run the narrative verifier uses), a hex run of sixteen or more, a
+`*.md` filename, and a `uv run ...` command head. Adjacent spans separated by at most one space
+merge into one placeholder, so a whole command line is one token rather than a dozen. A trailing
+dot is excluded from the provider-name pattern, or `Prose: openai/gpt-5-nano.` loses its sentence
+period.
+
+The literals come from the month's own data, not from a regex over capital letters. Add
+`protected_literals(digest, records) -> tuple[str, ...]` to
+`src/agentic_portfolio/flow/report_summary.py`, which already holds all of it: every ticker from
+`candidates`, `positions` and the parsed weights, every currency, objective, benchmark and
+`label`, every source filename, every report digest, the `sources_digest`, every `command` string
+and every window date. A `[A-Z]{2,}` rule was the obvious alternative and is wrong - it protects
+`CAUTION`, `WITHIN` and `SAME`, which are English words this milestone exists to translate.
+
+Nothing moves out of `src/agentic_portfolio/agents/report_summary.py`. An earlier draft of this
+milestone moved `_FIGURE` and `stated_figures` into the flow layer so that a module without
+`crewai` could reuse them; that is not needed and would cost something. See the `Decision Log`
+entry for why it was specified and then dropped.
+
+**The schema.** Create `src/agentic_portfolio/agents/translation_schema.py` with
+`TranslatedBlock(index: int, text: str)` and `TranslatedBriefing(blocks: list[TranslatedBlock])`,
+plus a short `disclaimer` field holding one sentence IN THE TARGET LANGUAGE saying the document is
+a machine translation whose tables were not translated. Every field carries a
+`Field(description=...)`, because a description reaches the model as its output schema and is
+therefore half the instruction rather than documentation of it - the same reasoning
+`src/agentic_portfolio/agents/summary_schema.py` records. The index is explicit rather than
+positional on purpose: a model that drops one block must not shift every block after it.
+
+**The crew.** Create `src/agentic_portfolio/agents/translate_crew/` with `__init__.py`, `crew.py`
+and `config/agents.yaml` plus `config/tasks.yaml`, copying the shape of `summary_crew/` exactly: a
+`@CrewBase class ReportTranslationCrew` whose `__init__(self, model: str)` stores only the model,
+an `@agent translator_agent()` and `@task translation_task()` built through `require(...)` from
+`src/agentic_portfolio/agents/crew_config.py`, `output_pydantic=TranslatedBriefing`, `verbose=False`
+for the same reason this command's other crew uses it, and `llm=self.model` as a bare
+`provider/model` string rather than a `crewai.LLM` - see this plan's existing decision on that.
+`tasks.yaml` interpolates `{language}`, `{month}`, `{block_count}` and `{blocks}`.
+
+`agents.yaml` gives the agent the role of a financial report translator, and its backstory carries
+the one constraint that makes the design work, stated as a rule about its own output: you are
+translating a document whose numbers are already correct and already printed in tables your
+sentences will sit beside; every placeholder you are given is copied character for character and
+never translated, reordered or explained; you translate only the words around them; you return one
+entry per block index you were given and nothing else.
+
+**The driver.** Create `src/agentic_portfolio/agents/report_translation.py` with
+`TranslationUnavailable`, `verify_translation(sources, translated)` and
+`translate_briefing(body, language, digest, records, model=None) -> tuple[str, tuple[str, ...]]`,
+following `generate_narrative` in this order, so that every refusal happens before anything is
+charged: refuse a blank `language`; split and mask; refuse a document with more translatable blocks
+than the cap, naming chunking as the thing that is not implemented; resolve
+`model or settings.llm_quick`; call `api_key_problem` BEFORE the crew is built; kickoff, wrapping
+any provider exception as `TranslationUnavailable` naming the model; refuse a result with no
+`pydantic` payload.
+
+`verify_translation` is where the guarantee lives, and it is a stricter test than
+`verify_narrative`'s: **the ordered list of placeholders in a translated block must equal the list
+in its source.** Once every figure, ticker, date, digest and command is an opaque token, equality
+is exact and cheap, and one rule catches a dropped ticker, a localized date and a mangled digest
+alike. A block that fails, or that the model omits entirely, keeps its English text and is counted.
+Then two whole-document gates, each raising with a sentence naming the reason: if fewer than four
+fifths of the blocks were accepted, abandon the translation, because a document that is one fifth
+English is worse than one that is honestly all English; and if fewer than half the accepted blocks
+actually differ from their English source, abandon it as well, since a small model echoing its
+input back would otherwise pass every placeholder check and produce an English file labelled
+`language: zh-TW`. Script detection cannot substitute for that second gate, because `--language`
+is free-form and the target script is unknown.
+
+Reassembly is `restore_tokens` then `join_briefing`. The body then gains the model's disclaimer in
+the target language and one deterministic English audit line naming the model, the language, the
+file translated from, and how many blocks stayed English - two languages deliberately, because the
+target-language reader needs to know it is machine-translated and a reviewer who reads only English
+needs the counts.
+
+**The command.** In `src/agentic_portfolio/flow/summary_cli.py` add `--language`, documented in this
+command's established voice: free-form, a BCP-47 tag or a plain language name, the English summary
+always written first, every figure and table copied from it unchanged, and any sentence whose
+placeholders do not survive left in English rather than guessed at. `--language` with `--no-llm` is
+a contradiction and is refused through `parser.error` naming both flags, exit 2, since `--no-llm`
+promises no network call at all. Give `existing_summary` a `language` parameter defaulting to
+`None`, and match `(facts.get("language") or None) == (language or None)` so that an absent fact
+means English and the two summaries already in `output/2026-09/` keep being recognized.
+
+The orchestration has three cases and the middle one is the valuable one. If neither file exists,
+run the prose pass, render, save the English, translate, save the translation. If the English
+exists but the translation does not, make **no prose call**: read the saved English body back with
+`load_report` and translate that, recording `translated_from` as its digest - so `--language` on an
+already-summarized month is cheap, idempotent, and provably a translation of the bytes on disk. If
+both exist, print both already-saved notices and write nothing. `--force` rewrites both.
+
+A translation failure degrades exactly as `NarrativeUnavailable` does: warn on stderr, print and
+save the English, exit 0. A failed translation must not cost the reader the briefing.
+
+**The archive.** In `src/agentic_portfolio/flow/report_archive.py` add `language`,
+`translation_model`, `translated_from` and `translation_status` to `FACT_ORDER` after
+`narrative_status`, so the summary group reads in the order a person asks the questions. Add
+`language` to `report_filename`'s token loop, giving
+`2026-09-11-summary-zh-TW-91c40e7b.md`. Say in the docstring that this token is for human
+legibility and NOT a uniqueness mechanism - the name already ends in a digest of the body, and two
+languages cannot produce one body - so that nobody later mistakes it for one. All of this is
+additive: a key absent from a report's facts is omitted from the file, and digests cover the body
+alone, so no existing file or call site changes.
+
+Add `translate_crew` to `CREW_PACKAGES` in `tests/test_packaging.py`. That is the guard which
+catches a prompt YAML missing from the wheel, and a new crew that skips it ships broken.
+
+Write `tests/test_briefing_blocks.py` and `tests/test_report_translation.py`, and extend
+`tests/test_summary_cli.py`, `tests/test_report_archive.py` and `tests/test_packaging.py`. Build
+fixtures by writing real reports with `save_report` and rendering them with `render_digest`, per
+this plan's own lesson that a hand-rolled imitation tests a smaller month than it claims. Cover at
+least: the round-trip law; every indented line landing in a `preformatted` block and none in a
+paragraph; a blank line inside an indented run not splitting it; `protect_tokens` leaving `WITHIN`
+intact while masking the ticker `T` where it stands alone; a command line masked as ONE placeholder;
+`Prose: openai/gpt-5-nano.` keeping its period; a block whose placeholders were reordered rejected;
+a block the model omitted keeping its English; the coverage and echo gates each abandoning a
+translation with a named reason; no line of a translated briefing being exactly `---`; an English
+summary not blocking a translation of the same reports and vice versa; `--language` on an
+already-summarized month translating without a prose call, asserted with a fake
+`generate_narrative` that fails if called; and a translated file not being read back as a source
+report.
+
+Verify:
+
+    uv run pytest tests/test_briefing_blocks.py tests/test_report_translation.py -q
+    uv run pytest tests/test_summary_cli.py tests/test_report_archive.py tests/test_packaging.py -q
+
+
+### Milestone 8 - the PDF
+
+
+At the end of this milestone `uv run portfolio-summary --pdf` writes a PDF beside every Markdown
+file the run saved, with the tables still in columns, and refuses - by name - to write a Chinese PDF
+on a machine with no Chinese font.
+
+**Why there is no Markdown library here.** `render_digest` indents its tables by two spaces and
+pads them with `str.ljust`. CommonMark needs four spaces to make a code block, so a generic parser
+reads every table as prose and HTML collapses the padding that is the table. A library would
+therefore need a pre-processor that already applied the "an indented run is preformatted" rule, at
+which point the pre-processor is the converter. Milestone 7's `split_briefing` already is that rule,
+so the conversion is the four remaining constructs and no new dependency.
+
+Create `src/agentic_portfolio/flow/report_pdf.py` with `PdfUnavailable`, a `RenderedPdf` named tuple
+of `path` and `created` mirroring `SavedReport`, `format_pdf_notice(rendered)` mirroring
+`format_save_notice`, and:
+
+    def contains_cjk(text: str) -> bool
+    def display_width(line: str) -> int
+    def pre_font_size(width: int) -> float
+    def cjk_font_family(families: Sequence[str] = CJK_FAMILIES) -> str | None
+    def briefing_html(facts: Mapping[str, str], body: str, *, source_name: str) -> str
+    def stylesheet() -> str
+    def pdf_path(md_path: Path | str) -> Path
+    def write_pdf(md_path: Path | str) -> RenderedPdf | None
+
+`briefing_html` walks `split_briefing`'s blocks and emits two heading levels, paragraphs, one
+unordered list and a `<pre>` per indented run, escaping with `html.escape` and touching nothing
+inside a preformatted block. It sets the document language so WeasyPrint picks the right font and
+line-breaking rules, and emits one small provenance paragraph naming the file, the save time, the
+source-report count and the prose model - which `string-set` also pins into every page footer, so a
+printed page always says which file it came from. It deliberately does not reproduce all fifteen
+front-matter facts: that is a page of machine metadata in a document made for reading, and it is one
+`cat` away in the Markdown.
+
+Sizing is arithmetic, not taste. Usable width on A4 portrait with 15mm margins is 510pt and DejaVu
+Sans Mono advances 0.602em, so `pre_font_size` picks the largest size at which a block's widest line
+fits, clamped between 6.5pt and 9pt, and `display_width` counts wide and fullwidth characters as two
+via `unicodedata.east_asian_width`. Each block is sized from its OWN widest line: the briefing's
+widest indented line is 183 characters, in the every-window list, and sizing the whole document to
+fit that puts the leaderboard at about 5.5pt - unreadable, in order to protect a prose list that
+happened to be indented.
+
+`write_pdf` takes a PATH and re-reads it with `load_report`, rather than taking the body this run
+rendered. That is what makes the PDF provably match the saved bytes, what makes `--pdf` work on the
+already-saved path where no body was rendered, and what lets one flag serve a translated file whose
+text this module never saw. If the PDF already exists it returns `created=False` and renders
+nothing. Otherwise it writes to a `.report-*.pdf` temporary in the destination directory and
+`os.replace`s it, copying `_write_atomically`'s shape including its cleanup on any `BaseException`.
+
+Create `src/agentic_portfolio/flow/report_pdf.css` as package data, read with
+`importlib.resources.files` - the pattern `tests/test_packaging.py` already defends and the reason
+the six crew YAML files ship at all. A4 portrait with 15mm margins and a footer carrying the source
+name and `page / pages`; a body font stack naming DejaVu Sans and then the CJK families, so CSS
+fallback handles an absent one; `h2` with a hairline rule and `break-after: avoid`; a `lead` class
+that only sets `break-after: avoid`, so a table caption cannot be orphaned from its table without
+inventing emphasis the Markdown does not state. `pre` uses `white-space: pre-wrap` with a hanging
+indent, and that is load-bearing rather than cosmetic: under plain `white-space: pre` an over-wide
+line is laid out in a single box wider than the paper and simply runs off it, with no warning from
+WeasyPrint at all. Wrapping misaligns the tail of one line; the alternative loses it.
+
+Failure handling, all of it raising `PdfUnavailable`, caught once in the CLI and printed as a
+warning on stderr with the exit status unchanged - the Markdown is the product and the PDF is a
+rendering of it. WeasyPrint absent or its system libraries missing is an `ImportError` or an
+`OSError` from `dlopen`, and the message names `libpango-1.0-0` and friends. An unwritable path is
+an `OSError` naming it. A file that is not a report this archive wrote is named too.
+
+The one exception to degrading is the font check, and it goes the other way. If the document
+contains CJK text and `cjk_font_family()` finds no CJK family, `--pdf` REFUSES before rendering,
+naming the font package to install and the Markdown file that is complete regardless. A refusal
+leaves the reader a readable document; a warning leaves them a four-page PDF of empty boxes that
+looks finished, and that is the artifact that gets emailed. The check asks fontconfig through
+WeasyPrint's own cffi handle, so it needs no new distribution and no `fc-list` binary.
+
+**The command.** Add `--pdf` to `src/agentic_portfolio/flow/summary_cli.py`, have `_write` return
+its `SavedReport`, and add a `_render_pdf(path)` sibling that never raises. Call it after each save
+and once on the already-saved path, gated on `args.pdf`. `--pdf` with `--stdout` is a contradiction
+and is refused through `parser.error` naming both flags, exit 2, because `--stdout` promises to save
+nothing and there is then nothing to render beside. `--pdf` is otherwise orthogonal to `--no-llm`
+and composes with `--language` by rendering one PDF per file saved.
+
+**The images.** Extend the runtime stage of the root `Dockerfile` with `libpango-1.0-0`,
+`libpangoft2-1.0-0`, `libharfbuzz0b`, `libharfbuzz-subset0`, `fonts-dejavu-core` and
+`fonts-noto-cjk`, and `docker/Dockerfile.dev` with the two font packages - its Pango libraries are
+already there. Comment both in those files' established why-not-what voice, including that no cairo
+is needed because WeasyPrint has written PDF itself since v53, that a missing font is silent, and
+that `fonts-noto-cjk` is the largest single addition to the release image and is what makes a
+Chinese briefing readable rather than a page of boxes. In `pyproject.toml`, correct the now-stale
+"exactly the nine distributions" comment, record that `weasyprint` is imported by this module, and
+say that `markdown` was deliberately NOT brought back when `weasyprint` arrived, with the reason
+above - a lock file cannot express that this dependency's SYSTEM libraries are part of the contract,
+so the comment must.
+
+Write `tests/test_report_pdf.py` and extend `tests/test_summary_cli.py` and
+`tests/test_packaging.py`. These tests invoke WeasyPrint for real: it is a declared dependency, it
+is installed, it touches no network, and the only interesting question - does WeasyPrint accept this
+HTML and this CSS - is precisely what a fake cannot answer. One render of the real briefing was
+measured at 0.11 to 0.14 seconds, so this adds about a second to a seven-minute suite, and a
+runtime rise here would be a real signal rather than noise. The two degradation paths monkeypatch
+this module's two named seams, the same way `tests/test_summary_cli.py` patches
+`generate_narrative` by its imported name.
+
+Cover at least: the exact substring `"  rank  what                       return"` appearing inside a
+`<pre>` in the HTML, which is the assertion this whole milestone exists for; no line starting with a
+space landing in a paragraph, checked over a real `render_digest` output; a blank row inside an
+indented block not splitting it; HTML metacharacters escaped; a narrow table keeping the largest
+size and a 117-character one shrinking to fit 510pt; a 183-character line clamped AND the stylesheet
+containing `pre-wrap`; `display_width("台灣") == 4`; the bytes starting `%PDF-` and the real briefing
+paginating to more than one page, so nothing was dropped into one overflowing page; an existing PDF
+left alone with `created=False`; two Markdown files in one folder getting two PDFs, which is the
+translation case; a missing renderer degrading with a message naming `libpango-1.0-0` while the
+Markdown is untouched; a CJK document with no CJK font refusing with a message naming
+`fonts-noto-cjk` and writing no file; `--pdf --stdout` exiting 2 and saying which flag to drop; a
+repeat run with `--pdf` rendering beside the summary already saved; a failed PDF keeping the
+briefing and warning; and a `.pdf` in the month folder not being read as a report and not even
+producing a skip note.
+
+Verify:
+
+    uv run pytest tests/test_report_pdf.py -q
+    uv run pytest tests/test_summary_cli.py tests/test_packaging.py -q
+
+
 ## Validation and Acceptance
 
 Acceptance is the Purpose transcript reproduced: from `/app/agentic_portfolio`,
@@ -872,6 +1501,25 @@ Per-milestone: `uv run pytest tests/test_report_summary.py tests/test_report_sum
 tests/test_summary_cli.py -q` passes; each of those three files fails before its milestone and
 passes after. `uv run pytest tests/test_*.py` stays green.
 
+Acceptance for Milestone 7 is one comparison, and it is the whole point of the design:
+`uv run portfolio-summary 2026-09 --language zh-TW` saves a second file whose headings and
+paragraphs are Traditional Chinese and whose tables are byte-identical to the English one, so
+
+    diff <(grep '^  ' <english>.md) <(grep '^  ' <chinese>.md)
+
+produces no output. The document's last lines name the model, the language, the English file it was
+translated from, and how many blocks stayed English. Running it again writes nothing and names both
+files. `--language` with `--no-llm` exits 2 naming both flags.
+
+Acceptance for Milestone 8 is that `uv run portfolio-summary 2026-09 --pdf` writes a file beginning
+`%PDF-` beside each saved briefing, that the real briefing paginates to more than one page rather
+than one overflowing page, and that its tables are still in columns in a monospace face rather than
+reflowed into prose. `--pdf --stdout` exits 2 naming both flags. In a container with no CJK font
+installed - which is the state of this one - a Chinese document is REFUSED by name, and that
+refusal firing is itself an acceptance criterion rather than a defect: it is the difference between
+a known limitation and a silent page of empty boxes. Installing `fonts-noto-cjk` is how to see the
+finished article.
+
 
 ## Idempotence and Recovery
 
@@ -883,6 +1531,18 @@ module is five additive names in `src/flow/report_archive.py`'s `FACT_ORDER`, wh
 any saved file's digest or filename because digests cover the body only; reverting it leaves the
 new facts written in sorted order after the known ones, still readable. A half-finished milestone
 is recovered by deleting the new files it created and re-reading this plan.
+
+Milestones 7 and 8 keep that property and widen the first sentence rather than weakening it. The
+edits to existing modules are still additive: four more `FACT_ORDER` names, one more token in
+`report_filename` that only a fact-carrying summary can trigger, and the move of `stated_figures`
+into `src/agentic_portfolio/flow/report_summary.py` with a re-export at its old path, so every
+existing import still resolves. Re-running with `--language` over an already-translated month
+writes nothing. `--pdf` renders only when the PDF is absent, so it is safe to repeat and is also
+the way to add a PDF to a month summarized before Milestone 8 existed. Neither flag deletes or
+rewrites anything: the only writers are `save_report`, which refuses a path that exists, and
+`write_pdf`, which returns `created=False` for one. A PDF is derived, so recovery from a bad render
+is deleting the `.pdf` and re-running - the Markdown it came from is untouched, which is the
+property the whole failure design is built on.
 
 
 ## Artifacts and Notes
@@ -966,6 +1626,93 @@ And the section the command exists for, which no single saved report can print:
         2021-10-01 to 2026-09-01 (60 months)  0.0498  0.1447      0.0813
         2022-10-03 to 2026-09-01 (48 months)  0.1073  0.1461      0.4740
 
+Milestones 7 and 8, verified 2026-09-13 against a copy of the real `output/2026-09/` - 22 source
+reports across USD and JPY, which is what that folder actually holds now rather than the nine it
+held when this plan was written. A COPY, so the verification wrote nothing into the archive:
+
+    $ uv run portfolio-summary 2026-09 --output-dir <copy> --no-llm --pdf
+    ... the figures-only briefing ...
+    Prose: none, by --no-llm. Every figure above was computed.
+    Saved report: <copy>/2026-09/2026-09-13-summary-799d0668.md
+    Saved PDF: <copy>/2026-09/2026-09-13-summary-799d0668.pdf
+
+    $ uv run portfolio-summary 2026-09 --output-dir <copy> --no-llm --pdf
+    Summary already saved for these 22 reports: .../2026-09-13-summary-799d0668.md
+    Re-run with --force to write a new one, or --stdout to print without saving.
+    PDF already saved beside the report: .../2026-09-13-summary-799d0668.pdf
+
+The PDF: 29,399 bytes, `%PDF-1.7`, six pages, and the widest text box laid out at 663.9px inside
+680.3px of content width - so nothing runs off the paper. `load_month` over the same folder
+afterwards reports `sources: 22` and one skip note naming the summary; the `.pdf` produces no note
+at all, because the reader globs `*.md`.
+
+Both refusals, with their real exit statuses:
+
+    $ uv run portfolio-summary 2026-09 --output-dir <copy> --pdf --stdout ; echo $?
+    portfolio-summary: error: --pdf renders a PDF beside a saved Markdown file, and --stdout
+    saves nothing. Drop --stdout to save both, or drop --pdf to just look at the month
+    2
+    $ uv run portfolio-summary 2026-09 --output-dir <copy> --language zh-TW --no-llm ; echo $?
+    portfolio-summary: error: --language cannot be combined with --no-llm: a translation is
+    written by a model, and --no-llm makes no network call at all. Drop one of them
+    2
+    $ uv run portfolio-summary 2026-10 --output-dir <copy> --no-llm ; echo $?
+    No reports to summarize in <copy>/2026-10/ (looked for kind: portfolio or kind: whatif).
+    1
+
+`--language zh-TW --pdf` with a STUBBED translator - a stub that masks, replaces every word, and
+restores the markers, exactly as a faithful translator would - wrote the four files, and the
+acceptance proof is the diff:
+
+    $ diff <(grep '^  ' <english>.md) <(grep '^  ' <chinese>.md)
+    # no output: all 206 table lines byte-identical
+
+Comparing the FIGURES of the two bodies is the other half of it. The English body states 1,081 and
+the Chinese 1,087; nothing is missing, and every one of the six additions is accounted for by the
+provenance lines this feature appends on purpose - `2026`, `09`, `13`, `5981` and `661` from the
+English filename it names, and `5` from the model name. The body grows by exactly three lines: a
+blank, the model's disclaimer in the target language, and the English audit line.
+
+The translation's front matter, which is where the pair becomes traceable:
+
+    kind: summary
+    month: 2026-09
+    report_count: 22
+    sources_digest: f3700d2de48c19f082d751bd15b77e3b1d1785506d7318ba29a2fcf079cd6a0c
+    llm_model: openai/gpt-5-nano
+    narrative_status: written
+    language: zh-TW
+    translation_model: openai/gpt-5-nano
+    translated_from: 5981d66154b1ab92dbefbad3294902f73d11df891a3f92c93b510aadc81f3262
+    translation_status: written
+
+Test counts for the two milestones: `tests/test_briefing_blocks.py` 39,
+`tests/test_report_translation.py` 49, `tests/test_report_pdf.py` 48, and
+`tests/test_summary_cli.py` 35 -> 73. Running the nine affected files together reports 363 passed
+in 5.2s, which is the reassuring direction: nothing added here reaches the network, and the PDF
+tests invoke WeasyPrint for real at about a tenth of a second per render.
+
+The full suite: `uv run pytest tests/test_*.py` reports `1261 passed, 3 warnings in 634.33s`, and
+`--collect-only -q` confirms 1261 - the 1049 recorded earlier in this plan plus the 127 added here
+and 85 added by other work in between.
+
+**The runtime needs explaining, because this plan made it an acceptance criterion**, and 634s is
+well above the "materially above about 460 seconds means something is reaching the network" line
+written for Milestone 5. It was measured and it is not the new code. The 15 slowest tests are ALL
+in `tests/test_holdings.py` (13 of them) and `tests/test_holdings_cli.py` (2), the slowest at
+23.36s, together accounting for about 236s; not one of the new test files appears among them, and
+`tests/test_holdings.py` imports no module this amendment touched. The nine affected files run in
+5.2s in total, so Milestones 7 and 8 contribute under one percent of the suite's time.
+
+Two corrections worth recording rather than hiding. The first full run of this amendment reported
+`1223.81s`, nearly double the real figure, because two earlier suite runs had been left going and
+were competing for the same cores - a measurement error, not a regression, and the reason the
+number was re-measured alone before being written down. And the 460-second threshold itself is now
+misleading: it was a sound heuristic for a 1049-test suite whose slowest tests were not the
+holdings ones, and it should be read as "the LLM and network-touching paths must stay mocked",
+which the per-file timings above demonstrate directly, rather than as a single number against a
+suite whose composition has changed.
+
 Per-milestone test counts, each file failing before its milestone and passing after:
 
     $ uv run pytest tests/test_report_summary.py tests/test_report_summary_agent.py \
@@ -1034,6 +1781,73 @@ In `src/flow/summary_cli.py`, define:
 In `pyproject.toml`, add `portfolio-summary = "src.flow.summary_cli:main"` to
 `[project.scripts]`.
 
+Milestones 7 and 8 add no new third-party distribution. `weasyprint` was already declared in
+`pyproject.toml` and was, until Milestone 8, the one declared dependency nothing imported. An
+earlier draft of Milestone 8 also declared `fontTools`; it is not needed, because
+`weasyprint.text.ffi` already exposes the fontconfig library the glyph check asks. What those
+milestones DO add is a system-library requirement that a lock file cannot express: WeasyPrint
+`dlopen`s Pango at import time, so both container images must install `libpango-1.0-0`,
+`libpangoft2-1.0-0`, `libharfbuzz0b` and `libharfbuzz-subset0`, plus `fonts-dejavu-core` for the
+tables and `fonts-noto-cjk` for any non-Latin translation.
+
+In `src/agentic_portfolio/flow/briefing_blocks.py`, define:
+
+    class Block(NamedTuple):
+        kind: str      # heading | paragraph | bullet | preformatted | blank
+        text: str
+
+    def split_briefing(body: str) -> tuple[Block, ...]
+    def join_briefing(blocks: Sequence[Block]) -> str
+    def protect_tokens(text: str, literals: Sequence[str]) -> tuple[str, tuple[str, ...]]
+    def restore_tokens(text: str, tokens: Sequence[str]) -> str
+
+In `src/agentic_portfolio/flow/report_summary.py`, add:
+
+    def protected_literals(
+        digest: MonthDigest, records: Sequence[ReportRecord]
+    ) -> tuple[str, ...]
+
+
+In `src/agentic_portfolio/agents/translation_schema.py`, define `TranslatedBlock` and
+`TranslatedBriefing`. In `src/agentic_portfolio/agents/translate_crew/crew.py`, define
+`ReportTranslationCrew` with the same three decorated methods as `ReportSummaryCrew`. In
+`src/agentic_portfolio/agents/report_translation.py`, define:
+
+    class TranslationUnavailable(RuntimeError)
+
+    def verify_translation(
+        sources: Sequence[str], translated: Mapping[int, str]
+    ) -> tuple[dict[int, str], tuple[str, ...]]
+
+    def translate_briefing(
+        body: str,
+        language: str,
+        digest: MonthDigest,
+        records: Sequence[ReportRecord],
+        model: str | None = None,
+    ) -> tuple[str, tuple[str, ...]]
+
+In `src/agentic_portfolio/flow/report_pdf.py`, define:
+
+    class PdfUnavailable(RuntimeError)
+
+    class RenderedPdf(NamedTuple):
+        path: Path
+        created: bool
+
+    def contains_cjk(text: str) -> bool
+    def display_width(line: str) -> int
+    def pre_font_size(width: int) -> float
+    def cjk_font_family(families: Sequence[str] = CJK_FAMILIES) -> str | None
+    def briefing_html(facts: Mapping[str, str], body: str, *, source_name: str) -> str
+    def stylesheet() -> str
+    def pdf_path(md_path: Path | str) -> Path
+    def write_pdf(md_path: Path | str) -> RenderedPdf | None
+    def format_pdf_notice(rendered: RenderedPdf | None) -> str | None
+
+In `src/agentic_portfolio/flow/summary_cli.py`, `existing_summary` gains a `language` parameter,
+`_write` returns its `SavedReport`, and a `_render_pdf(path) -> None` sibling is added.
+
 
 ## Amendment note - 2026-09-11, Milestone 6
 
@@ -1069,3 +1883,73 @@ detection compares the digest of the SET of source reports, not of the briefing 
 a month summarized before this amendment still reports `Summary already saved for these 9 reports:`,
 and `--force` is how the new layout reaches a saved file. That is the right trade - the alternative
 writes a new file on every run - but it is not obvious, so `README.md` now says it.
+
+
+## Amendment note - 2026-09-13, Milestones 7 and 8
+
+
+**What changed.** The briefing can now be read by someone who is not the person who ran the
+commands. Two flags were added to `uv run portfolio-summary`: `--language`, which saves a second
+file holding the same briefing with its sentences translated and every table byte-identical to the
+English original, and `--pdf`, which renders a PDF beside every Markdown file the run saved.
+Supporting them: `src/agentic_portfolio/flow/briefing_blocks.py` (shared by both),
+`src/agentic_portfolio/agents/translation_schema.py`,
+`src/agentic_portfolio/agents/translate_crew/`,
+`src/agentic_portfolio/agents/report_translation.py`, `src/agentic_portfolio/flow/report_pdf.py`
+and its packaged stylesheet, `protected_literals` in
+`src/agentic_portfolio/flow/report_summary.py`, four new `FACT_ORDER` keys with a `language`
+filename token, `purpose` and `remedy` parameters on `api_key_problem` so that a missing key stops
+recommending `--no-llm` to a caller for whom `--no-llm` is refused, `translate_crew` added to
+`tests/test_packaging.py`'s `CREW_PACKAGES`, and the system libraries and fonts both container
+images were missing.
+
+**Why.** From use, and from the same observation twice. The briefing succeeded at saying what a
+month of runs meant and failed at reaching anyone who does not read English comfortably or does not
+have a Markdown viewer - which is most people who would want to be shown one. Neither gap needed
+new analysis: the figures were already computed, the document was already rendered, and
+`weasyprint` was already declared in `pyproject.toml` and imported nowhere.
+
+**Why as an amendment rather than `plans/21_*.md`.** `PLANS.md` makes ExecPlans living documents,
+and this is the same judgement Milestone 6 recorded: these are new flags on a delivered command,
+reading the document that command already renders, rather than a step of their own. Splitting them
+off would have left this plan's `Outcomes & Retrospective` describing a command that no longer
+matched it - and in particular still describing a briefing that is only ever English Markdown.
+
+**What the design turns on, in one sentence each.** The translator is never shown a table, which is
+this plan's own figures-in-Python split applied one level up and is what keeps the columns aligned
+in a language whose glyphs are double-width. The tokens that must survive inside a translated
+sentence are drawn from the `MonthDigest`'s own knowledge of the month rather than from a regex
+over capital letters, which would have protected `CAUTION` and `WITHIN`. And there is no Markdown
+library, because a generic parser reads a 2-space-indented `ljust`-padded table as prose.
+
+**Two things this amendment changed about itself while being implemented**, both recorded in the
+`Decision Log` and `Surprises & Discoveries` rather than quietly edited out. The first draft
+specified moving `_FIGURE` and `stated_figures` into the flow layer; that was written while the
+verifier was still imagined as comparing figures, and once it became placeholder equality the move
+had no consumer and would have introduced the project's first `agents` -> `flow` import for
+nothing. And the verifier as first written checked only the markers, which is blind to a heading:
+`#` is not a figure, so a model that translated `## Risk/return leaderboard` into a bare sentence
+passed every check and silently demoted a section. `structure_prefix` closed that, and twelve tests
+failed the moment it was added - every one of them because the stand-in translator had been
+translating the prefix away, which is exactly what a live model would do.
+
+**Two things the exploration found that were not suspected.** The released image could not have
+imported WeasyPrint at all - the runtime stage installs neither Pango nor HarfBuzz, and the failure
+would have surfaced at a user's first `--pdf` rather than in any build step. And no font in this
+container has a single CJK glyph, which WeasyPrint renders as empty boxes without a word of warning.
+That second one is why `--pdf` refuses a CJK document rather than warning about it: a refusal leaves
+the reader the Markdown, a warning leaves them a finished-looking file full of boxes.
+
+**What these milestones deliberately do not do.** Table headers and cell contents stay English -
+`rank`, `what`, `return`, every ticker, every label - because `str.ljust` padding and double-width
+CJK glyphs cannot both be right, and localizing them means teaching `_table` to pad by display
+width, which is an i18n project rather than a flag. The deterministic English sentences are
+translated by a model on each run, so one heading may be worded differently in two runs; a message
+catalogue would fix that and is much larger. Nothing checks translation QUALITY - the verifier
+proves the figures, tables, tickers and structure are the English original's, and a fluent
+mistranslation of a caution passes every check, which is the honest boundary of a mechanical
+verifier and is why the document says it was machine-translated. There is no `--language` on
+`uv run portfolio` or `portfolio-holdings whatif`. And dedup is still by source set rather than by
+text, now doubled: after a change to the translation logic or the PDF renderer, an
+already-summarized month still reports `Summary already saved`, and `--force` is how the new output
+reaches disk.
