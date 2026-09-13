@@ -59,8 +59,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 from agentic_portfolio.dataset.ticker_currency import DEFAULT_CURRENCY
+from agentic_portfolio.config.settings import settings
 
-DEFAULT_RATES_PATH = "memory/rates.json"
+DEFAULT_RATES_PATH = settings.rates_path
 
 MAX_ABS_RISK_FREE_RATE = 1.0
 """Magnitude at or above which a rate is refused outright.
@@ -270,8 +271,12 @@ def resolve_risk_free_rate(
 
     Pure, and takes `saved` and `default` as parameters rather than reading a
     file or the settings singleton - the same shape
-    `src/agentic_portfolio/optimizer/benchmark.py`'s `resolve_benchmark_ticker` uses, and what
-    keeps this module free of a `agentic_portfolio.config.settings` import.
+    `src/agentic_portfolio/optimizer/benchmark.py`'s `resolve_benchmark_ticker` uses. This
+    function's purity is the point and is unchanged; note that the module does
+    now import `agentic_portfolio.config.settings`, but only for
+    `DEFAULT_RATES_PATH` above, so that the remembered-rates file follows
+    `AGENTIC_PORTFOLIO_HOME` like every other path. Nothing in the resolution
+    below reads it.
 
     `currency` drives ONLY the wording of `origin`. It is not looked up in
     any table of per-currency defaults, because deliberately no such table

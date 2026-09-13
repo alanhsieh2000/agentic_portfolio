@@ -40,8 +40,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agentic_portfolio.dataset.ticker_currency import DEFAULT_CURRENCY
+from agentic_portfolio.config.settings import settings
 
-DEFAULT_CANDIDATES_PATH = "memory/candidates.json"
+DEFAULT_CANDIDATES_PATH = settings.candidates_path
 
 
 def _validate_tickers(path: str, currency: str, tickers: object) -> list[str]:

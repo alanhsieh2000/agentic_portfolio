@@ -52,8 +52,9 @@ from typing import NamedTuple
 import pandas as pd
 
 from agentic_portfolio.dataset.ticker_currency import DEFAULT_CURRENCY
+from agentic_portfolio.config.settings import settings
 
-DEFAULT_PORTFOLIO_PATH = "memory/portfolio.json"
+DEFAULT_PORTFOLIO_PATH = settings.portfolio_path
 
 
 def _validate_share_count(path: str, currency: str, ticker: str, shares: object) -> float:

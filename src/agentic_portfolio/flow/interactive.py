@@ -139,7 +139,7 @@ def _is_backtest_date(rebalance_date: date) -> bool:
 def open_pipeline_session(
     rebalance_date: date,
     selection: str,
-    db_path: str = "data/portfolio.duckdb",
+    db_path: str = settings.db_path,
     allow_dividend_fetch: bool = True,
 ):
     """Yield `(effective_db_path, mode)` for `rebalance_date`: `(db_path,
@@ -1538,7 +1538,7 @@ def run_pipeline(
     objective: str,
     portfolio_value: float,
     selection: str = "llm_s_only",
-    db_path: str = "data/portfolio.duckdb",
+    db_path: str = settings.db_path,
     candidates: list[str] | None = None,
     target_annual_return: float = DEFAULT_TARGET_ANNUAL_RETURN,
     risk_free_rate: float = settings.risk_free_rate,

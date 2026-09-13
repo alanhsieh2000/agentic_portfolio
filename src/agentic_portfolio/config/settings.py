@@ -31,7 +31,29 @@ source's schema regardless of where the literal lives.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_HOME = os.environ.get("AGENTIC_PORTFOLIO_HOME", ".")
+"""Directory every relative runtime path below is resolved against. Defaults
+to the current working directory, which is the historical behavior and the
+right one for a container that mounts a workspace and sets its own `-w`.
+
+Read from `os.environ` rather than declared as a field because `model_config`
+below needs it, and a class body cannot see its own field values."""
+
+
+def _under_home(relative: str) -> str:
+    """`relative` resolved against `_HOME`, unchanged when `_HOME` is unset.
+
+    The identity branch is load-bearing rather than cosmetic: returning
+    `./data/portfolio.duckdb` instead of `data/portfolio.duckdb` would change
+    every path this project prints to the user and break the tests that assert
+    the exact default string. So the no-override case stays byte-identical.
+    """
+    return relative if _HOME in ("", ".") else str(Path(_HOME) / relative)
 
 
 class Settings(BaseSettings):
@@ -42,15 +64,48 @@ class Settings(BaseSettings):
     straight from the process environment, not by this project's own code.
     """
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=_under_home(".env"), env_file_encoding="utf-8", extra="ignore"
+    )
 
-    db_path: str = "data/portfolio.duckdb"
+    agentic_portfolio_home: str = _HOME
+    """Where the relative paths below are rooted, as an introspectable field so
+    a report can say which workspace it read. Deliberately NOT named `home`:
+    `case_sensitive` is unset, so pydantic-settings matches field names to
+    environment variables case-insensitively and a field called `home` would
+    silently absorb `$HOME`, moving every path into the user's home directory.
 
-    output_dir: str = "output"
+    Note one limit. CrewAI calls `load_dotenv()` itself, resolving `.env` from
+    the CURRENT WORKING DIRECTORY, which is how an LLM API key in `.env`
+    reaches litellm at all. Point this setting away from the working directory
+    and the two readers look in different places, so keep the LLM keys in the
+    real environment when doing that."""
+
+    db_path: str = _under_home("data/portfolio.duckdb")
+    """The shared market-data cache: prices, returns, factors, membership,
+    dividends and news. Override with DB_PATH - which the Docker image does, to
+    reach a read-only dataset baked into an image layer while everything
+    writable still follows the working directory."""
+
+    output_dir: str = _under_home("output")
     """Directory the printed portfolio reports are archived under, one
     subdirectory per month of the run's as-of date (see
     `src/agentic_portfolio/flow/report_archive.py`). Override with OUTPUT_DIR, or per run with
     `--output-dir` on either entry point."""
+
+    holdings_db_path: str = _under_home("data/holdings.duckdb")
+    """Price and monthly-return cache for the tickers the user actually holds.
+    Deliberately a different file from `db_path`: the window a candidate pool is
+    measured over is derived from every row in that shared table, so reporting
+    on your own holdings must never add rows to it."""
+
+    news_archive_path: str = _under_home("data/news_archive_source.parquet")
+    """Downloaded source the news-archive builder reads to populate the
+    `news_articles_hf` table inside `db_path`."""
+
+    candidates_path: str = _under_home("memory/candidates.json")
+    rates_path: str = _under_home("memory/rates.json")
+    portfolio_path: str = _under_home("memory/portfolio.json")
 
     fetch_start: str = "2015-01-01"
     fetch_end: str = "2024-04-30"
@@ -76,6 +131,17 @@ class Settings(BaseSettings):
     risk_free_rate: float = 0.02
 
     llm_s_model: str = "anthropic/claude-sonnet-4-5"
+
+    llm_f_model: str = "anthropic/claude-sonnet-4-5"
+    """Model LLM-F scores news sentiment with. Overridden by LLM_F_MODEL, or per
+    call by `screen_month`'s `model` argument.
+
+    Declared here, rather than left as the `os.environ.get("LLM_F_MODEL", ...)`
+    read it used to be in `src/agentic_portfolio/agents/llm_f.py`, so that the
+    preflight check in `src/agentic_portfolio/config/preflight.py` can ask which
+    provider LLM-F needs without duplicating the resolution - two copies of that
+    logic would eventually disagree, and the preflight would then vouch for a
+    key the run does not use."""
 
     llm_quick: str = "openai/gpt-5-nano"
     """Small, cheap model for the high-volume prose passes - currently only

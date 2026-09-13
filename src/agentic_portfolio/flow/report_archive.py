@@ -77,10 +77,19 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
-DEFAULT_OUTPUT_DIR = "output"
-"""Fallback for `src/agentic_portfolio/config/settings.py`'s `output_dir`, which is the
-env-overridable source both CLIs actually read. Kept here as well so this
-module is usable without importing the settings singleton."""
+from agentic_portfolio.config.settings import settings
+
+DEFAULT_OUTPUT_DIR = settings.output_dir
+"""Taken from `src/agentic_portfolio/config/settings.py`'s `output_dir`, which
+is what both CLIs read as their `--output-dir` default.
+
+This used to be the literal `"output"`, kept separate so the module needed no
+settings import. It now comes from `Settings` for one reason: every default
+path in this project is resolved against `AGENTIC_PORTFOLIO_HOME`, and a
+constant that opted out of that would put reports somewhere else from the
+database and the memory files whenever that setting is used. One rule for
+every path is worth the import, which is cheap - `settings.py` depends on
+nothing inside this project."""
 
 FRONT_MATTER_FENCE = "---"
 

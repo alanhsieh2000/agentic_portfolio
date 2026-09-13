@@ -892,7 +892,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--db-path",
-        default="data/portfolio.duckdb",
+        default=settings.db_path,
         help="Database consulted (read only) for cached prices and monthly returns before "
              "anything is fetched. Never written to.",
     )

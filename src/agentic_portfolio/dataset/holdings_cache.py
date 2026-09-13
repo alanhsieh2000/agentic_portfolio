@@ -56,10 +56,11 @@ import pandas as pd
 from agentic_portfolio.dataset.dividends import has_splits_table
 from agentic_portfolio.dataset.membership import compute_rebalance_dates
 from agentic_portfolio.dataset.ticker_ingestion import validate_and_ingest_tickers
+from agentic_portfolio.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOLDINGS_CACHE_PATH = "data/holdings.duckdb"
+DEFAULT_HOLDINGS_CACHE_PATH = settings.holdings_db_path
 
 
 def latest_expected_rebalance_date(as_of: date) -> date:

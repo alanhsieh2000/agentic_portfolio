@@ -38,7 +38,7 @@ PARQUET_URL = (
 
 
 def download_news_archive(
-    dest_path: str = "data/news_archive_source.parquet",
+    dest_path: str = settings.news_archive_path,
     url: str = PARQUET_URL,
     timeout: float = settings.http_timeout_seconds,
 ) -> Path:
@@ -61,7 +61,7 @@ def download_news_archive(
 
 
 def build_news_archive(
-    parquet_path: str = "data/news_archive_source.parquet", db_path: str = settings.db_path
+    parquet_path: str = settings.news_archive_path, db_path: str = settings.db_path
 ) -> None:
     """Load the local Parquet file at `parquet_path` into the
     `news_articles_hf` table in the DuckDB file at `db_path`, creating the
