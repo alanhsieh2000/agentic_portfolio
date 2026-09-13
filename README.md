@@ -13,7 +13,7 @@ This project aims to follow the idea proposed by "Designing Agentic AI-Based Scr
 
 # Configuration
 
-Runtime settings (DuckDB path, fetch/rebalance date windows, batch sizes, rate-limit pause seconds, HTTP timeouts, the book-equity reporting lag, the trailing dividend-yield window, and the two LLM model names) are centralized in `src/config/settings.py`, a `pydantic-settings` `Settings` class with sensible defaults — see that file for the authoritative list of every configurable value and its default. Any field can be overridden via an environment variable of the same name (case-insensitive) or via a `.env` file at the repository root (gitignored, never commit one with real secrets).
+Runtime settings (DuckDB path, fetch/rebalance date windows, batch sizes, rate-limit pause seconds, HTTP timeouts, the book-equity reporting lag, the trailing dividend-yield window, and the two LLM model names) are centralized in `src/agentic_portfolio/config/settings.py`, a `pydantic-settings` `Settings` class with sensible defaults — see that file for the authoritative list of every configurable value and its default. Any field can be overridden via an environment variable of the same name (case-insensitive) or via a `.env` file at the repository root (gitignored, never commit one with real secrets).
 
 Environment variables this project depends on:
 
@@ -21,14 +21,77 @@ Environment variables this project depends on:
 - `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` (required for LLM-S/LLM-F's CrewAI Anthropic calls) — read directly by the `anthropic` SDK underneath `crewai`, not by this project's own code.
 - `LLM_S_MODEL` (optional) — overrides the default Claude model LLM-S uses (`anthropic/claude-sonnet-4-5`).
 - `LLM_QUICK` (optional) — the small, cheap model that writes the prose in `uv run portfolio-summary` (default `openai/gpt-5-nano`). It is a separate knob from `LLM_S_MODEL` because the two calls do different work: LLM-S reasons about data and needs a capable model, while the summarizer only writes sentences around figures this project has already computed itself. `--model` overrides it for one run, and `--no-llm` skips the call entirely.
-- `OPENAI_API_KEY` (required only for `uv run portfolio-summary`'s prose, and only while `LLM_QUICK` names an `openai/` model) — read by the OpenAI SDK underneath `crewai`. It is also read by this project's own code, in `src/agents/report_summary.py`, which checks `settings.openai_api_key` **before** the process environment: `pydantic-settings` loads `.env` without exporting it, so a check against the environment alone would refuse to run on a machine whose key lives only in `.env`.
+- `OPENAI_API_KEY` (required only for `uv run portfolio-summary`'s prose, and only while `LLM_QUICK` names an `openai/` model) — read by the OpenAI SDK underneath `crewai`. It is also read by this project's own code, in `src/agentic_portfolio/agents/report_summary.py`, which checks `settings.openai_api_key` **before** the process environment: `pydantic-settings` loads `.env` without exporting it, so a check against the environment alone would refuse to run on a machine whose key lives only in `.env`.
 - `RISK_FREE_RATE` (optional) — the annual risk-free rate every Sharpe ratio is measured against, as a decimal (default `0.02`). A per-currency rate remembered in `memory/rates.json` **outranks** this variable, deliberately: a per-currency entry is the more specific statement, and one global variable cannot express "0.5% for yen, 4.25% for dollars" at all. Every report names the source it actually used, so a run that ignores this variable says so.
 - `DIVIDEND_LOOKBACK_MONTHS` (optional) — the trailing window a per-ticker dividend yield is computed over, in months (default `12`, the trailing-twelve-month convention). A ticker's yield is the per-share dividends with an ex-date in this window divided by its latest price.
 - `DB_PATH` (optional) — overrides the default DuckDB file location (`data/portfolio.duckdb`).
 
+# Installation
+
+The project is distributed as a Docker image, published to GitHub Container Registry and built for both `linux/amd64` and `linux/arm64`:
+
+```bash
+docker pull ghcr.io/<owner>/agentic-portfolio:0.1.0
+```
+
+**The image already contains the market-data database**, so the paper's backtest works immediately — no dataset build, no `SEC_UA`, nothing to download beyond the image itself:
+
+```bash
+docker run --rm -e ANTHROPIC_API_KEY ghcr.io/<owner>/agentic-portfolio:0.1.0 portfolio-backtest
+```
+
+For everything else you want a working directory mounted, because that is where reports and remembered state are written. Define this alias once and every command in the next section works by its bare name:
+
+```bash
+alias apx='docker run -it --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/work" -w /work \
+  -e ANTHROPIC_API_KEY -e OPENAI_API_KEY \
+  ghcr.io/<owner>/agentic-portfolio:0.1.0'
+
+apx portfolio --date today --value 100000 --selection user_provided
+```
+
+What each flag buys, since every one of them is there for a reason:
+
+- **`-it`** is **mandatory** for `portfolio --selection user_provided` and `portfolio-holdings whatif`, which sit at interactive prompts. Drop the `-t` for scripted runs whose output you pipe to a file.
+- **`--user "$(id -u):$(id -g)"`** makes the reports and JSON memory files in your mounted directory belong to *you*. Without it they are written by the image's own unprivileged user and you may not be able to edit or delete them.
+- **`-v "$PWD:/work" -w /work`** is where `memory/*.json`, `output/<month>/` and `data/holdings.duckdb` land. The bundled market-data database is *not* here — it stays read-only inside the image, so nothing you run can modify it.
+- **`-e ANTHROPIC_API_KEY`** passes your key from the host environment. A `.env` file in the mounted directory also works, but `-e` is preferable: a directory that holds saved reports is not a good place for credentials.
+
+Which credentials you actually need:
+
+| Variable | Needed by | Not needed for |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `portfolio-backtest`, and `--selection llm_s_only` / `llm_f_only` / `llm_s_and_f` | `--selection user_provided`, `portfolio-holdings` |
+| `OPENAI_API_KEY` | `portfolio-summary`'s prose only | anything, if you pass `--no-llm` |
+| `SEC_UA` | rebuilding the dataset yourself | **anything at all, when using the bundled dataset** |
+
+A run that needs a key it does not have now refuses in about a second, naming the variable and the ways out, rather than failing partway through a data fetch.
+
+Two things worth knowing:
+
+- **The `portfolio-build-*` commands need `-e DB_PATH=/work/data/portfolio.duckdb`.** The bundled database is read-only by design, so a builder aimed at it fails with a permission error rather than silently discarding its work. Point it at your mounted directory to build your own.
+- **`--selection user_provided`, `portfolio-holdings` and `whatif` need network access**, since they fetch each ticker you name from Yahoo Finance on demand. They need no database at all.
+
+To run from a source checkout instead, use the development container described under [Development](#development); every command below then works as `uv run <name>`.
+
 # How to Use
 
-Every command below is a console script installed by `pyproject.toml`'s `[project.scripts]`, run as `uv run <name>`. This section is a quick reference for flags and defaults; the prose above explains the *why* behind each one in far more depth.
+Every command below is a console script declared in `pyproject.toml`'s `[project.scripts]`. Run it prefixed with the `apx` alias above if you are using the image, or with `uv run` from a source checkout. This section is a quick reference for flags and defaults; the prose above explains the *why* behind each one in far more depth.
+
+## Where files are written
+
+With the image, `/work` inside the container is whatever directory you mounted — so everything below appears in your own working directory:
+
+| Path | What it holds |
+|---|---|
+| `./output/<year>-<month>/` | Every report any command printed, saved as Markdown |
+| `./memory/candidates.json` | Your candidate pools, one per currency |
+| `./memory/portfolio.json` | The holdings you actually own |
+| `./memory/rates.json` | The remembered risk-free rate per currency |
+| `./data/holdings.duckdb` | Price cache for your own holdings |
+
+The shared market-data database is the exception: `DB_PATH` already points at the read-only copy inside the image. Every one of these locations can be moved with the flags documented per command, or all at once by setting `AGENTIC_PORTFOLIO_HOME`.
 
 ## Dataset build commands
 
@@ -178,8 +241,43 @@ After we use the Backtest Mode to find effective and efficient values for hyper-
 - **A month of saved reports can be summarized into one briefing**: `uv run portfolio-summary` reads `output/<year>-<month>/` and writes back a single document answering the questions no individual report can. Which of the month's runs won on which axis, ranked; which tickers every optimization agreed on and which candidates none of them wanted; how the portfolio you actually hold compares with the frontier you just mapped; what each hypothetical change cost and bought; and — the section the command exists for — where two of the month's reports are **not** comparable. On the nine reports of a real `output/2026-09/`, that last section is the useful one: the same PFF/PFFA/VZ book scores an annual return of 0.0229 and a Sharpe of -0.1253 over 60 months and 0.0713 and 0.2808 over 48, so the question of whether it beats the risk-free rate is decided by the window alone. The leaderboard is therefore **partitioned** by currency and returns window and ranked only within a partition; merging them would invite a comparison the figures do not support. **Every number in the briefing is computed in Python** from the saved front matter; the language model named by `LLM_QUICK` writes only the prose between the tables, and any sentence of it stating a figure that was never computed is replaced by a machine-written line before you see it, with the document's last line saying how many were. `--no-llm` omits the prose and makes no network call at all, which is also what happens — with a warning, never a failure — when the model cannot be reached, because the tables are the value and the sentences are the garnish. The summary is saved into the month folder it describes with `kind: summary` front matter, and the reader accepts only `kind: portfolio` and `kind: whatif`, so a summary never summarizes an earlier summary. A repeat is recognized by a digest over the **set of source reports** rather than over the summary text — the prose differs run to run, so a text digest would add a file every time — and a second run says `Summary already saved for these 9 reports:` and writes nothing. `--force` overrides that, `--stdout` prints without saving, and the month argument defaults to the current calendar month. Finally, the briefing ends with a **`Source reports` list** naming every report it was built from, each with the eight characters that name its file — so a row worth following up (`whatif CSPX.L+PFFA+VZ`, say) can be traced to the report behind it (`2026-09-11-whatif-USD-c3103383.md`) and read in full. Where two reports would otherwise print the same name — the held book measured over 60 months and again over 48 — the list qualifies them with their window, since that is what actually tells them apart. One consequence of dedup being by source set rather than by text: after an upgrade that changes the briefing's *format*, an already-summarized month still reports `Summary already saved`, and `--force` is how you get the new layout into a saved file.
 
 
+# Development
+
+The development container is a separate image from the release one, and they are deliberately not shared: the development image installs the project's *dependencies* but not the project itself, so edits take effect without reinstalling, and it carries node plus a coding agent. Its Dockerfile is `docker/Dockerfile.dev`; the release image is the `Dockerfile` at the repository root. `docker/README.md` explains the split and holds the build and publish commands.
+
+From a checkout, every command runs as `uv run <name>`, and the test suite is:
+
+```bash
+uv run pytest tests/test_*.py        # 1081 tests, about seven minutes
+```
+
+The importable package is `src/agentic_portfolio/`, so modules import as `agentic_portfolio.<subpackage>.<module>`. Note that `pyproject.toml` sets no pytest `pythonpath`: tests import the *installed* package (which `uv run` provides) rather than the source tree, so that a packaging mistake — a prompt YAML file missing from the wheel, say — fails in the test suite rather than at a user.
+
+One trap worth knowing before you go looking: **`--help` is not safe on every command.** Only `portfolio`, `portfolio-holdings`, `portfolio-summary` and `portfolio-migrate-candidates` parse arguments. The eight `portfolio-build-*` / `portfolio-backfill-snapshot` commands ignore argv and start work immediately — including writing to the market-data database — and `portfolio-backtest` runs a full backtest. To check the entry points are wired up, import them instead of invoking them.
+
 # Acknowledgements and Citation
 
 - "Designing Agentic AI-Based Screening for Portfolio Investment", https://arxiv.org/abs/2603.23300v1.
 - Martin, R. A., (2021). PyPortfolioOpt: portfolio optimization in Python. Journal of Open Source Software, 6(61), 3066, https://doi.org/10.21105/joss.03066
 - https://docs.crewai.com/
+
+## Bundled market data — provenance and licensing
+
+The `LICENSE` file (MIT) covers this repository's **source code only**. It grants no rights in the market data this software fetches, caches, or ships; `NOTICE` records those terms in full, and the summary is:
+
+- **SEC EDGAR** — the book-equity figures. Public domain, subject to the SEC's fair-access policy, which this project honors via `SEC_UA` and rate limiting.
+- **Wikipedia** — the S&P 500 membership list and its historical changes. CC BY-SA 4.0, attributed in `NOTICE`.
+- **Yahoo Finance** — the price, dividend and split history. Yahoo's terms restrict redistribution. It is bundled in the published image anyway, deliberately and for one narrow purpose: non-commercial reproduction of a published academic result. That decision is recorded in `plans/20_packaging_and_release.md`'s Decision Log rather than left implicit.
+
+The bundled database covers **2015-01-02 to 2024-04-29** and does not go stale, because the backtest window is fixed history. Its exact contents are recorded beside it and can be read without unpacking anything:
+
+```bash
+docker run --rm ghcr.io/<owner>/agentic-portfolio:0.1.0 \
+  cat /opt/agentic-portfolio/data/DATASET.json
+```
+
+That manifest is generated from the database during the image build, so it cannot drift from what it describes. It reports per-table row counts, the date spans, and — usefully — *why* each ticker with no coverage has none. Four tickers (`AVB`, `EA`, `EQR`, `LEG`) have no dividend history and never will: Yahoo Finance no longer serves any data overlapping the window, so re-running the build cannot fix them, and the manifest says so in those words.
+
+If you would rather not rely on the bundled copy — for licensing comfort, for current data, or simply to verify it — build your own with the [dataset build commands](#dataset-build-commands) and point `DB_PATH` at it. Nothing in this software requires the bundled database: `--selection user_provided`, the holdings report and `whatif` all fetch what they need on demand and never read it.
+
+**This is research software.** Its output is not investment advice, the historical figures it reports are not a prediction, and the dividend figures it computes are a record of what was paid rather than a promise of what will be.
