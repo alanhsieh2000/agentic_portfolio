@@ -18,7 +18,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # development stage: --target development
 FROM base AS development
 
-# use docker build --build-arg USER_NAME=user_name --build-arg USER_UID=uid --target development -t tag .
+# use docker build --build-arg USER_NAME=user_name --build-arg USER_UID=uid --target development -f docker/Dockerfile.dev -t tag .
 ARG USER_NAME=root
 ARG USER_UID=0
 
