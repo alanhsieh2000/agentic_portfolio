@@ -21,12 +21,32 @@ classifiers = [
     "Private :: Do Not Upload",
 ]
 
-# Exactly the nine distributions `src/agentic_portfolio/` imports, verified by parsing every
+# Exactly the ten distributions `src/agentic_portfolio/` imports, verified by parsing every
 # module's import statements rather than by reading the list. Eleven others were declared and
 # imported nowhere (aisuite, exa-py, markdown, matplotlib, parsel, python-dotenv, questionary,
 # redis, regex, seaborn, stockstats) and `pytest` was declared as a RUNTIME dependency; all are
 # now removed or moved to the dev group below. This matters for a container image, where every
 # unused package is build time and image size.
+#
+# `weasyprint` is the tenth, and it is now imported - by
+# `src/agentic_portfolio/flow/report_pdf.py`, for `portfolio-summary --pdf`. It was declared one
+# commit before that module existed and was briefly the one declared-but-unimported entry here.
+#
+# `markdown` was deliberately NOT brought back with it, and that is worth recording because it
+# looks like the obvious companion. A briefing's tables are indented by two spaces and padded
+# with `str.ljust`, while CommonMark needs four spaces to make a code block - so a Markdown
+# parser reads every table in the document as prose and HTML collapses the padding that IS the
+# alignment. Using one would have meant writing a pre-processor that already applied the "an
+# indented run is preformatted" rule, at which point the pre-processor is the converter. That
+# rule lives in `src/agentic_portfolio/flow/briefing_blocks.py` and the four remaining
+# constructs are emitted directly.
+#
+# `weasyprint` is also the only dependency here whose SYSTEM libraries are part of the contract,
+# which a lock file cannot express: it dlopens Pango through cffi at IMPORT time, so both
+# container images must install libpango-1.0-0, libpangoft2-1.0-0, libharfbuzz0b and
+# libharfbuzz-subset0, plus fonts-dejavu-core for the tables and fonts-noto-cjk for a
+# translated briefing. See the runtime stage of `Dockerfile` and `docker/Dockerfile.dev`.
+# No cairo is needed - WeasyPrint has written PDF itself since v53.
 #
 # Only the `anthropic` crewai extra is kept. `[tools]` went because the one tool import in this
 # project is `from crewai.tools import BaseTool`, which ships in crewai CORE - the separate
