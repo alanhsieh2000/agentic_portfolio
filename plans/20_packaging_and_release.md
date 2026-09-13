@@ -93,17 +93,112 @@ Three things make this possible, and each is a separate piece of work:
       on a clean tree at commit `1cdd58f`, branch `docker_deployment`. Bytecode caches purged.
       Reference counts for Step 2 verified by measurement, correcting two figures taken from an
       earlier survey (see `Surprises & Discoveries`).
-- [ ] Step 1 - move `src/*` into `src/agentic_portfolio/`.
-- [ ] Step 2 - rewrite the 527 `src.` and 314 `src/` references across 68 files.
-- [ ] Step 3 - `pyproject.toml` script targets, wheel config, drop `pythonpath`; update `README.md`
-      and `AGENTS.md`.
-- [ ] Step 4 - consolidate the seven path literals behind `AGENTIC_PORTFOLIO_HOME`.
-- [ ] Step 5 - preflight checks, `llm_f_model` setting, CrewAI missing-config error.
-- [ ] Step 6 - dependency trim and `uv lock`.
-- [ ] Step 7 - package metadata, `LICENSE`, `NOTICE`.
-- [ ] Step 8 - `.dockerignore`.
-- [ ] Step 9 - runtime `Dockerfile`, dataset layer, `DATASET.json` provenance.
-- [ ] Step 10 - multi-arch build, GHCR publish, README installation section.
+- [x] (2026-09-12 07:30Z) Step 1 - moved `src/*` into `src/agentic_portfolio/` via the temporary
+      directory. Git recorded **64** renames (58 `.py` plus the 6 CrewAI YAML), all at 100%
+      similarity, no content changes.
+- [x] (2026-09-12 07:35Z) Step 2 - rewrote all 527 `src.` and 314 `src/` references across 75
+      files. Needed **six** sed rules, not four: a fifth category of reference
+      (`python -m src.<module>`) was missed on the first pass and caught by the gate. Both gates
+      pass: the only surviving `src.` is `flow/live.py:125`'s DuckDB alias, and its `ATTACH ... AS
+      src` on line 123 is intact.
+- [x] (2026-09-12 08:25Z) Step 3 - done. `pyproject.toml`: 13 script targets rewritten to
+      `agentic_portfolio.*`, `packages = ["src/agentic_portfolio"]` with the old justifying comment
+      replaced, `pythonpath = ["."]` removed with a comment explaining why. `uv sync` re-installed
+      and `agentic_portfolio.flow.cli` resolves to `src/agentic_portfolio/flow/cli.py`. Gates
+      passed: **1049 tests collected** in 4.16s, **94 passed** in the `test_optimizer.py` +
+      `test_summary_cli.py` smoke subset, and all 13 entry points import with a callable `main`.
+      Docs: the two pre-move paths in `README.md` and the illustrative one in `AGENTS.md` updated,
+      and `AGENTS.md` now states the importable package is `src/agentic_portfolio/` and notes the
+      layout matches the canonical CrewAI layout in `CREWAI.md`. The `pyproject.toml` part of this
+      step was committed in `a4ab6e7`; the doc edits came after.
+- [x] (2026-09-12 09:05Z) Step 4 - all seven path literals now exist only in
+      `config/settings.py`, each wrapped in `_under_home`, with five new fields
+      (`holdings_db_path`, `news_archive_path`, `candidates_path`, `rates_path`,
+      `portfolio_path`) beside the existing `db_path` and `output_dir`. Defaults verified
+      **byte-identical** to before. `AGENTIC_PORTFOLIO_HOME=/tmp/ws` moves all seven together;
+      `DB_PATH` wins alone and leaves `output_dir` in place, which is the split the image needs.
+      The two inert argparse defaults are fixed - proof: `DB_PATH=/ro/baked.duckdb portfolio
+      --date 2024-03-29 --value 1000` now fails naming `/ro/baked.duckdb`, where before it named
+      `data/portfolio.duckdb` and ignored the variable. Gate: **556 passed** across the ten
+      path-sensitive test modules. `tests/conftest.py` needed **no** change - see
+      `Surprises & Discoveries`.
+- [x] (2026-09-12 09:55Z) Step 5 - `config/preflight.py` added, holding `api_key_problem` (moved
+      from `agents/report_summary.py` and re-exported there so existing callers and monkeypatch
+      targets still resolve), plus `require_api_keys`, `require_sec_user_agent` and
+      `export_api_keys`. Wired into `flow/cli.py:main` (right after `parse_args`),
+      `flow/backtest.py:main`, `dataset/fundamentals.py:main`,
+      `dataset/backfill_snapshot.py:main`, and `flow/live.py`'s snapshot builder for the two
+      selections that reach the SEC. `llm_f_model` added to `Settings` and `agents/llm_f.py`
+      switched to it, removing the last direct `os.environ` model read; `DEFAULT_MODEL` and the now
+      unused `import os` deleted from that module, and `import os` from `report_summary.py`.
+      A new `agents/crew_config.py` turns CrewAI's silent missing-YAML behavior into a named error -
+      it previously surfaced as a bare `KeyError: 'strategy_agent'`, which matters much more once
+      the prompts ship inside a wheel. Both refusals exit **2** with the sentence on stderr, which
+      needed fixing after measurement (see `Surprises & Discoveries`). 17 new tests in
+      `tests/test_preflight.py`; the four LLM/summary modules' own 85 tests still pass.
+- [x] (2026-09-12 10:20Z) Step 6 - runtime dependencies cut from 21 to the **nine** actually
+      imported, verified by parsing every module's import statements with `ast` rather than by
+      reading the list. Removed: `aisuite`, `exa-py`, `markdown`, `matplotlib`, `parsel`,
+      `python-dotenv`, `questionary`, `redis`, `regex`, `seaborn`, `stockstats`, and `pytest`
+      (which was a runtime dependency). `pytest` and `cvxpy` moved to a PEP 735
+      `[dependency-groups] dev`. crewai extras cut to `[anthropic]` alone - `[tools]` went because
+      `from crewai.tools import BaseTool` resolves to crewai **core**
+      (`site-packages/crewai/tools/__init__.py`) and nothing imports `crewai_tools`. Result:
+      **204 locked distributions -> 166, 38 removed.** Gate: 107 tests across the optimizer, LLM
+      and preflight modules, plus all three crews and the `BaseTool` subclass importing cleanly -
+      which is the real check on the pruned extras.
+- [x] (2026-09-12 10:35Z) Step 7 - `description`, `readme`, `license = "MIT"`, `license-files`,
+      `authors`, `keywords`, `classifiers` (including `Private :: Do Not Upload` as a hard guard
+      against an accidental PyPI publish), `[project.urls]` and
+      `[tool.hatch.build.targets.sdist]` added. New `LICENSE` (MIT) and `NOTICE` recording the
+      three data sources and their differing positions. `uv build` produces both artifacts, and
+      the wheel is verified correct: **6** CrewAI prompt YAML files present, top-level names are
+      `agentic_portfolio` and `agentic_portfolio-0.1.0.dist-info` only, **no** top-level `src/`,
+      and all **13** console scripts declared against `agentic_portfolio.*`.
+- [x] (2026-09-12 07:38Z) Step 8 - `.dockerignore` written **out of order**, deliberately: brought
+      forward so that no build could ever pick up `.env` or the author's personal data. Verified
+      without Docker by simulating its rules over the whole tree: **76 files would be sent, 24,407
+      excluded**; top-level entries are `LICENSE NOTICE README.md data docker pyproject.toml src
+      uv.lock`; no `.env`, `memory/`, `output/`, `.venv/`, `.git/` or `holdings.duckdb`; and
+      `data/` contributes **only** `portfolio.duckdb`. That is a simulation of Docker's semantics,
+      not Docker's own evaluation - confirm with the real builder when one is available.
+- [~] (2026-09-12 11:10Z) Step 9 - **written but UNVERIFIED: there is no Docker in this dev
+      container** (`docker`, `buildx`, `podman` and `nerdctl` are all absent and there is no
+      `/var/run/docker.sock`). Authored: the four-stage runtime `Dockerfile`; `docker/README.md`
+      with build, verify and publish commands; `docker/dataset_manifest.py`; and
+      `docker/dataset.sha256` holding
+      `916e4f5f5670b68490b99905a75131e6902e2333184571376f74c0d3108adc05` - the **recovered**
+      dataset. The development container moved to `docker/Dockerfile.dev` (not `.devcontainer/`,
+      which is gitignored and would have untracked it). The manifest generator **is** verified: run
+      against the real database it produces a 3.9 KB `DATASET.json` reporting 11 tables, 1,203,663
+      price rows over 2015-01-02..2024-04-29, 525 distinct tickers, and the AVB/EA/EQR/LEG reasons.
+      **Still to do on a host with Docker:** build it, run the verification block in
+      `docker/README.md`, and above all run the secret-absence gate before any push.
+- [~] (2026-09-12 11:30Z) Step 10 - **documentation done, publishing blocked.** `README.md` now
+      carries a `# Installation` section (pull command, the `apx` alias, what each `docker run`
+      flag buys, a table of which credential each command needs and which need none, and the two
+      traps: builders need `-e DB_PATH=/work/...`, and `user_provided`/`holdings`/`whatif` need
+      network but no database); a `## Where files are written` table mapping `/work` to the host
+      directory; a `# Development` section explaining the two-Dockerfile split, the missing pytest
+      `pythonpath` and why, and the `--help` hazard; and
+      `## Bundled market data - provenance and licensing` under Acknowledgements, naming all three
+      data sources and their differing terms. The `# How to Use` preamble no longer says `uv run`
+      unconditionally. **Blocked:** the actual multi-arch build and GHCR push, on the missing
+      Docker. Commands are written up in `docker/README.md` ready to run, including the
+      `--annotation index:` and make-the-package-public steps that are easy to miss.
+
+Steps 1, 2, partial 3 and 8 are committed as `a4ab6e7` on branch `docker_deployment`.
+
+- [x] (2026-09-12 08:15Z) **Unplanned: recovered `data/portfolio.duckdb` after damaging it.** A
+      `--help` sweep over all thirteen console scripts ran the dataset builders (see
+      `Surprises & Discoveries`), costing 7,038 price rows. Recovered offline by grafting the four
+      dividend tables from the damaged file onto a pre-dividend backup whose price history was
+      provably the original. All nine verification properties match, and the recovered file is
+      **46,936,064 bytes - byte-for-byte the original size**, which no step of the merge targeted
+      and so is independent corroboration. Verified through the application's own dividend code,
+      not just SQL: `JNJ 0.0321, KO 0.0325, T 0.0715, XOM 0.0345` as of 2024-03-29, with
+      `AVB/EA/EQR/LEG` correctly reported unavailable rather than as zero payers. Both inputs kept
+      as `data/portfolio.candidate.duckdb` and `data/portfolio.damaged-20260912.duckdb`.
 - [ ] Follow-up (not in this plan): make the `crewai` import lazy so `--selection user_provided`
       starts without loading the LLM stack. Deferred because roughly eight tests in
       `tests/test_interactive_flow.py` monkeypatch `generate_rule` and `screen_month` by attribute
@@ -141,29 +236,113 @@ Three things make this possible, and each is a separate piece of work:
   `grep -ro '"src\.' --include='*.py' src tests | wc -l`, which finds all 248 in `tests/` and none
   in `src/`.
 
-- Observation: a `.env` file *does* supply the LLM API keys, but by way of a dependency's behavior
-  rather than anything this project does - and that has a consequence for Step 4. Nothing in
-  `src/agents/` ever passes a key to the LLM client (`grep -rn "api_key\|base_url" src/agents/`
-  finds only `api_key_problem`'s own check), and pydantic-settings loads `.env` without exporting it
-  to `os.environ`, so it first appears that a key living only in `.env` could never reach litellm.
-  It does, because **CrewAI calls `load_dotenv()` itself** - in `crewai/llm.py` and
-  `crewai/project/crew_base.py` - and that resolves `.env` **relative to the current working
-  directory**. Evidence, with the real keys stripped from the environment:
+- Observation: **how an API key in `.env` actually reaches litellm, and why it will stop working
+  once this is packaged.** This took three attempts to get right; the first two conclusions written
+  here were both wrong, so the mechanism is spelled out rather than the symptom.
 
-      $ cd /tmp/envtest && printf 'OPENAI_API_KEY=from-cwd-dotenv\n' > .env
-      $ env -u OPENAI_API_KEY python -c "import os, crewai; print(os.environ.get('OPENAI_API_KEY'))"
-      from-cwd-dotenv
-      $ cd /tmp/noenv    # no .env in this directory or its parents
-      $ env -u OPENAI_API_KEY python -c "import os, crewai; print(os.environ.get('OPENAI_API_KEY'))"
-      None
+  Nothing in `agents/` ever passes a key to the LLM client (`grep -rn "api_key\|base_url"
+  src/agentic_portfolio/agents/` finds only the preflight's own check), and pydantic-settings loads
+  `.env` without exporting it to `os.environ`, which the SDKs read. So a key in `.env` alone looks
+  like it could never work. It does work, because **CrewAI calls `load_dotenv()` itself** in
+  `crewai/llm.py`. The part that matters is *which* `.env` that finds: python-dotenv searches
+  **upward from the calling module's own file**, not from the working directory. In a development
+  checkout CrewAI's file is `<repo>/.venv/lib/python3.12/site-packages/crewai/llm.py`, so the search
+  walks up and finds `<repo>/.env` - whatever directory you ran from. Measured:
 
-  The consequence: after Step 4, `Settings` reads `.env` from `AGENTIC_PORTFOLIO_HOME` while CrewAI
-  keeps reading it from the working directory. When those two are the same - which is the default,
-  and the case in the image - everything agrees. When a deployer points
-  `AGENTIC_PORTFOLIO_HOME` somewhere else, the preflight added in Step 5 could pass on a key found
-  in the home `.env` while litellm looks in the working directory and finds nothing, turning a
-  clean refusal back into a late provider error. Do not try to unify the two by reaching into
-  CrewAI. Document it, and have the preflight name both locations in its message.
+      $ cd /tmp/nokeys        # no .env here or in any parent
+      $ env -u ANTHROPIC_API_KEY python /tmp/probe.py
+      cwd         : /tmp/nokeys
+      env KEY     : None
+      after settings import -> settings.anthropic_api_key: None
+      after cli import      -> env KEY : '1k3HpAFpbLwkclRtoLk...'     <-- injected by crewai
+      crewai/llm.py lives in : /app/agentic_portfolio/.venv/lib/python3.12/site-packages/crewai
+      first .env walking UP  : /app/agentic_portfolio/.env
+
+  **This accident does not survive packaging, and that is the whole point.** In the image the
+  virtual environment is at `/opt/agentic-portfolio/venv`, so searching upward from CrewAI reaches
+  `/opt/agentic-portfolio/` and `/` - never the user's mounted `/work`. A `.env` in the mounted
+  workspace would satisfy this project's own `Settings` (whose `env_file` follows
+  `AGENTIC_PORTFOLIO_HOME`, default: the working directory) and therefore *pass the preflight*, then
+  fail inside the provider call minutes later. A check that passes and a run that dies afterwards is
+  worse than no check.
+
+  So Step 5 adds `export_api_keys()`, which copies a provider key that `Settings` has and the
+  environment lacks into `os.environ`, never overriding one already set. Three lines, and it makes
+  the two readers agree in every layout - checkout, wheel and image alike. It also means the
+  preflight's verdict is now the same question the SDK will ask.
+
+  One consequence for testing, recorded in `tests/test_preflight.py`'s own docstring: because
+  importing anything that reaches CrewAI injects the repository's real key into `os.environ`, the
+  refusal path **cannot** be tested in this repository by unsetting the variable. Both `Settings`
+  and `os.environ` have to be monkeypatched, or the test asserts nothing.
+
+- Observation: **the packaging defect is provably fixed, and the proof required a venv outside the
+  repository.** Installing the built wheel into `/tmp/fresh` and running from `/tmp` - so nothing
+  can resolve from the source tree - gives:
+
+      $ /tmp/fresh/bin/python -c "import agentic_portfolio as p; print(p.__file__)"
+      /tmp/fresh/lib/python3.12/site-packages/agentic_portfolio/__init__.py
+      $ ls /tmp/fresh/lib/python3.12/site-packages/ | grep -xE 'src|agentic_portfolio'
+      agentic_portfolio                      <-- and no `src`
+      13 entry points import and expose a callable main
+      6 prompt files present and non-empty in the installed package
+
+  That clean venv is also the only place in this session where the preflight's refusal path could
+  be tested honestly, because `load_dotenv` can reach no `.env` by walking up from
+  `/tmp/fresh/lib/python3.12/site-packages/crewai` - which is precisely the image's situation:
+
+      $ env -u ANTHROPIC_API_KEY /tmp/fresh/bin/portfolio --date 2024-03-29 --value 1000
+      ANTHROPIC_API_KEY is not set, so the LLM-S screening rule for --selection llm_s_only ...
+      exit code: 2
+
+      $ env -u SEC_UA /tmp/fresh/bin/portfolio-build-fundamentals
+      SEC_UA is not set, so the book-equity figures cannot be fetched - the SEC requires a ...
+      exit code: 2
+
+  Before Step 5 the first of those reached `resolve_as_of_date` and died with a DuckDB
+  `IOException`. `--selection user_provided` is correctly not blocked by either check.
+
+  One number worth keeping for the deferred follow-up: the refusal takes **3.4 seconds**, nearly all
+  of it importing `crewai`. That is the eager-import cost, and it is what making the import lazy
+  would buy - visible here, invisible in the image.
+
+- Observation: `uv build` writes a `dist/.gitignore` containing `*`, so the build directory
+  self-ignores and no `.gitignore` change is needed for it.
+
+- Observation: **there is no Docker inside the development container**, so Steps 9 and 10 cannot be
+  executed or verified here at all. `command -v docker buildx podman nerdctl` finds nothing and
+  `/var/run/docker.sock` does not exist. Everything in those steps is therefore *written* and
+  reviewed but **unexercised**: the image has never been built, the multi-arch build has never
+  run, and the secret-absence gate has never run. That gate in particular must be run before the
+  first push, because a key in a published layer survives deleting the tag.
+
+  What could be verified without Docker, and was: the `.dockerignore` by simulating its rules over
+  the tree (76 files in, 24,407 out, nothing sensitive, `data/` contributing only
+  `portfolio.duckdb`), and `docker/dataset_manifest.py` by running it against the real database.
+
+- Observation: the development container's Dockerfile should not move to `.devcontainer/`, which
+  the plan originally suggested. `.devcontainer` is listed in `.gitignore`, so a file placed there
+  stops being version controlled. It went to `docker/Dockerfile.dev` instead, which keeps the two
+  images separate and both tracked.
+
+- Observation: a `[project.urls]` table placed above the `dependencies` list silently swallows it.
+  TOML sub-tables run until the next table header, so `dependencies = [...]` became a *URL entry*
+  and the build failed with `TypeError: URL 'dependencies' of field 'project.urls' must be a
+  string` - a message that does not mention ordering at all. `[project.urls]` now sits after every
+  plain key in `[project]`, with a comment saying why. Worth recording because the error text sends
+  you looking at the URLs rather than at their position.
+
+- Observation: `raise SystemExit("a message")` does **not** exit 2. It sets `.code` to the string
+  and exits 1, printing the message. The preflight documented itself as using argparse's
+  usage-error status, so the message and the status are now set separately - `print(..., file=
+  sys.stderr)` then `raise SystemExit(2)`. Caught by measuring rather than by reading:
+
+      $ ... preflight.require_api_keys('llm_s_only'); echo $?
+      ANTHROPIC_API_KEY is not set, so the LLM-S screening rule ...
+      1        <-- documented as 2
+
+  `tests/test_preflight.py::test_the_refusal_exits_two_not_one` now asserts both the code and that
+  the sentence still reaches stderr, so a later simplification back to `SystemExit(message)` fails.
 
 - Observation: the dataset builders open the market-data database for writing, which conflicts with
   baking it into a read-only image layer. Evidence: `src/dataset/membership.py:241` and
@@ -182,6 +361,69 @@ Three things make this possible, and each is a separate piece of work:
   `crewai/tools/base_tool.py` ships in crewai core - the `crewai-tools` distribution that the
   `[tools]` extra installs is never imported. But crewai core lists `chromadb~=1.1.0` as a direct
   requirement, so dropping the extra does not remove the embedding stack from the image.
+
+
+- Observation: **`--help` is destructive on nine of the thirteen console scripts, and this cost a
+  dataset.** Only `portfolio`, `portfolio-holdings`, `portfolio-summary` and
+  `portfolio-migrate-candidates` build an `argparse` parser. The eight `portfolio-build-*` /
+  `portfolio-backfill-snapshot` commands and `portfolio-backtest` ignore argv entirely and act
+  immediately, and the builders open the market-data database **writable**
+  (`dataset/membership.py:241`, `dataset/prices.py:351,374,416`). Verifying the rename with a loop
+  of `uv run <script> --help` therefore re-ran `portfolio-build-membership` and
+  `portfolio-build-prices` against the real `data/portfolio.duckdb`: membership re-fetched
+  Wikipedia's *current* S&P 500 list, prices rebuilt against it, and the result lost 7,038 price
+  rows. Evidence:
+
+      prices rows          1,203,663 -> 1,196,625
+      unresolved_tickers          55 -> 57
+      sec_fallback_tickers         3 -> 2
+      file size           46,936,064 -> 68,431,872 bytes
+
+  Two aggravating factors worth learning from, beyond the flag itself. The loop was run as a
+  **backgrounded** command, so it kept executing for roughly two minutes after the first sign of
+  trouble - a destructive check that cannot be watched is worse than one that can. And there was no
+  record of the dataset's prior state: only `prices` had been measured beforehand, so the other ten
+  tables could not be checked for damage at all. That absence is the strongest argument for the
+  `DATASET.json` provenance file in Step 9, which exists precisely so this question is answerable.
+
+- Observation: the damage was fully recoverable offline, and the recovery corroborated itself. A
+  pre-dividend backup held `prices` at exactly 1,203,663 - the pre-damage count - while the damaged
+  file still held the four dividend tables, built before the accident against that same price
+  history. Grafting the latter onto the former with the `ATTACH ... (READ_ONLY)` pattern from
+  `flow/live.py:113-134` produced a file of **46,936,064 bytes, identical to the original size**.
+  Nothing in the merge aimed at that number, so it is independent evidence that the reconstruction
+  is exact. No network fetch was needed, which also means the dividend figures `README.md`
+  documents are unchanged.
+
+- Observation: two of the planned Step 4 mitigations turned out to be unnecessary, and one of them
+  could not have worked. The plan called for extending `tests/conftest.py` to pin the new path
+  fields and to `monkeypatch.delenv("AGENTIC_PORTFOLIO_HOME")`. Neither was needed: every test that
+  touches these paths passes them **explicitly** as arguments or flags rather than relying on a
+  default (`grep -rn '"memory/rates\.json"\|"data/portfolio\.duckdb"' tests/` shows only explicit
+  call arguments), and `DEFAULT_RATES_PATH` still evaluates to the same string, so
+  `tests/test_cli.py:1509` holds unchanged. 556 tests across the ten path-sensitive modules passed
+  with no test edits at all. And the `delenv` would have been inert regardless: `_HOME` is read from
+  `os.environ` at **settings-import time**, which happens when `conftest.py` itself imports the
+  singleton - long before any fixture body runs. Anything wanting to neutralize that variable for a
+  test run has to do it before that import, not in a fixture.
+
+- Observation: two modules carried docstrings stating they deliberately avoided importing the
+  settings singleton - `flow/rate_memory.py` ("what keeps this module free of a
+  `agentic_portfolio.config.settings` import") and `flow/report_archive.py` ("Kept here as well so
+  this module is usable without importing the settings singleton"). Step 4 contradicts both, and
+  did so on purpose: a path constant that opted out of `AGENTIC_PORTFOLIO_HOME` would put reports
+  somewhere different from the database and the memory files whenever that setting is used, so
+  partial adoption would be the defect. The import is cheap - `config/settings.py` depends on
+  nothing inside this project, so there is no cycle. Both docstrings were rewritten to state what is
+  now true rather than left standing as false claims, and `resolve_risk_free_rate` itself is
+  untouched: it still takes `saved` and `default` as parameters, which is the purity that note was
+  actually protecting.
+
+- Observation: the four tickers with no dividend coverage are unfixable by re-running, exactly as
+  `README.md` claims, and the recovered dataset still says so in the application's own words:
+
+      AVB: yfinance no longer serves this ticker's history for the requested 2015-01-01..2024-04-30
+      EA:  (same)   EQR: (same)   LEG: (same)
 
 
 ## Decision Log
@@ -257,6 +499,27 @@ Three things make this possible, and each is a separate piece of work:
   command is recorded in `docker/README.md` so it does not live only in someone's shell history.
   Date/Author: 2026-09-12.
 
+- Decision: recover the damaged dataset by grafting the dividend tables onto the backup, rather
+  than rebuilding it with the eight builders.
+  Rationale: the backup's `prices` count matches the pre-damage count exactly, so its price,
+  membership, factor and returns data is provably the original; the damaged file's dividend tables
+  predate the accident and were built against that same price history, so the two are mutually
+  consistent. A rebuild would have been slower, would have needed the rate-limited SEC pass, and -
+  decisively - would have refetched *current* dividend data, changing figures that `README.md`
+  documents and that the saved reports under `output/2026-09/` were computed against. The merge is
+  offline and changes no figure. Both input files are kept rather than deleted, since `data/` is
+  gitignored and costs nothing to retain.
+  Date/Author: 2026-09-12, after verifying all three files read-only.
+
+- Decision: verify console-script wiring by importing each entry point and asserting `main` is
+  callable, never by invoking `--help`.
+  Rationale: `--help` is not a safe probe here - nine of the thirteen commands ignore argv and act,
+  and the builders write to the market-data database. The import check tests the thing a rename can
+  actually break (a script pointing at a module path that no longer exists) while executing
+  nothing. Both places in this plan that reached for `--help` on all thirteen have been replaced,
+  and a warning now sits at each.
+  Date/Author: 2026-09-12, after the incident recorded in `Surprises & Discoveries`.
+
 - Decision: keep the development container and the release image as separate Dockerfiles rather than
   sharing stages.
   Rationale: they optimize for opposite things. The development image deliberately does *not*
@@ -269,9 +532,63 @@ Three things make this possible, and each is a separate piece of work:
 
 ## Outcomes & Retrospective
 
-Not yet started. To be written at the end of Step 3 (the package is importable and installable),
-the end of Step 7 (the wheel is correct and complete), and the end of Step 10 (the image is
-published and verified), comparing the result against the Purpose section above.
+### At the end of Step 7 (2026-09-12): the package is real
+
+The half of the Purpose section that does not need Docker is delivered and proven. A wheel built
+from this tree, installed into a fresh virtual environment outside the repository, puts
+`agentic_portfolio` into `site-packages` with no top-level `src`, exposes all thirteen console
+scripts, and carries all six CrewAI prompt files. The test suite went from 1049 to 1081 passing with
+no regressions, the runtime dependency list went from 21 declarations to 9, and the locked
+distribution count from 204 to 166.
+
+Two things are better than the plan asked for. `DB_PATH` now actually works - it was inert before,
+because two argparse defaults hardcoded the path string, so the environment variable the README
+documented did nothing. And a run that lacks a credential refuses in about a second naming the
+variable, where before it either died with a DuckDB `IOException` after reaching the database or
+with a provider traceback minutes into a fetch.
+
+One thing is worse than the plan assumed: **Steps 9 and 10 cannot be finished in this environment
+at all**, because the development container has no Docker. The Dockerfile, the manifest generator,
+the checksum and the publish instructions are all written, and the two pieces that could be checked
+without a daemon were checked - but the image has never been built and the secret-absence gate has
+never run. Anyone picking this up should treat that gate as the first task, not the last, because a
+key in a published layer survives deleting the tag.
+
+### Lessons worth carrying forward
+
+**Measure, then write it down; do not reason and write it down.** Three claims in this document were
+wrong when first written and each was corrected only by running something: that a `.env` file could
+not supply the LLM keys, then that CrewAI resolved `.env` from the working directory, and that
+`SystemExit("message")` exits 2. The `.env` question took three attempts because each measurement
+answered a narrower question than the one that mattered. The version that finally held up explains
+the *mechanism* - python-dotenv searching upward from the calling module's own file - and that
+version is the one that predicted the image would behave differently, which is the whole reason it
+matters.
+
+**A verification step can be more dangerous than the change it verifies.** The single most costly
+event in this work was not a code change; it was checking the rename by running `--help` on all
+thirteen console scripts, nine of which ignore argv and act immediately. That destroyed 7,038 price
+rows. Two aggravating factors are worth naming: the check ran in the background, so it kept going
+for about two minutes after the first sign of trouble, and there was no record of the dataset's
+prior state, so the damage could not be fully assessed afterwards. The first is a habit to change;
+the second is why `DATASET.json` exists.
+
+**A backup nobody has verified is still worth having.** The recovery worked because a pre-dividend
+backup existed and its price count matched the pre-damage figure exactly. Neither file was correct
+alone - the backup lacked four tables, the damaged copy lacked 7,038 rows - but together they were
+complete, and the merged result came out byte-for-byte the size of the original, which nothing in
+the merge was aiming at.
+
+**Documented decisions deserve to be overridden explicitly or not at all.** Two modules carried
+docstrings stating they avoided importing the settings singleton. The right move was neither to
+quietly contradict them nor to preserve a partial feature, but to override them and rewrite the
+docstrings to say what is now true and why.
+
+### Still to do
+
+Step 9's build and verification, and Step 10's publish, on a machine with Docker. Also the deferred
+follow-up in `Progress`: making the `crewai` import lazy, now quantified at **3.4 seconds** of
+startup for a run that needs no LLM at all.
 
 
 ## Context and Orientation
@@ -431,18 +748,31 @@ The kinds:
    `monkeypatch.setattr` accepts a dotted string naming what to replace; these are module paths
    written as text, so no import-anchored rule will find them. They are concentrated in
    `tests/test_cli.py`, `tests/test_interactive_flow.py` and `tests/test_holdings_cli.py`.
-3. *Backticked module references in docstrings* - `` `src.flow.rate_memory` ``.
+3. *Backticked module references in docstrings*, 4 of them - `` `src.flow.rate_memory` ``.
 4. *Prose file-path references in docstrings*, 314 of them - "see `src/flow/rate_memory.py`".
+5. *Module-invocation references*, 13 of them - `python -m src.dataset.membership`. These are real
+   module paths, so they break if not rewritten, and two of them are inside **runtime error
+   messages a user sees** (`dataset/prices.py:357`, `dataset/momentum.py:98` both tell the user to
+   run a builder first). One more, in `dataset/sec_edgar.py:60`, names
+   `src.config.settings.settings` in prose after the word "via". This category was missed on the
+   first pass and found by the gate below - see `Surprises & Discoveries`.
 
-The rules, applied to tracked Python files only:
+The rules, applied to tracked Python files only. Note the pathspec must reach nested directories,
+so filter the file list rather than relying on `src/*.py` matching recursively:
 
-    $ git ls-files -z 'src/*.py' 'tests/*.py' | xargs -0 sed -i -E \
+    $ git ls-files -z 'src' 'tests' | tr '\0' '\n' | grep '\.py$' | tr '\n' '\0' \
+      | xargs -0 sed -i -E \
         -e 's|\bfrom src\.|from agentic_portfolio.|g' \
         -e 's|\bfrom src import\b|from agentic_portfolio import|g' \
         -e 's|\bimport src\.|import agentic_portfolio.|g' \
         -e 's|"src\.|"agentic_portfolio.|g' \
         -e 's|`src\.|`agentic_portfolio.|g' \
-        -e 's|src/|src/agentic_portfolio/|g'
+        -e 's|src/|src/agentic_portfolio/|g' \
+        -e 's|-m src\.|-m agentic_portfolio.|g' \
+        -e 's|via src\.config|via agentic_portfolio.config|g'
+
+The six CrewAI YAML files need no rewriting - confirmed with
+`git ls-files 'src' | grep '\.ya\?ml$' | xargs grep -l 'src[./]'`, which matches nothing.
 
 **The quote anchor in the fourth rule is load-bearing, and here is why.**
 `src/agentic_portfolio/flow/live.py` around lines 123 to 125 contains this:
@@ -498,6 +828,12 @@ into `.venv` first, so tests will import the installed package instead. Verify:
     $ uv sync
     $ uv run python -c "import agentic_portfolio.flow.cli as m; print(m.__file__)"
     $ uv run portfolio --help | head -3
+
+`portfolio` is one of the four commands that parse arguments, so `--help` is safe there. **Do not
+extend that check into a loop over every console script.** Nine of the thirteen ignore argv and act
+immediately - the eight builders write to the market-data database and `portfolio-backtest` runs a
+full backtest. The safe way to verify all thirteen is the import check in
+`Validation and Acceptance`, which executes nothing.
 
 **Documentation.** Update only `README.md` (2 references, at lines 16 and 24) and `AGENTS.md`
 (2 references; line 4 states the real convention, line 10 is an illustrative example path). Leave
@@ -650,15 +986,15 @@ the variable, saying what cannot happen, and offering concrete ways out:
     be generated with anthropic/claude-sonnet-4-5. Set it in .env or the environment, choose
     another model with LLM_S_MODEL, or re-run with --selection user_provided
 
-**Do not try to "fix" key forwarding.** It is tempting, on seeing that nothing in `src/agents/`
-passes a key to the LLM client, to add an explicit `api_key=` or to export the settings value into
-`os.environ`. That would be redundant: CrewAI calls `load_dotenv()` itself and picks up a `.env` in
-the working directory, as measured in Surprises above. The one real hazard is the divergence this
-plan introduces - `Settings` reading `.env` from `AGENTIC_PORTFOLIO_HOME` while CrewAI reads it from
-the working directory - so the preflight message should name both places a key can live rather than
-just `.env`, and `README.md` should say that a `.env` is read from the working directory. Add a test
-that pins the measured behavior, so that a future CrewAI upgrade which drops `load_dotenv()` fails
-here loudly instead of in production.
+**Also close the key-forwarding gap, with `export_api_keys()`.** Nothing in `agents/` passes a key
+to the LLM client; the SDKs read `os.environ`, and pydantic-settings does not export `.env`. That
+works today only because CrewAI's own `load_dotenv()` finds `<repo>/.env` by searching upward from
+its installed file inside `<repo>/.venv/` - an accident of checkout layout that **does not hold in
+the image**, where the virtual environment is at `/opt/agentic-portfolio/venv` and the user's `.env`
+is in the mounted `/work`. See `Surprises & Discoveries` for the measurement. So
+`export_api_keys()` copies any provider key that `Settings` holds and the environment lacks into
+`os.environ`, never overriding one already set, and `require_api_keys` calls it first. That makes
+the preflight's verdict the same question the SDK will ask, in every layout.
 
 **Close the CrewAI missing-config trap too.** CrewAI's `_load_config` logs a warning and returns an
 empty dictionary when a YAML file is missing, so `agents/llm_s_crew/crew.py:41` then fails with a
@@ -910,12 +1246,11 @@ tail, build each architecture natively and join them:
   each flag buys. State that `-it` is **mandatory** for `portfolio --selection user_provided` and
   `portfolio-holdings whatif`, which sit at `input()` prompts. On API keys, give both working
   options: `-e ANTHROPIC_API_KEY` (or `--env-file`) passes them from the host environment, and a
-  `.env` in the mounted working directory also works, because both this project's `Settings` and
-  CrewAI's own `load_dotenv()` read one from there - see the measurement in
-  `Surprises & Discoveries`. Add the one caveat: if `AGENTIC_PORTFOLIO_HOME` is pointed away from
-  the working directory, put the keys in the environment rather than in a `.env`, because the two
-  readers would then look in different places. State that `SEC_UA` is not needed at all by a user
-  of the bundled dataset. State that builder commands need
+  `.env` in the mounted working directory also works - the latter **only because**
+  `export_api_keys()` bridges it, since CrewAI's own `load_dotenv()` cannot reach `/work` from
+  `/opt/agentic-portfolio/venv`; recommend `-e` as the primary route regardless, since it keeps
+  credentials out of a directory that also holds saved reports. State that `SEC_UA` is not needed at
+  all by a user of the bundled dataset. State that builder commands need
   `-e DB_PATH=/work/data/portfolio.duckdb`.
 - A `## Where files are written` subsection under `# How to Use`, mapping `/work` to the host
   directory.
@@ -964,9 +1299,34 @@ naming the file when handed an empty config. Those tests are what stop this regr
     $ python -m venv /tmp/fresh && /tmp/fresh/bin/pip install -q dist/*.whl
     $ ls /tmp/fresh/lib/python3.12/site-packages/ | grep -x 'src'      # expect no match
     $ ls /tmp/fresh/lib/python3.12/site-packages/ | grep -x 'agentic_portfolio'
-    $ for s in /tmp/fresh/bin/portfolio*; do "$s" --help >/dev/null || echo "BROKEN $s"; done
+    $ ls /tmp/fresh/bin/ | grep -c '^portfolio'                        # expect 13
 
-Thirteen scripts, no output from the loop.
+**NEVER verify these commands by running `--help` on them.** Nine of the thirteen take no
+arguments at all and act immediately: the eight `portfolio-build-*` / `portfolio-backfill-snapshot`
+builders start fetching and **writing to the market-data database**, and `portfolio-backtest` runs
+a complete backtest. `--help` is not a safe probe - it is ignored, and the command runs. Only
+`portfolio`, `portfolio-holdings`, `portfolio-summary` and `portfolio-migrate-candidates` use
+`argparse` and understand `--help`. See `Surprises & Discoveries` for what this cost when it was
+learned the hard way.
+
+To check that every entry point is wired correctly, import it and assert `main` is callable, which
+executes nothing:
+
+    $ /tmp/fresh/bin/python - <<'PY'
+    from importlib.metadata import entry_points
+    import importlib
+    names = []
+    for ep in entry_points(group="console_scripts"):
+        if ep.name.startswith("portfolio"):
+            module, _, attribute = ep.value.partition(":")
+            assert callable(getattr(importlib.import_module(module), attribute)), ep.name
+            names.append(ep.name)
+    print(f"{len(names)} entry points import and expose a callable main")
+    PY
+    13 entry points import and expose a callable main
+
+That check catches exactly what matters after a rename - a script pointing at a module path that no
+longer exists - without side effects.
 
 **The image.**
 
@@ -1154,3 +1514,39 @@ database read-only. `docker buildx` produces the multi-architecture image.
   turn into a confusing failure inside a container. The reference counts in
   `Artifacts and Notes` were measured rather than estimated, and they are what changed the
   documentation policy from "rewrite everything" to "leave plans 01 to 19 alone".
+
+- 2026-09-12, second revision, after implementing Steps 0 through 8 and authoring 9 and 10. Six
+  changes, each because the plan as written was wrong or incomplete rather than because the design
+  moved:
+
+  **A destructive instruction was removed.** The `Validation and Acceptance` section told the
+  reader to verify the console scripts with `for s in /tmp/fresh/bin/portfolio*; do "$s" --help`.
+  Following that instruction destroyed 7,038 rows of `data/portfolio.duckdb`, because nine of the
+  thirteen commands ignore argv and act immediately. It is replaced by an import-only check, and a
+  warning now sits at both places a reader would reach for `--help`. This was the single most
+  important correction in this revision: the plan actively harmed the person following it.
+
+  **Step 2's rewrite rules were incomplete.** Four rules were specified; six were needed. The
+  missing category was `python -m src.<module>`, which appears in docstrings and in two runtime
+  error messages users actually see. The gate caught it, which is the argument for having the gate.
+
+  **The `.env` mechanism was described wrongly, twice.** Both `Surprises & Discoveries` and Step 5
+  now carry the actual mechanism - python-dotenv searching upward from CrewAI's own installed file
+  - and Step 5 gained `export_api_keys()` as a result, having previously said not to touch key
+  forwarding at all. The corrected understanding is what revealed that a `.env` in the mounted
+  workspace would pass the preflight and then fail inside the image.
+
+  **The dev container's destination changed** from `.devcontainer/Dockerfile` to
+  `docker/Dockerfile.dev`, because `.devcontainer` is gitignored and the original destination would
+  have silently untracked the file.
+
+  **Two `conftest.py` mitigations were dropped as unnecessary**, with the reason recorded: every
+  affected test passes its paths explicitly, and the proposed `monkeypatch.delenv` could not have
+  worked anyway because `_HOME` is read at settings-import time.
+
+  **Steps 9 and 10 are marked `[~]`, not `[x]`.** The development container has no Docker, so the
+  image has never been built and the secret-absence gate has never run. Saying otherwise would be
+  the most expensive kind of inaccuracy this document could contain.
+
+  The unplanned dataset recovery is recorded in `Progress`, `Surprises & Discoveries` and the
+  `Decision Log`, and `Outcomes & Retrospective` now has its first two entries.
