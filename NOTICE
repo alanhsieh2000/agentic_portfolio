@@ -1,0 +1,68 @@
+agentic-portfolio
+Copyright (c) 2026 Alan Hsieh
+
+The MIT license in LICENSE covers THIS REPOSITORY'S SOURCE CODE ONLY. It grants
+no rights in any market data this software fetches, caches, or ships. Those
+terms come from the data's own sources and are summarized below.
+
+
+WHAT THIS PROJECT IS
+
+A reproduction of the screening method described in "Designing Agentic AI-Based
+Screening for Portfolio Investment" (arXiv:2603.23300). The paper's authors are
+credited in README.md. A method is not copyrightable, so that citation is an
+attribution owed to their work rather than a licensing condition on this code.
+
+
+THE BUNDLED MARKET DATA
+
+The published container image contains a prebuilt DuckDB database at
+/opt/agentic-portfolio/data/portfolio.duckdb, covering 2015-01-02 to 2024-04-29.
+It is bundled so that the paper's backtest can be reproduced without a
+multi-hour rebuild, and because the window is fixed history that cannot go stale.
+Its exact contents, row counts and build date are recorded beside it in
+DATASET.json.
+
+It is derived from three sources, with three different positions:
+
+  U.S. Securities and Exchange Commission (EDGAR) - the book-equity figures.
+  Public domain. EDGAR is subject to the SEC's fair-access policy, which
+  requires a descriptive User-Agent and rate limiting; this project honors both
+  (see src/agentic_portfolio/dataset/sec_edgar.py and the SEC_UA setting).
+
+  Wikipedia - the S&P 500 membership list and its historical changes.
+  Licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/) and
+  attributed here as required. Source:
+  https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
+
+  Yahoo Finance - the price, dividend and split history.
+  Yahoo's terms of service restrict redistribution of their data. This project
+  bundles it anyway, deliberately and for one narrow purpose: non-commercial
+  reproduction of a published academic result. That is a considered decision and
+  not an oversight, and it is recorded as such in
+  plans/20_packaging_and_release.md's Decision Log.
+
+If you would rather not rely on our copy - whether for licensing comfort, or
+because you want current data, or because you simply want to verify it - build
+your own and point the DB_PATH environment variable at it. Every step is a
+first-class command of this tool:
+
+  portfolio-build-membership
+  portfolio-build-prices
+  portfolio-build-fundamentals      # needs SEC_UA
+  portfolio-build-momentum
+  portfolio-build-returns
+  portfolio-build-dividends
+  portfolio-build-news-archive
+
+Nothing in this software requires the bundled database. The user_provided
+selection, the holdings report, and the whatif explorer all fetch what they need
+on demand and never read it.
+
+
+NO INVESTMENT ADVICE
+
+This is research software that reproduces an academic method. Its output is not
+a recommendation, the historical figures it reports are not a prediction, and
+the dividend figures it computes are a record of what was paid rather than a
+promise of what will be.
