@@ -26,12 +26,20 @@ hope. The verifier is the part that holds.
 from __future__ import annotations
 
 import logging
-import os
 import re
 
 from agentic_portfolio.agents.summary_crew.crew import ReportSummaryCrew
 from agentic_portfolio.agents.summary_schema import NOT_APPLICABLE, MonthNarrative
+from agentic_portfolio.config.preflight import api_key_problem
 from agentic_portfolio.config.settings import settings
+
+# `api_key_problem` now lives in `src/agentic_portfolio/config/preflight.py`,
+# beside the other credential checks, so that the preflight module can be
+# imported without pulling in `crewai` - which this module cannot be. It is
+# re-exported here because callers and test monkeypatch targets name it at this
+# path, and because a reader looking for "why did the prose not run" comes here
+# first.
+__all__ = ["api_key_problem"]
 
 logger = logging.getLogger(__name__)
 
@@ -64,33 +72,6 @@ class NarrativeUnavailable(RuntimeError):
     briefing without prose, because the figures are the value here and the
     sentences are the garnish.
     """
-
-
-def api_key_problem(model: str) -> str | None:
-    """The reason this model cannot be reached, or `None` if it can.
-
-    Checked before a crew is built, so an unreachable model costs nothing and
-    fails with a sentence rather than from inside CrewAI's executor.
-
-    The provider's key is looked for in `Settings` FIRST and the process
-    environment second, and that order is not cosmetic: `pydantic_settings`
-    loads `.env` without exporting it to `os.environ`, so a check against the
-    environment alone would refuse to run on a machine whose key lives only in
-    `.env` - which is how this repository is configured.
-    """
-    providers = {
-        "openai/": ("OPENAI_API_KEY", settings.openai_api_key),
-        "anthropic/": ("ANTHROPIC_API_KEY", settings.anthropic_api_key),
-    }
-    for prefix, (variable, configured) in providers.items():
-        if model.startswith(prefix) and not (configured or os.environ.get(variable)):
-            return (
-                f"{variable} is not set, so the prose for this summary cannot be written "
-                f"with {model}. Set it in .env or the environment, choose another model "
-                "with LLM_QUICK or --model, or re-run with --no-llm to get the figures "
-                "without the prose"
-            )
-    return None
 
 
 def stated_figures(text: str) -> set[str]:

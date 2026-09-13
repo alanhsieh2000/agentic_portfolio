@@ -21,6 +21,7 @@ from pypfopt import objective_functions
 
 from agentic_portfolio.agents.llm_s import generate_rule
 from agentic_portfolio.agents.llm_s_schema import ScreeningRule
+from agentic_portfolio.config.preflight import require_api_keys
 from agentic_portfolio.config.settings import settings
 from agentic_portfolio.dataset.membership import compute_rebalance_dates
 from agentic_portfolio.flow.interactive import run_scan
@@ -112,7 +113,7 @@ def _load_next_month_returns(rebalance_dates: list[date], db_path: str) -> dict[
 
 
 def run_full_backtest(
-    objective: str, selection: str = "llm_s_only", db_path: str = "data/portfolio.duckdb"
+    objective: str, selection: str = "llm_s_only", db_path: str = settings.db_path
 ) -> pd.DataFrame:
     """Chain the scanner/optimizer sequence across every one of the stored
     2020-2024 window's 52 monthly rebalance dates and return a
@@ -195,6 +196,10 @@ def main() -> None:
     `python -m agentic_portfolio.flow.backtest`.
     """
     logging.basicConfig(level=logging.INFO)
+    # The backtest asks LLM-S for a screening rule at each rebalance date, so a
+    # missing key wastes the whole run. `llm_s_only` is the selection
+    # `run_full_backtest` uses by default.
+    require_api_keys("llm_s_only")
     result = run_full_backtest("MSR")
     sharpe = compute_sharpe_ratio(result["net_return"])
     print(f"Realized annualized Sharpe (MSR, net of transaction cost and risk-free rate, this project): {sharpe:.4f}")

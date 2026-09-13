@@ -14,6 +14,7 @@ from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 
 from agentic_portfolio.agents.llm_f_schema import HeadlineSentimentBatch
+from agentic_portfolio.agents.crew_config import require
 
 
 @CrewBase
@@ -33,11 +34,11 @@ class LLMFCrew:
 
     @agent
     def sentiment_agent(self) -> Agent:
-        return Agent(config=self.agents_config["sentiment_agent"], llm=self.model, verbose=True)
+        return Agent(config=require(self.agents_config, "sentiment_agent", "agentic_portfolio/agents/llm_f_crew/config/agents.yaml"), llm=self.model, verbose=True)
 
     @task
     def sentiment_task(self) -> Task:
-        return Task(config=self.tasks_config["sentiment_task"], output_pydantic=HeadlineSentimentBatch)
+        return Task(config=require(self.tasks_config, "sentiment_task", "agentic_portfolio/agents/llm_f_crew/config/tasks.yaml"), output_pydantic=HeadlineSentimentBatch)
 
     @crew
     def crew(self) -> Crew:

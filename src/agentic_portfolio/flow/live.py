@@ -41,6 +41,7 @@ from datetime import date, timedelta
 import duckdb
 import pandas as pd
 
+from agentic_portfolio.config.preflight import require_sec_user_agent
 from agentic_portfolio.dataset.fundamentals import build_factors
 from agentic_portfolio.dataset.membership import apply_changes_asof, compute_rebalance_dates, fetch_and_normalize_membership, write_membership_table
 from agentic_portfolio.dataset.dividends import build_dividends
@@ -195,6 +196,13 @@ def build_live_snapshot(
         with build_scratch_snapshot("live_snapshot_") as scratch_db_path:
             yield scratch_db_path
         return
+
+    # Only the selections that call `build_factors` below reach the SEC, and
+    # they reach it after the membership and price fetches - so establish the
+    # User-Agent now rather than several minutes in. `user_provided` returned
+    # above and needs nothing.
+    if selection in ("llm_s_only", "llm_s_and_f"):
+        require_sec_user_agent()
 
     fd, temp_db_path = tempfile.mkstemp(suffix=".duckdb", prefix="live_snapshot_")
     os.close(fd)

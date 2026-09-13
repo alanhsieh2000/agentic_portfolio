@@ -53,6 +53,7 @@ import duckdb
 import pandas as pd
 import yfinance as yf
 
+from agentic_portfolio.config.preflight import require_sec_user_agent
 from agentic_portfolio.config.settings import settings
 from agentic_portfolio.dataset import sec_edgar
 from agentic_portfolio.dataset.prices import to_yfinance_symbol
@@ -744,6 +745,9 @@ def main() -> None:
     by `python -m agentic_portfolio.dataset.fundamentals`.
     """
     logging.basicConfig(level=logging.INFO)
+    # Established before the Wikipedia and price passes, which otherwise run for
+    # minutes before the first SEC request discovers the User-Agent is missing.
+    require_sec_user_agent()
     build_factors()
 
 

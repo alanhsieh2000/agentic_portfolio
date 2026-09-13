@@ -19,17 +19,16 @@ from __future__ import annotations
 
 import calendar
 import logging
-import os
 from datetime import date
 
 import pandas as pd
 
 from agentic_portfolio.agents.llm_f_crew.crew import LLMFCrew
 from agentic_portfolio.agents.llm_f_schema import HeadlineSentiment, SentimentSignal
+from agentic_portfolio.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "anthropic/claude-sonnet-4-5"
 BUY_THRESHOLD = 0.1
 SELL_THRESHOLD = -0.1
 HALF_LIFE_DAYS = 7.0
@@ -105,7 +104,7 @@ def generate_signal(
     if not headlines:
         return SentimentSignal(ticker=ticker, month=month_str, score=0.0, signal="hold")
 
-    resolved_model = model or os.environ.get("LLM_F_MODEL", DEFAULT_MODEL)
+    resolved_model = model or settings.llm_f_model
 
     llm_f_crew = LLMFCrew(model=resolved_model)
     result = llm_f_crew.crew().kickoff(

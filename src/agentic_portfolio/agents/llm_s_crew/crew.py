@@ -20,6 +20,7 @@ from agentic_portfolio.agents.llm_s_crew.tools import (
     TestComplexConditionTool,
 )
 from agentic_portfolio.agents.llm_s_schema import ScreeningRule
+from agentic_portfolio.agents.crew_config import require
 
 
 @CrewBase
@@ -38,12 +39,12 @@ class LLMSCrew:
 
     @agent
     def strategy_agent(self) -> Agent:
-        return Agent(config=self.agents_config["strategy_agent"], llm=self.model, verbose=True)
+        return Agent(config=require(self.agents_config, "strategy_agent", "agentic_portfolio/agents/llm_s_crew/config/agents.yaml"), llm=self.model, verbose=True)
 
     @task
     def strategy_task(self) -> Task:
         return Task(
-            config=self.tasks_config["strategy_task"],
+            config=require(self.tasks_config, "strategy_task", "agentic_portfolio/agents/llm_s_crew/config/tasks.yaml"),
             tools=[
                 GetDatabaseSchemaTool(snapshot=self.snapshot, as_of_date=self.as_of_date),
                 QueryFirmDatabaseTool(snapshot=self.snapshot),

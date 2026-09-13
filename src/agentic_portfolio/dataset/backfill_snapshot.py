@@ -30,6 +30,7 @@ from datetime import date
 import duckdb
 import pandas as pd
 
+from agentic_portfolio.config.preflight import require_sec_user_agent
 from agentic_portfolio.config.settings import settings
 from agentic_portfolio.dataset import sec_edgar
 from agentic_portfolio.dataset.fundamentals import (
@@ -145,6 +146,7 @@ def main() -> None:
     import sys
 
     logging.basicConfig(level=logging.INFO)
+    require_sec_user_agent()
     target = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date(2019, 12, 31)
     snapshot = build_snapshot_for_date(target)
     insert_snapshot_rows(snapshot)

@@ -19,6 +19,7 @@ from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 
 from agentic_portfolio.agents.summary_schema import MonthNarrative
+from agentic_portfolio.agents.crew_config import require
 
 
 @CrewBase
@@ -42,11 +43,11 @@ class ReportSummaryCrew:
 
     @agent
     def summary_agent(self) -> Agent:
-        return Agent(config=self.agents_config["summary_agent"], llm=self.model, verbose=False)
+        return Agent(config=require(self.agents_config, "summary_agent", "agentic_portfolio/agents/summary_crew/config/agents.yaml"), llm=self.model, verbose=False)
 
     @task
     def summary_task(self) -> Task:
-        return Task(config=self.tasks_config["summary_task"], output_pydantic=MonthNarrative)
+        return Task(config=require(self.tasks_config, "summary_task", "agentic_portfolio/agents/summary_crew/config/tasks.yaml"), output_pydantic=MonthNarrative)
 
     @crew
     def crew(self) -> Crew:

@@ -62,6 +62,7 @@ import argparse
 import pandas as pd
 from datetime import date
 
+from agentic_portfolio.config.preflight import require_api_keys
 from agentic_portfolio.config.settings import settings
 from agentic_portfolio.dataset.ticker_currency import DEFAULT_CURRENCY, group_by_currency
 from agentic_portfolio.dataset.holdings_cache import DEFAULT_HOLDINGS_CACHE_PATH
@@ -2430,7 +2431,7 @@ def main() -> None:
              f"ceiling is {MAX_DIVIDEND_YIELD}). Mutually exclusive with "
              "--min-annual-dividend.",
     )
-    parser.add_argument("--db-path", default="data/portfolio.duckdb")
+    parser.add_argument("--db-path", default=settings.db_path)
     parser.add_argument(
         "--benchmark",
         default=None,
@@ -2547,6 +2548,12 @@ def main() -> None:
              "contains them.",
     )
     args = parser.parse_args()
+
+    # Before anything opens a database or fetches anything. A live-mode screened
+    # run otherwise pays for the whole Yahoo Finance snapshot and only then
+    # discovers it has no API key, reporting it as a provider exception from
+    # inside CrewAI rather than as the missing variable it is.
+    require_api_keys(args.selection)
 
     if args.currency:
         args.currency = args.currency.strip().upper()
