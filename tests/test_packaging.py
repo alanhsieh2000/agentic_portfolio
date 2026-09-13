@@ -1,4 +1,5 @@
-"""The six CrewAI prompt files must be reachable as package data.
+"""The eight CrewAI prompt files and the PDF stylesheet must be reachable as
+package data.
 
 Why this test exists, given that the files are obviously sitting in the source
 tree. Every word of the LLM-S, LLM-F and summary prompts lives in those YAML
@@ -16,6 +17,12 @@ logs a warning and proceeds with an empty dictionary, so the first symptom used
 to be a bare `KeyError` naming an agent. `agentic_portfolio/agents/crew_config.py`
 now turns that into a sentence naming the file, and the last test here pins that.
 
+`agentic_portfolio/flow/report_pdf.css` rides the same convention for the same
+reason, and is guarded here for the same failure: a wheel without it renders
+every PDF at WeasyPrint's defaults - US Letter, no margins worth the name, and a
+proportional face that destroys the column alignment the whole file exists to
+preserve - rather than failing outright.
+
 These tests use `importlib.resources`, not `Path(__file__).parent`, on purpose:
 the former asks the import system where the data actually is, which is the same
 question CrewAI's loader is effectively asking, and it keeps answering correctly
@@ -30,7 +37,7 @@ import pytest
 
 from agentic_portfolio.agents.crew_config import CrewConfigMissing, require
 
-CREW_PACKAGES = ("llm_s_crew", "llm_f_crew", "summary_crew")
+CREW_PACKAGES = ("llm_s_crew", "llm_f_crew", "summary_crew", "translate_crew")
 CONFIG_FILES = ("agents.yaml", "tasks.yaml")
 
 
@@ -76,3 +83,25 @@ def test_a_config_missing_one_key_says_what_it_does_define():
 def test_a_present_key_is_returned_unchanged():
     config = {"strategy_agent": {"role": "analyst"}}
     assert require(config, "strategy_agent", "config/agents.yaml") == {"role": "analyst"}
+
+
+def test_the_pdf_stylesheet_is_reachable_as_package_data():
+    resource = files("agentic_portfolio.flow").joinpath("report_pdf.css")
+    assert resource.is_file(), (
+        "agentic_portfolio/flow/report_pdf.css is not reachable through the import system. "
+        "If this is an installed copy, the wheel was built without it and every briefing "
+        "would be rendered at WeasyPrint's default page size with proportional type, which "
+        "breaks the column alignment of every table"
+    )
+
+
+def test_the_pdf_stylesheet_sets_a_page_size_and_preserves_whitespace():
+    """A present but truncated stylesheet would pass the check above and still
+    lay every table out wrongly, so the two declarations that actually carry the
+    tables are pinned by name."""
+    text = files("agentic_portfolio.flow").joinpath("report_pdf.css").read_text()
+    assert "@page" in text
+    assert "size: A4" in text
+    # `pre-wrap` rather than `pre`: WeasyPrint does not paginate horizontally,
+    # so an over-wide line under plain `pre` runs off the paper silently.
+    assert "pre-wrap" in text

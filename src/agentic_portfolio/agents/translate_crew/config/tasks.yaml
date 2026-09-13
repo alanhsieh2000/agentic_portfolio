@@ -1,0 +1,33 @@
+translation_task:
+  description: >
+    Translate the sentences of a saved portfolio briefing covering {month} into {language}.
+
+    There are {block_count} numbered blocks below. Return one entry for each, carrying that
+    block's index and your translation of it. Return nothing for any index not in the list.
+
+    Two rules carry the whole task. First, the markers: every [[0]], [[1]] and so on in a
+    block stands for a figure, a date, a ticker, a filename, a command or a digest that has
+    already been checked and must not change. Reproduce every marker of a block in your
+    translation of it, the same number of times, in the same order, spelled exactly. Do not
+    translate a marker, do not explain one, do not reorder them, do not drop one, do not add
+    one. A block whose markers do not match will be discarded and its English kept, so a
+    faithful stiff sentence is worth more than a fluent one that moved a number.
+
+    Second, structure: one line per block, and any leading "#", "##" or "- " reproduced
+    exactly as given. Do not merge two blocks. Do not split one. Do not add a heading, a note,
+    a caveat or an explanation of your own, and do not translate a block that is only a
+    marker or only a command - return that unchanged.
+
+    Also give one short disclaimer sentence, written in {language}, saying that this document
+    was machine-translated from an English briefing and that its tables and figures were not
+    translated. It must contain no digits and no markers.
+
+    BLOCKS:
+    {blocks}
+  expected_output: >
+    A TranslatedBriefing. `language` echoes the language asked for. `disclaimer` is one
+    sentence in that language with no digits and no markers. `blocks` holds exactly one entry
+    per numbered block above, each with the index copied unchanged and a single-line
+    translation that reproduces every marker of the original in its original order, keeping
+    any leading "#", "##" or "- ".
+  agent: translator_agent

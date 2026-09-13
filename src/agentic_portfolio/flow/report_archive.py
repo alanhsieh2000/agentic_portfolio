@@ -119,6 +119,15 @@ FACT_ORDER: tuple[str, ...] = (
     "sources_digest",
     "llm_model",
     "narrative_status",
+    # Written only by a TRANSLATED summary, so absent from every other file.
+    # `language` is deliberately absent rather than "en" on an English summary:
+    # the summaries saved before translation existed carry no such fact, and a
+    # reader should not have to learn that an absent fact and "en" mean the same
+    # thing. `existing_summary` normalizes the two on the way in instead.
+    "language",
+    "translation_model",
+    "translated_from",
+    "translation_status",
     "currency",
     "objective",
     "objective_origin",
@@ -359,9 +368,23 @@ def report_filename(archive: ReportArchive, facts: dict[str, object], digest: st
     counter. A counter would have been the alternative and is worse: it depends
     on what else is in the directory, so the same report saved into two
     different archives would get two different names.
+
+    The `language` token is for a reader's benefit and is NOT a uniqueness
+    mechanism - worth saying so, because it looks like one. Uniqueness is
+    already guaranteed by the digest: the name ends in a hash of the body, and
+    two languages cannot produce one body. The token is there so that
+    `2026-09-11-summary-zh-TW-91c40e7b.md` can be told from its English sibling
+    without opening either. Only a translated summary carries the fact, so no
+    existing filename changes shape.
+
+    A language named in its own script has no filename-safe characters at all,
+    and `_slug` then yields `unknown`. That is accepted rather than fixed: the
+    file is still correct and still unique, the `language` FACT carries the
+    truth, and changing `_slug` to serve this case would loosen the safety rule
+    that keeps a path separator out of every other filename.
     """
     tokens = [archive.as_of.isoformat(), archive.kind]
-    for key in ("objective", "selection"):
+    for key in ("objective", "selection", "language"):
         value = facts.get(key)
         if value is not None:
             tokens.append(_slug(value))

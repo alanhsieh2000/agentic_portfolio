@@ -1826,3 +1826,59 @@ def digest_for_llm(digest: MonthDigest) -> str:
         out.append(f"BENCHMARK COVERAGE {note}")
 
     return "\n".join(out).rstrip() + "\n"
+
+
+def protected_literals(
+    digest: MonthDigest, records: Sequence[ReportRecord]
+) -> tuple[str, ...]:
+    """Every noun in this month that a translation must reproduce exactly.
+
+    `src/agentic_portfolio/agents/report_translation.py` masks these out of a
+    sentence before a language model sees it, so that a ticker, a currency code
+    or an objective name comes back character-for-character rather than
+    localized. The list is returned longest-first, which is what makes a
+    combination like `PFF+PFFA+VZ` win over the three tickers inside it.
+
+    The point of building it HERE, from the digest and the records, is that it
+    is exact rather than a guess. The obvious alternative - a regex for runs of
+    capital letters - looks equivalent and is not: it protects `CAUTION`,
+    `WITHIN`, `SAME` and `NOT APPLICABLE`, every one of which is an English word
+    the translator exists to render, while still missing a lowercase model name.
+    This module already knows precisely which nouns the month contains, so no
+    guessing is required.
+
+    Deliberately NOT included: the report digests and the `sources_digest`. A
+    hex digest is matched by `briefing_blocks`' own long-hex pattern, and
+    listing the digests as literals as well would mean a 64-character string
+    was matched twice with the longer match winning anyway - no behaviour
+    change, and one more thing to keep in step. The window dates, filenames,
+    figures and command lines are likewise left to the narrow patterns there,
+    which recognize their SHAPE and so also catch a value this function never
+    saw.
+    """
+    literals: set[str] = set()
+    for record in records:
+        literals.update(record.candidates or ())
+        literals.update(ticker for ticker, _ in (record.positions or ()))
+        literals.update(ticker for ticker, _ in (record.weights or ()))
+        for value in (
+            record.currency,
+            record.objective,
+            record.benchmark,
+            record.selection,
+            label(record),
+        ):
+            if value:
+                literals.add(str(value))
+    for _, benchmark in digest.scope.benchmarks:
+        if benchmark.ticker:
+            literals.add(benchmark.ticker)
+    literals.update(digest.scope.currencies)
+    for partition in digest.partitions:
+        for row in partition.rows:
+            if row.label:
+                literals.add(row.label)
+    literals.discard("")
+    # Longest first so a compound label or ticker combination is matched whole
+    # rather than being eaten piecemeal by the shorter names inside it.
+    return tuple(sorted(literals, key=lambda text: (-len(text), text)))

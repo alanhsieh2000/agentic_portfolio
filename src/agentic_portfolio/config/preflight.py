@@ -82,7 +82,18 @@ def _refuse(message: str) -> None:
     raise SystemExit(2)
 
 
-def api_key_problem(model: str) -> str | None:
+#: What `api_key_problem` says a missing key costs, and how to proceed without
+#: it, when the caller does not say. These are the summary's prose pass, which
+#: was this check's only caller when it was written.
+DEFAULT_PURPOSE = "the prose for this summary cannot be written"
+DEFAULT_REMEDY = "re-run with --no-llm to get the figures without the prose"
+
+
+def api_key_problem(
+    model: str,
+    purpose: str = DEFAULT_PURPOSE,
+    remedy: str = DEFAULT_REMEDY,
+) -> str | None:
     """The reason this model cannot be reached, or `None` if it can.
 
     Checked before a crew is built, so an unreachable model costs nothing and
@@ -93,14 +104,22 @@ def api_key_problem(model: str) -> str | None:
     loads `.env` without exporting it to `os.environ`, so a check against the
     environment alone would refuse to run on a machine whose key lives only in
     `.env` - which is how this repository is configured.
+
+    `purpose` and `remedy` are parameters rather than fixed text because there
+    is now more than one caller and they do not have the same way out. The
+    summary's prose pass can fall back to `--no-llm`; the translation in
+    `src/agentic_portfolio/agents/report_translation.py` cannot, since
+    `--no-llm` is refused alongside `--language` and dropping `--language` is
+    the actual remedy there. Telling a user to pass a flag that would be
+    rejected is worse than saying nothing. The defaults preserve this
+    function's original wording exactly, so every existing call site and test
+    is unaffected.
     """
     for prefix, (variable, field) in _PROVIDERS.items():
         if model.startswith(prefix) and not (getattr(settings, field, None) or os.environ.get(variable)):
             return (
-                f"{variable} is not set, so the prose for this summary cannot be written "
-                f"with {model}. Set it in .env or the environment, choose another model "
-                "with LLM_QUICK or --model, or re-run with --no-llm to get the figures "
-                "without the prose"
+                f"{variable} is not set, so {purpose} with {model}. Set it in .env or the "
+                f"environment, choose another model with LLM_QUICK or --model, or {remedy}"
             )
     return None
 

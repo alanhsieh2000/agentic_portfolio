@@ -544,3 +544,543 @@ def test_the_older_of_two_summaries_wins_only_if_it_is_actually_newer(
     _run(monkeypatch, tmp_path)
 
     assert f"Summary already saved for these 2 reports: {first}" in capsys.readouterr().out
+
+
+# --- --language ---------------------------------------------------------------
+#
+# `translate_briefing` is patched at `summary_cli.translate_briefing` - the name
+# as imported into the module under test - so no test below reaches a model. The
+# fake returns a document built from the REAL briefing it was handed, with only
+# the unindented prose lines altered, which is what a faithful translator would
+# produce. That way the assertions about tables surviving are assertions about
+# the CLI's own wiring and not about a hand-written fixture.
+
+
+def _fake_translation(monkeypatch, raises=None, kept_english=(), mangle_tables=False):
+    """Patch `translate_briefing` and hand back the list of calls it received."""
+    calls: list = []
+
+    def fake(body, language, literals=(), model=None, month=""):
+        calls.append(
+            {
+                "body": body,
+                "language": language,
+                "literals": literals,
+                "model": model,
+                "month": month,
+            }
+        )
+        if raises:
+            raise raises
+        out = []
+        for line in body.split("\n"):
+            if mangle_tables and line.startswith("  "):
+                out.append("  MANGLED")
+            elif line.strip() and not line.startswith("  "):
+                out.append(f"[{language}] {line}")
+            else:
+                out.append(line)
+        return "\n".join(out), "這是機器翻譯。", tuple(kept_english)
+
+    monkeypatch.setattr(summary_cli, "translate_briefing", fake)
+    return calls
+
+
+def _translations(tmp_path, language="zh-TW"):
+    folder = tmp_path / "output" / MONTH
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.glob(f"*summary-{language}-*.md"))
+
+
+def test_language_writes_a_second_file_beside_the_english_one(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert len(_summaries(tmp_path)) == 2
+    assert len(_translations(tmp_path)) == 1
+
+
+def test_the_english_summary_is_still_written_when_a_translation_is_asked_for(
+    monkeypatch, tmp_path
+):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    english = [p for p in _summaries(tmp_path) if p not in _translations(tmp_path)]
+    assert len(english) == 1
+    assert "language:" not in load_report(english[0])[0]
+
+
+def test_the_translated_file_carries_its_language_and_provenance(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    facts, _ = load_report(_translations(tmp_path)[0])
+    assert facts["language"] == "zh-TW"
+    assert facts["translation_status"] == "written"
+    assert facts["translated_from"]
+    assert facts["sources_digest"]
+
+
+def test_the_translated_filename_carries_the_language_token(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert "summary-zh-TW-" in _translations(tmp_path)[0].name
+
+
+def test_the_translated_document_keeps_every_table_line_byte_for_byte(monkeypatch, tmp_path):
+    # The assertion the whole translation design exists for.
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    english = [p for p in _summaries(tmp_path) if p not in _translations(tmp_path)][0]
+    english_tables = [l for l in load_report(english)[1].split("\n") if l.startswith("  ")]
+    chinese_tables = [
+        l for l in load_report(_translations(tmp_path)[0])[1].split("\n") if l.startswith("  ")
+    ]
+    assert english_tables
+    assert english_tables == chinese_tables
+
+
+def test_the_translator_is_given_the_months_protected_literals(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    calls = _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert "NVDA" in calls[0]["literals"]
+    assert "USD" in calls[0]["literals"]
+
+
+def test_an_english_summary_does_not_block_a_translation_of_the_same_reports(
+    monkeypatch, tmp_path
+):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path)
+    assert len(_summaries(tmp_path)) == 1
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert len(_summaries(tmp_path)) == 2
+
+
+def test_a_translation_does_not_block_recognizing_the_english_summary(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    before = len(_summaries(tmp_path))
+    _run(monkeypatch, tmp_path)
+    assert len(_summaries(tmp_path)) == before
+
+
+def test_language_on_an_already_summarized_month_needs_no_prose_call(monkeypatch, tmp_path):
+    # The valuable middle case: the English briefing is on disk, so only the
+    # translation is missing and a prose pass would be wasted spend.
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the prose pass must not run when the English briefing exists")
+
+    monkeypatch.setattr(summary_cli, "generate_narrative", refuse)
+    calls = _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert len(calls) == 1
+    assert len(_translations(tmp_path)) == 1
+
+
+def test_reusing_the_saved_english_translates_the_bytes_on_disk(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path)
+    english = _summaries(tmp_path)[0]
+    saved_body = load_report(english)[1]
+
+    monkeypatch.setattr(summary_cli, "generate_narrative", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("no prose pass")
+    ))
+    calls = _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert calls[0]["body"].strip() == saved_body.strip()
+
+
+def test_a_repeat_run_in_the_same_language_writes_nothing(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    before = _summaries(tmp_path)
+    capsys.readouterr()
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    out = capsys.readouterr().out
+    assert _summaries(tmp_path) == before
+    assert "already saved" in out
+    assert "zh-TW" in out
+
+
+def test_two_languages_of_one_month_produce_two_translations(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "ja")
+    assert len(_translations(tmp_path, "zh-TW")) == 1
+    assert len(_translations(tmp_path, "ja")) == 1
+    assert len(_summaries(tmp_path)) == 3
+
+
+def test_force_with_language_rewrites_both(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    _fake_narrative(monkeypatch, _narrative(headline="A different headline entirely."))
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW", "--force")
+    assert len(_summaries(tmp_path)) == 4
+
+
+def test_stdout_with_language_prints_both_and_writes_nothing(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW", "--stdout")
+    out = capsys.readouterr().out
+    assert _summaries(tmp_path) == []
+    assert "[zh-TW]" in out
+    assert "Portfolio archive summary" in out
+
+
+def test_language_with_no_llm_exits_two_and_names_both_flags(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    with pytest.raises(SystemExit) as exit_info:
+        _run(monkeypatch, tmp_path, "--language", "zh-TW", "--no-llm")
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--language" in err and "--no-llm" in err
+
+
+def test_a_failed_translation_keeps_the_english_and_exits_zero(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(
+        monkeypatch, raises=summary_cli.TranslationUnavailable("model refused the job")
+    )
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    captured = capsys.readouterr()
+    assert len(_summaries(tmp_path)) == 1
+    assert _translations(tmp_path) == []
+    assert "Warning: model refused the job" in captured.err
+    assert "Portfolio archive summary" in captured.out
+
+
+def test_a_partial_translation_records_how_many_blocks_stayed_english(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch, kept_english=("block 3: dropped marker(s) [1]",))
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    facts, body = load_report(_translations(tmp_path)[0])
+    assert facts["translation_status"].startswith("partial: 1 block")
+    assert "1 block(s) were kept in English" in body
+
+
+def test_the_translated_document_names_the_english_file_it_came_from(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    english = [p for p in _summaries(tmp_path) if p not in _translations(tmp_path)][0]
+    body = load_report(_translations(tmp_path)[0])[1]
+    assert english.name in body
+    assert "zh-TW" in body
+
+
+def test_the_translated_document_carries_the_disclaimer_in_the_target_language(
+    monkeypatch, tmp_path
+):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert "這是機器翻譯。" in load_report(_translations(tmp_path)[0])[1]
+
+
+def test_a_translated_summary_is_not_read_back_as_a_source_report(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    capsys.readouterr()
+    _run(monkeypatch, tmp_path, "--force")
+    out = capsys.readouterr().out
+    # Still two source reports, not four: both summaries were skipped.
+    assert "2 reports (2 portfolio, 0 whatif)" in out
+
+
+def test_a_free_form_language_name_still_saves_one_file(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "Traditional Chinese")
+    assert len(_summaries(tmp_path)) == 2
+
+
+def test_a_language_name_that_slugs_to_nothing_still_saves_one_file(monkeypatch, tmp_path):
+    # `_slug` yields "unknown" here. The file is still correct and unique
+    # because its name ends in a digest of the body, and the `language` fact
+    # carries the truth.
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "繁體中文")
+    assert len(_summaries(tmp_path)) == 2
+    saved = [p for p in _summaries(tmp_path) if "unknown" in p.name]
+    assert len(saved) == 1
+    assert load_report(saved[0])[0]["language"] == "繁體中文"
+
+
+# --- --pdf --------------------------------------------------------------------
+#
+# These run WeasyPrint for real. It is installed, needs no network, and renders
+# one of these small briefings in about a tenth of a second - and the question
+# worth asking here is whether the CLI hands it the right file, which a fake
+# would answer by construction.
+
+
+def _pdfs(tmp_path):
+    folder = tmp_path / "output" / MONTH
+    return sorted(p for p in folder.glob("*.pdf")) if folder.is_dir() else []
+
+
+def test_pdf_writes_one_pdf_beside_the_saved_summary(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path, "--pdf")
+    pdfs = _pdfs(tmp_path)
+    assert len(pdfs) == 1
+    assert pdfs[0].stem == _summaries(tmp_path)[0].stem
+    assert pdfs[0].read_bytes().startswith(b"%PDF-")
+
+
+def test_without_pdf_no_pdf_is_written(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path)
+    assert _pdfs(tmp_path) == []
+
+
+def test_the_pdf_notice_names_the_file_after_the_report_notice(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path, "--pdf")
+    out = capsys.readouterr().out
+    assert "Saved PDF: " in out
+    assert out.index("Saved report: ") < out.index("Saved PDF: ")
+
+
+def test_pdf_with_no_llm_renders_without_calling_the_model(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    calls = _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path, "--pdf", "--no-llm")
+    assert calls == []
+    assert len(_pdfs(tmp_path)) == 1
+
+
+def test_pdf_with_stdout_exits_two_and_says_which_flag_to_drop(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    with pytest.raises(SystemExit) as exit_info:
+        _run(monkeypatch, tmp_path, "--pdf", "--stdout")
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--pdf" in err and "--stdout" in err
+    assert "Drop --stdout" in err
+
+
+def test_a_repeat_run_with_pdf_renders_beside_the_summary_already_saved(
+    monkeypatch, tmp_path, capsys
+):
+    # The "I forgot --pdf" case: no --force, no second Markdown file, no model
+    # call, and a PDF at the end of it.
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path)
+    assert _pdfs(tmp_path) == []
+    capsys.readouterr()
+    _run(monkeypatch, tmp_path, "--pdf")
+    out = capsys.readouterr().out
+    assert len(_summaries(tmp_path)) == 1
+    assert len(_pdfs(tmp_path)) == 1
+    assert "already saved" in out
+    assert "Saved PDF: " in out
+
+
+def test_a_repeat_run_with_pdf_leaves_an_existing_pdf_alone(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path, "--pdf")
+    before = _pdfs(tmp_path)[0].read_bytes()
+    capsys.readouterr()
+    _run(monkeypatch, tmp_path, "--pdf")
+    out = capsys.readouterr().out
+    assert _pdfs(tmp_path)[0].read_bytes() == before
+    assert "PDF already saved beside the report" in out
+
+
+def test_force_with_pdf_writes_a_second_summary_and_a_second_pdf(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path, "--pdf")
+    _fake_narrative(monkeypatch, _narrative(headline="An entirely different headline."))
+    _run(monkeypatch, tmp_path, "--pdf", "--force")
+    assert len(_summaries(tmp_path)) == 2
+    assert len(_pdfs(tmp_path)) == 2
+    assert {p.stem for p in _pdfs(tmp_path)} == {p.stem for p in _summaries(tmp_path)}
+
+
+def test_language_with_pdf_writes_four_files(monkeypatch, tmp_path):
+    """The headline behaviour: an English pair and a translated pair.
+
+    `cjk_font_family` is patched to report a font present, because this
+    assertion is about the CLI rendering a PDF beside EACH file it saved and not
+    about which fonts the machine running the tests happens to have. The
+    unpatched behaviour on a font-less machine is the next test, and it is what
+    this container actually does.
+    """
+    from agentic_portfolio.flow import report_pdf
+
+    monkeypatch.setattr(report_pdf, "cjk_font_family", lambda *a, **k: "Noto Sans CJK TC")
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW", "--pdf")
+    assert len(_summaries(tmp_path)) == 2
+    assert len(_pdfs(tmp_path)) == 2
+    assert {p.stem for p in _pdfs(tmp_path)} == {p.stem for p in _summaries(tmp_path)}
+
+
+def test_a_translated_pdf_is_refused_without_a_cjk_font_and_the_english_one_is_not(
+    monkeypatch, tmp_path, capsys
+):
+    """What this container really does, and what it must do.
+
+    Both Markdown files are saved and the English PDF is rendered; only the
+    Chinese PDF is refused, by name, because every character of it would print
+    as an empty box. The refusal is per file rather than per run, so forgetting
+    to install a font costs the translation's PDF and nothing else.
+    """
+    from agentic_portfolio.flow import report_pdf
+
+    monkeypatch.setattr(report_pdf, "cjk_font_family", lambda *a, **k: None)
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW", "--pdf")
+    captured = capsys.readouterr()
+    assert len(_summaries(tmp_path)) == 2
+    assert len(_pdfs(tmp_path)) == 1
+    assert "fonts-noto-cjk" in captured.err
+    assert "Saved PDF: " in captured.out
+
+
+def test_a_failed_pdf_keeps_the_briefing_and_warns(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+
+    def fail(path):
+        raise summary_cli.PdfUnavailable("WeasyPrint could not be loaded (no libpango)")
+
+    monkeypatch.setattr(summary_cli, "write_pdf", fail)
+    _run(monkeypatch, tmp_path, "--pdf")
+    captured = capsys.readouterr()
+    assert len(_summaries(tmp_path)) == 1
+    assert _pdfs(tmp_path) == []
+    assert "Warning: no PDF" in captured.err
+    assert "Portfolio archive summary" in captured.out
+
+
+def test_a_pdf_in_the_month_folder_is_not_read_as_a_report(monkeypatch, tmp_path, capsys):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _run(monkeypatch, tmp_path, "--pdf")
+    capsys.readouterr()
+    _run(monkeypatch, tmp_path, "--force")
+    out = capsys.readouterr().out
+    assert "2 reports (2 portfolio, 0 whatif)" in out
+    assert ".pdf" not in out.split("Reading")[1].split("\n")[0]
+
+
+def test_reusing_the_saved_english_records_that_files_digest(monkeypatch, tmp_path):
+    """`translated_from` must name the English file actually translated.
+
+    On the reuse path the English summary was written by an earlier run, so the
+    digest has to come from reading that file rather than from a `SavedReport`
+    this run produced - and it must be the digest of the very bytes handed to
+    the translator.
+    """
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path)
+    english = _summaries(tmp_path)[0]
+    english_digest = load_report(english)[0]["digest"]
+
+    monkeypatch.setattr(
+        summary_cli,
+        "generate_narrative",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prose pass")),
+    )
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert load_report(_translations(tmp_path)[0])[0]["translated_from"] == english_digest
+
+
+def test_reusing_the_saved_english_keeps_its_prose_model_on_the_translation(
+    monkeypatch, tmp_path
+):
+    # The translated file's `llm_model` describes the prose it carries, which
+    # came from the earlier run, not from this one.
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--model", "openai/first-model")
+    monkeypatch.setattr(
+        summary_cli,
+        "generate_narrative",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prose pass")),
+    )
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW", "--model", "openai/second-model")
+    facts = load_report(_translations(tmp_path)[0])[0]
+    assert facts["llm_model"] == "openai/first-model"
+    assert facts["translation_model"] == "openai/second-model"
+
+
+def test_stdout_with_language_names_no_source_file(monkeypatch, tmp_path, capsys):
+    # Nothing was saved, so there is no English file to point at and the
+    # provenance line must not invent one.
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW", "--stdout")
+    out = capsys.readouterr().out
+    assert "Translation: zh-TW" in out
+    assert ", from " not in out
+
+
+def test_the_month_is_passed_to_the_translator(monkeypatch, tmp_path):
+    _two_reports(tmp_path)
+    _fake_narrative(monkeypatch, _narrative())
+    calls = _fake_translation(monkeypatch)
+    _run(monkeypatch, tmp_path, "--language", "zh-TW")
+    assert calls[0]["month"] == MONTH
