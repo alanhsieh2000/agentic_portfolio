@@ -26,6 +26,15 @@ ARG USER_UID=0
 RUN groupadd -g ${USER_UID} ${USER_NAME} \
     && useradd -u ${USER_UID} -m -s /bin/bash -g ${USER_NAME} ${USER_NAME}
 
+# The pango and harfbuzz libraries are what WeasyPrint dlopens through cffi at
+# import time, for `portfolio-summary --pdf`.
+#
+# The two font packages are for that same flag. DejaVu is the face the PDF
+# stylesheet measures every table column against, and is otherwise present here
+# only by accident of fontconfig-config's dependencies - and a missing font is
+# silent, so it is named. Noto CJK is what makes a translated briefing readable
+# instead of a page of empty boxes; without it `--pdf` refuses a Chinese
+# document by name, which is exactly what this container did before these lines.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git \
@@ -39,7 +48,9 @@ RUN apt-get update && \
     libpango-1.0-0 \
     libpangoft2-1.0-0 \
     libharfbuzz0b \
-    libharfbuzz-subset0 && \
+    libharfbuzz-subset0 \
+    fonts-dejavu-core \
+    fonts-noto-cjk && \
     rm -rf /var/lib/apt/lists/*
 
 # install claude code
