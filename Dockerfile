@@ -39,9 +39,11 @@ COPY --from=uv /uv /usr/local/bin/uv
 
 # Compilers live in this stage only. Anything that needs to build from source
 # does it here, and the runtime stage below never carries a toolchain.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/agentic-portfolio/venv \
     UV_COMPILE_BYTECODE=1 \
@@ -88,9 +90,36 @@ LABEL org.opencontainers.image.title="agentic-portfolio" \
 # Runtime shared libraries only, no toolchain. libgomp1 is OpenMP, wanted by
 # numpy/scipy solver backends; libatomic1 is carried over from the development
 # image, where duckdb needed it.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 libatomic1 \
-    && rm -rf /var/lib/apt/lists/*
+#
+# The four pango/harfbuzz libraries are what WeasyPrint dlopens through cffi at
+# IMPORT time for `portfolio-summary --pdf`. Without them that import raises
+# OSError, so this image could not render a PDF at all - and because the import
+# is lazy, the failure would have surfaced at a user's first --pdf rather than
+# in any build step. No cairo is needed: WeasyPrint has written PDF itself since
+# v53.
+#
+# fonts-dejavu-core is the body and table face the stylesheet names, and the one
+# every column width in a rendered briefing is measured against. It also arrives
+# transitively with fontconfig-config, and is named here anyway because a
+# missing font is SILENT - WeasyPrint substitutes and the alignment quietly goes.
+#
+# fonts-noto-cjk is the largest single apt addition to this image. It is what
+# makes `--pdf --language zh-TW` produce a readable document instead of a page
+# of empty boxes. Drop it only if this image will never be asked for a
+# translated PDF, and know what happens then: the command refuses that one file
+# by name and says which package to install, rather than writing tofu.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libatomic1 \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libharfbuzz0b \
+    libharfbuzz-subset0 \
+    libfontconfig1 \
+    fonts-dejavu-core \
+    fonts-noto-cjk && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /usr/local/bin/uv
 
