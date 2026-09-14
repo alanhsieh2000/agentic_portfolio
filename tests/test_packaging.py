@@ -105,3 +105,9 @@ def test_the_pdf_stylesheet_sets_a_page_size_and_preserves_whitespace():
     # `pre-wrap` rather than `pre`: WeasyPrint does not paginate horizontally,
     # so an over-wide line under plain `pre` runs off the paper silently.
     assert "pre-wrap" in text
+    # The runtime asset, rather than the repository-root design reference,
+    # carries the adapted report theme and the running-page provenance.
+    assert "margin: 18mm 15mm 18mm" in text
+    assert "--navy: #154f7a" in text
+    assert "string(report-title)" in text
+    assert "string(source)" in text

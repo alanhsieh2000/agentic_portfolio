@@ -224,6 +224,15 @@ are fixed-width text because that is the only thing that keeps seven columns in 
       slowest tests are all in `tests/test_holdings.py` and `tests/test_holdings_cli.py`, which
       import nothing changed here, while the nine affected files total 5.2s. See
       `Artifacts and Notes`.
+- [x] (2026-09-14 14:00Z) Milestone 9: adapted the visual language of the root `report.css` into
+      the packaged `src/agentic_portfolio/flow/report_pdf.css`, while retaining the fixed-width
+      table, CJK, provenance and no-overwrite contracts. Added three renderer tests and one
+      packaging assertion; `uv run pytest tests/test_report_pdf.py tests/test_packaging.py -q`
+      reports 72 passed in 2.27s.
+- [x] (2026-09-14 14:08Z) Milestone 9 full-suite verification: `uv run pytest
+      tests/test_*.py -q` reports `1264 passed, 3 warnings in 411.24s` - the previous 1261 tests
+      plus the three new renderer tests. The warnings are the same expected-return warnings from
+      three holdings tests recorded by the earlier milestone, not PDF regressions.
 - [ ] Not done: no live-model run of `--language`. Every translation path was exercised with a
       stub, so the verifier, the gates and the CLI wiring are proven while the QUALITY of a real
       `gpt-5-nano` Traditional Chinese translation is not. That is the one thing left to try, and
@@ -451,6 +460,15 @@ are fixed-width text because that is the only thing that keeps seven columns in 
   request text maps braces to brackets anyway. It is one line, it changes nothing observable - the
   real summaries contain no braces - and it removes a dependency on the order in which a third
   party interpolates.
+
+- Observation: (Milestone 9) the root `report.css` cannot safely replace the packaged stylesheet
+  verbatim. It expects semantic HTML tables, a subtitle and running-element divs that plan 19's
+  deliberately closed converter never emits; its 16mm side margins also disagree with the
+  renderer's 510pt table-width constant, and it drops the existing source footer.
+  Evidence: applying it unchanged to the real English briefing grew the document from six to nine
+  pages and produced a widest text box of 672.8px in a 672.8px content area. The adapted stylesheet
+  renders the real English and Traditional Chinese briefings in eight pages, with a 680.3px widest
+  text box in the retained 680.3px content area.
 
 ## Decision Log
 
@@ -715,6 +733,20 @@ are fixed-width text because that is the only thing that keeps seven columns in 
   so recording it would make the Markdown's own digest and filename depend on whether a PDF
   succeeded. Date/Author: 2026-09-13.
 
+- Decision: (Milestone 9) Adapt the root `report.css` as a visual reference rather than making it
+  the runtime stylesheet. Use its navy/blue palette, centered title, larger section hierarchy,
+  CJK-aware prose typography and pale code blocks, but keep 15mm side margins, DejaVu Sans Mono
+  first for tables, `pre-wrap`, the hanging indent and the source footer.
+  Rationale: those retained rules are coupled to table-width arithmetic and archive traceability;
+  the reference file targets a different HTML contract. The packaged stylesheet remains the only
+  runtime asset and the untracked root file remains untouched. Date/Author: 2026-09-14, agreed
+  with the user before implementation.
+- Decision: (Milestone 9) Add the report title and month as a top-right running string, keep the
+  source at bottom left and page count at bottom right, and add no investment disclaimer.
+  Rationale: this gives a detached page context without inventing wording that is absent from the
+  saved Markdown. Existing PDFs remain immutable; the new appearance applies only to PDFs rendered
+  after this change. Date/Author: 2026-09-14, agreed with the user before implementation.
+
 ## Outcomes & Retrospective
 
 The command exists and does what the Purpose section promised. `uv run portfolio-summary` reads a
@@ -760,11 +792,12 @@ the real reports carry silently merges two reports into one and shrinks the mont
 Nine tests failed at once for that reason, and the failure looked like nine bugs rather than one
 fixture.
 
-As of 2026-09-13 the plan has grown two further milestones, 7 and 8, which are SPECIFIED here and
-not yet delivered - `Progress` records them unchecked. They do not change any figure or any section
-of the briefing; they change who can read it. Milestone 7 saves a translated copy beside the
-English one, Milestone 8 renders a PDF beside each saved Markdown file, and the second amendment
-note at the foot of this file records what they turn on and what they deliberately leave undone.
+As of 2026-09-14 the plan has delivered three further milestones, 7 through 9. They do not change
+any figure or any section of the briefing; they change who can read it and how comfortably. The
+translated copy keeps every table byte-identical to the English original, the PDF remains a render
+of the saved Markdown, and the visual refinement gives that PDF a deliberate navy/blue hierarchy
+without weakening the table or provenance guarantees. The amendment notes at the foot of this file
+record what those milestones turn on and what they deliberately leave undone.
 
 One claim in this retrospective is worth re-reading in their light. The paragraph above says the
 briefing "is only half a tool if it cannot point back at what it summarized". The same sentence
@@ -1415,14 +1448,18 @@ nothing. Otherwise it writes to a `.report-*.pdf` temporary in the destination d
 
 Create `src/agentic_portfolio/flow/report_pdf.css` as package data, read with
 `importlib.resources.files` - the pattern `tests/test_packaging.py` already defends and the reason
-the six crew YAML files ship at all. A4 portrait with 15mm margins and a footer carrying the source
-name and `page / pages`; a body font stack naming DejaVu Sans and then the CJK families, so CSS
-fallback handles an absent one; `h2` with a hairline rule and `break-after: avoid`; a `lead` class
-that only sets `break-after: avoid`, so a table caption cannot be orphaned from its table without
-inventing emphasis the Markdown does not state. `pre` uses `white-space: pre-wrap` with a hanging
-indent, and that is load-bearing rather than cosmetic: under plain `white-space: pre` an over-wide
-line is laid out in a single box wider than the paper and simply runs off it, with no warning from
-WeasyPrint at all. Wrapping misaligns the tail of one line; the alternative loses it.
+the six crew YAML files ship at all. It now uses A4 portrait with 18mm vertical and 15mm side
+margins: retaining 15mm sides preserves the 510pt table-width calculation. Its navy/blue palette,
+centered title, larger section hierarchy, CJK-aware proportional prose and pale code blocks are
+adapted from the repository-root `report.css`, which is a design reference for a different HTML
+producer rather than a runtime asset. The `h1` supplies a named string repeated at top right; the
+footer retains the source at bottom left and `page / pages` at bottom right. DejaVu Sans Mono stays
+first for tables because their arithmetic is calibrated to its advance width. `h2` retains
+`break-after: avoid`, and a `lead` class keeps a table caption with its table without inventing
+emphasis the Markdown does not state. `pre` uses `white-space: pre-wrap` with a hanging indent, and
+that is load-bearing rather than cosmetic: under plain `white-space: pre` an over-wide line is laid
+out in a single box wider than the paper and simply runs off it, with no warning from WeasyPrint at
+all. Wrapping misaligns the tail of one line; the alternative loses it.
 
 Failure handling, all of it raising `PdfUnavailable`, caught once in the CLI and printed as a
 warning on stderr with the exit status unchanged - the Markdown is the product and the PDF is a
@@ -1486,6 +1523,26 @@ Verify:
     uv run pytest tests/test_summary_cli.py tests/test_packaging.py -q
 
 
+### Milestone 9 - adapt the preferred print style
+
+This milestone refines the appearance of the already-delivered PDF without changing its Markdown,
+CLI or Python interfaces. Edit only the packaged `src/agentic_portfolio/flow/report_pdf.css`; leave
+the untracked root `report.css` untouched as the design reference. Carry over its navy/blue palette,
+centered title, readable spacing, CJK-aware proportional typography and pale code treatment. Use
+10pt body type at 1.6 line height, a centered 21pt title, 13.5pt navy section headings with a 1.2pt
+blue rule, and A4 margins of `18mm 15mm 18mm`. Set the `h1` as `report-title` and repeat it in a
+muted 7.7pt top-right page header. Keep the centered provenance below the title, repeat it at bottom
+left, and keep `page / pages` at bottom right.
+
+Do not copy selectors for semantic tables, subtitles, callouts, images or deeper headings: the
+closed converter does not emit them. Do not change `USABLE_WIDTH_PT`, the DejaVu-first monospace
+stack, per-block inline sizes, `pre-wrap` or the hanging indent. Shade each `<pre>` without adding
+horizontal padding beyond that existing indent, so the width calculation remains true. Add tests
+that pin the visual contract and inspect WeasyPrint's actual margin boxes on every page. Acceptance
+is that the focused PDF and packaging suite passes and both real-language briefings stay within the
+680.3px content area.
+
+
 ## Validation and Acceptance
 
 Acceptance is the Purpose transcript reproduced: from `/app/agentic_portfolio`,
@@ -1543,6 +1600,10 @@ rewrites anything: the only writers are `save_report`, which refuses a path that
 `write_pdf`, which returns `created=False` for one. A PDF is derived, so recovery from a bad render
 is deleting the `.pdf` and re-running - the Markdown it came from is untouched, which is the
 property the whole failure design is built on.
+
+Milestone 9 does not weaken that rule. A stylesheet change deliberately does not replace PDFs
+already in the archive. New PDFs use the new appearance; to restyle an old derived file, move that
+PDF aside and re-run with `--pdf`. The saved Markdown remains authoritative and unchanged.
 
 
 ## Artifacts and Notes
@@ -1953,3 +2014,31 @@ verifier and is why the document says it was machine-translated. There is no `--
 text, now doubled: after a change to the translation logic or the PDF renderer, an
 already-summarized month still reports `Summary already saved`, and `--force` is how the new output
 reaches disk.
+
+
+## Amendment note - 2026-09-14, Milestone 9
+
+
+**What changed.** The packaged PDF stylesheet now adapts the visual language of the root
+`report.css`: navy and blue hierarchy, a centered 21pt title, more readable 10pt prose, stronger
+section rules, pale fixed-width blocks, and more deliberate spacing. The title and month repeat at
+top right while the source filename and page count remain in the footer. No Markdown, CLI or Python
+interface changed.
+
+**Why adaptation rather than replacement.** The reference stylesheet belongs to a different
+Markdown-to-HTML producer. Its semantic tables, subtitle, running divs, callouts and deeper headings
+do not exist in this briefing's deliberately closed HTML vocabulary. More importantly, its 16mm
+side margins disagree with the 510pt width used to size each fixed-width table. Copying it verbatim
+would make unsupported selectors look implemented while weakening the two guarantees that made the
+PDF feature useful: aligned tables and traceable pages.
+
+**What remained load bearing.** The side margins stay at 15mm, DejaVu Sans Mono remains the first
+table font, and `pre-wrap`, per-block font sizing and the hanging indent are unchanged. Prose can use
+Noto first because it is not measured by the table arithmetic. Automated rendering confirms the
+real English and Traditional Chinese briefings each occupy eight pages and no text box exceeds the
+680.3px content width; focused PDF and packaging tests report 72 passed in 2.27s.
+
+**Archive behavior.** The untracked root `report.css` remains untouched and is not packaged. An
+existing PDF remains immutable and therefore keeps its old appearance; moving that derived file
+aside and re-running with `--pdf` renders the saved Markdown with the new style. This preserves the
+no-overwrite decision from Milestone 8 rather than quietly assigning a new meaning to `--force`.

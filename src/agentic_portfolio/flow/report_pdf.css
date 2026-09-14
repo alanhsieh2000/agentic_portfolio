@@ -1,11 +1,11 @@
 /* Stylesheet for a portfolio briefing rendered to PDF by
  * `src/agentic_portfolio/flow/report_pdf.py`.
  *
- * Shipped as package data rather than embedded in Python because this is the
- * file a person tunes by editing and reviewing - page size, margins, type
- * sizes - and a reviewer should be able to read it as CSS. It is loaded with
- * `importlib.resources.files`, the same convention that puts the crew prompt
- * YAML files in the wheel.
+ * The visual language is adapted from the repository-root `report.css`: navy
+ * headings, blue rules, generous typography and restrained pale backgrounds.
+ * That file targets a different HTML producer, however, so this packaged file
+ * remains the runtime source of truth and contains only selectors emitted by
+ * `briefing_html`.
  *
  * Every declaration that is load bearing says why. The rest is ordinary type
  * setting.
@@ -14,66 +14,127 @@
 @page {
   /* A4 portrait with 15mm side margins leaves 180mm = 510pt of content width,
    * which is the number `report_pdf.USABLE_WIDTH_PT` carries. The two MUST
-   * agree: the module sizes each table from it, so changing a margin here
+   * agree: the module sizes each table from it, so changing a side margin here
    * without changing that constant silently overflows the widest table. The
-   * bottom margin is deeper than the sides to hold the footer. */
+   * deeper top and bottom margins hold the running title and footer. */
   size: A4 portrait;
-  margin: 15mm 15mm 18mm;
+  margin: 18mm 15mm 18mm;
 
+  @top-right {
+    /* `string-set` on h1 supplies the report title and month. */
+    content: string(report-title);
+    vertical-align: bottom;
+    padding-bottom: 4mm;
+    font-family: "Noto Sans CJK TC", "DejaVu Sans", sans-serif;
+    font-size: 7.7pt;
+    line-height: 1;
+    color: #888;
+  }
   @bottom-left {
     /* The saved filename, pinned here by `string-set` on the provenance
      * paragraph below. A printed or forwarded page that cannot say which file
      * it came from is a page nobody can check against the archive. */
     content: string(source);
+    vertical-align: top;
+    padding-top: 3mm;
     font-family: "DejaVu Sans", sans-serif;
-    font-size: 7pt;
-    color: #666;
+    font-size: 7.2pt;
+    line-height: 1;
+    color: #8a8a8a;
   }
   @bottom-right {
     content: counter(page) " / " counter(pages);
+    vertical-align: top;
+    padding-top: 3mm;
     font-family: "DejaVu Sans", sans-serif;
-    font-size: 7pt;
-    color: #666;
+    font-size: 7.2pt;
+    line-height: 1;
+    color: #8a8a8a;
   }
 }
 
+:root {
+  --navy: #154f7a;
+  --blue: #4476c4;
+  --ink: #141414;
+  --muted: #777;
+  --rule: #5f9dd0;
+  --code-pale: #f1f3f5;
+  --table-pale: #f3f5f7;
+}
+
+html {
+  /* Noto first gives prose the reference stylesheet's CJK-aware shape. Table
+   * text has a separate DejaVu-first stack below because its width arithmetic
+   * is calibrated to DejaVu Sans Mono. */
+  font-family: "Noto Sans CJK TC", "Noto Sans TC", "Source Han Sans TC",
+               "PingFang TC", "Microsoft JhengHei", "DejaVu Sans", sans-serif;
+  font-size: 10pt;
+  color: var(--ink);
+}
+
+html:lang(zh-CN) {
+  font-family: "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei",
+               "DejaVu Sans", sans-serif;
+}
+
+html:lang(ja) {
+  font-family: "Noto Sans CJK JP", "Noto Sans JP", "Yu Gothic",
+               "DejaVu Sans", sans-serif;
+}
+
+html:lang(ko) {
+  font-family: "Noto Sans CJK KR", "Noto Sans KR", "Malgun Gothic",
+               "DejaVu Sans", sans-serif;
+}
+
 body {
-  /* DejaVu first because it is the font the tables are measured in and the one
-   * both container images install. The CJK families follow as fallback: CSS
-   * skips the ones that are absent, so this single stack serves an English and
-   * a Chinese briefing with no dynamic rewriting. */
-  font-family: "DejaVu Sans", "Noto Sans CJK TC", "Noto Sans TC",
-               "Source Han Sans TC", "Noto Sans CJK SC", "WenQuanYi Zen Hei",
-               sans-serif;
-  font-size: 9.5pt;
-  line-height: 1.4;
-  color: #111;
+  margin: 0;
+  line-height: 1.6;
+  letter-spacing: 0.01em;
+  font-weight: 400;
 }
 
 h1 {
-  font-size: 15pt;
-  margin: 0 0 0.2em;
+  /* The named string is repeated in @top-right without adding presentation-
+   * only HTML to the deliberately small briefing converter. */
+  string-set: report-title content();
+  margin: 3mm 0 2mm;
+  color: var(--navy);
+  font-size: 21pt;
+  line-height: 1.25;
+  font-weight: 800;
+  text-align: center;
+  letter-spacing: 0.015em;
 }
 
 h2 {
-  font-size: 11.5pt;
-  margin: 1.1em 0 0.4em;
-  padding-bottom: 0.15em;
-  border-bottom: 0.5pt solid #ccc;
+  margin: 6mm 0 3mm;
+  padding: 0 0 1.4mm;
+  color: var(--navy);
+  font-size: 13.5pt;
+  line-height: 1.3;
+  font-weight: 800;
+  border-bottom: 1.2pt solid var(--rule);
   /* A heading alone at the foot of a page is a heading in the wrong place. */
   break-after: avoid;
 }
 
 p {
-  margin: 0 0 0.5em;
+  margin: 0 0 3.2mm;
+  text-align: justify;
+  orphans: 3;
+  widows: 3;
 }
 
 p.provenance {
   /* `string-set` is what puts this text into every page footer above. */
   string-set: source content();
+  margin: 0 0 7mm;
+  color: #666;
   font-size: 8pt;
-  color: #555;
-  margin-bottom: 1em;
+  line-height: 1.4;
+  text-align: center;
 }
 
 p.lead {
@@ -82,44 +143,46 @@ p.lead {
    * invent emphasis the Markdown does not state, and the same heuristic that
    * catches a table caption also catches ordinary lead-in sentences. */
   break-after: avoid;
-  margin-bottom: 0.2em;
+  margin-bottom: 1.2mm;
 }
 
 ul {
-  margin: 0 0 0.6em;
-  padding-left: 1.2em;
+  margin: 1.5mm 0 4mm 5.5mm;
+  padding-left: 4mm;
 }
 
 li {
-  margin-bottom: 0.2em;
+  margin: 0 0 1.4mm;
 }
 
 code {
-  font-family: "DejaVu Sans Mono", monospace;
+  font-family: "Noto Sans Mono CJK TC", "DejaVu Sans Mono", monospace;
   font-size: 0.92em;
+  background: var(--code-pale);
+  padding: 0.15em 0.3em;
+  border-radius: 2px;
 }
 
 pre {
-  /* The whole point of this file. These blocks are the briefing's tables, laid
-   * out by `report_summary._table` as space-padded plain text, so they are
-   * reproduced character for character in a monospace face and never reflowed.
+  /* These blocks are the briefing's tables, laid out by
+   * `report_summary._table` as space-padded plain text. DejaVu MUST remain
+   * first: `report_pdf.MONO_ADVANCE_EM` is its measured advance width.
    *
-   * `pre-wrap`, not `pre`, and that is load bearing rather than tidy. WeasyPrint
-   * does not paginate horizontally: under `white-space: pre` a line wider than
-   * the page is laid out in one box wider than the paper and simply runs off
-   * the edge, with no warning of any kind. Wrapping misaligns the tail of one
-   * over-wide line; not wrapping loses it. The hanging indent keeps a wrapped
-   * continuation visually attached to its row.
+   * `pre-wrap`, not `pre`, is load bearing. WeasyPrint does not paginate
+   * horizontally: a line wider than the paper otherwise runs off the edge
+   * without warning. The hanging indent keeps a wrapped continuation visually
+   * attached to its row.
    *
    * The font size is NOT set here - `report_pdf.briefing_html` sets it per
-   * block from that block's own widest line, because one document-wide size
-   * would have to fit the widest line in the whole briefing and would drop the
-   * leaderboard to an unreadable 5pt to protect a prose list. */
+   * block from that block's own widest line. Horizontal padding is limited to
+   * the existing hanging indent so the 510pt sizing calculation stays true. */
   font-family: "DejaVu Sans Mono", "Noto Sans Mono CJK TC", monospace;
   white-space: pre-wrap;
-  margin: 0 0 0.7em;
-  padding-left: 2.6em;
+  margin: 2mm 0 4.5mm;
+  padding: 2.5mm 0 2.5mm 2.6em;
   text-indent: -2.6em;
+  background: var(--table-pale);
+  line-height: 1.45;
   orphans: 3;
   widows: 3;
 }

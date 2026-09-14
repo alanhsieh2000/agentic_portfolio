@@ -250,6 +250,22 @@ def test_the_provenance_line_reaches_the_page_footer_through_the_stylesheet():
     assert "string(source)" in stylesheet()
 
 
+def test_the_title_reaches_the_running_header_through_the_stylesheet():
+    css = stylesheet()
+    assert "string-set: report-title content()" in css
+    assert "string(report-title)" in css
+
+
+def test_the_reference_theme_is_adapted_without_changing_table_width():
+    css = stylesheet()
+    assert "margin: 18mm 15mm 18mm" in css
+    assert "--navy: #154f7a" in css
+    assert "--rule: #5f9dd0" in css
+    assert "font-size: 10pt" in css
+    assert 'font-family: "DejaVu Sans Mono", "Noto Sans Mono CJK TC", monospace' in css
+    assert "background: var(--table-pale)" in css
+
+
 # --- sizing -------------------------------------------------------------------
 
 
@@ -350,6 +366,29 @@ def test_a_real_briefing_paginates_rather_than_overflowing_one_page(tmp_path):
     )
     # 180mm of content at 96dpi is 680.3px; nothing may exceed it.
     assert widest <= 681
+
+
+def test_every_page_repeats_the_title_source_and_page_number(tmp_path):
+    """The visual refinement must not trade away the old provenance contract."""
+    from weasyprint import CSS, HTML
+
+    body = _real_briefing(tmp_path)
+    document = HTML(string=briefing_html(FACTS, body, source_name="x.md")).render(
+        stylesheets=[CSS(string=stylesheet())]
+    )
+    assert len(document.pages) > 1
+    expected_title = "Portfolio archive summary - 2026-09"
+    for number, page in enumerate(document.pages, start=1):
+        margins = {
+            child.at_keyword: "".join(
+                box.text for box in _boxes(child) if getattr(box, "text", None)
+            )
+            for child in page._page_box.children
+            if getattr(child, "at_keyword", None)
+        }
+        assert margins["@top-right"] == expected_title
+        assert margins["@bottom-left"].startswith("x.md ")
+        assert margins["@bottom-right"] == f"{number} / {len(document.pages)}"
 
 
 def _boxes(box):
