@@ -12,7 +12,8 @@ why each ticker is or is not a candidate, what the optimizer expected of
 the ones it kept, and whether all of it beat simply holding the market,
 not just the final number of shares. Then
 enters an interactive loop letting the user add/remove candidate tickers,
-change the objective, or change MV's target return; each edit re-runs only
+change the objective, change MV's target return, or vary the trailing returns
+window from 24 through 60 months; each edit re-runs only
 `compute_weights_and_allocation` (never LLM-S or LLM-F again - the user is
 overriding the agents' already-given recommendation, not asking them to
 reconsider it) and reprints the updated candidates, weights, and
@@ -109,7 +110,11 @@ from agentic_portfolio.optimizer.dividends import (
     validate_dividend_yield,
     validate_min_annual_dividend,
 )
-from agentic_portfolio.optimizer.holdings import HoldingsStats
+from agentic_portfolio.optimizer.holdings import (
+    DEFAULT_LOOKBACK_MONTHS,
+    HoldingsStats,
+    validate_lookback_months,
+)
 from agentic_portfolio.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
 from agentic_portfolio.dataset.ticker_profile import TickerProfile
 from agentic_portfolio.optimizer.ticker_stats import TickerStats
@@ -416,6 +421,7 @@ def print_weights_and_allocation(
     risk_free_rate_origin: str | None = None,
     portfolio_value: float | None = None,
     resolved_objective=None,
+    requested_lookback_months: int | None = None,
 ) -> None:
     """Human-readable rendering of one `compute_weights_and_allocation`
     result, including the figures the optimizer decided from.
@@ -465,10 +471,21 @@ def print_weights_and_allocation(
     loop for the same reason the rate itself is: provenance that appeared on
     the initial report and vanished on the first edit would be worse than
     none.
+
+    `requested_lookback_months` is shown only when it differs from the
+    60-month default. The report always prints the actual dates and row
+    count; naming the request as well makes any shortage of available data
+    visible rather than looking like a silently shortened choice.
     """
     print(f"\nPortfolio currency: {currency} - --value is interpreted as {currency}")
+    requested = (
+        f", {requested_lookback_months} requested"
+        if requested_lookback_months is not None
+        and requested_lookback_months != DEFAULT_LOOKBACK_MONTHS
+        else ""
+    )
     print(f"Returns window: {stats.returns_window_start} to {stats.returns_window_end} "
-          f"({stats.returns_window_months} month(s) of monthly returns)")
+          f"({stats.returns_window_months} month(s) of monthly returns{requested})")
 
     held = [ticker for ticker, weight in sorted(stats.weights.items(), key=lambda kv: -kv[1]) if weight > 0]
 
@@ -2088,6 +2105,31 @@ def _prompt_target_return(prompt: str, current: float) -> float:
         return current
 
 
+def _prompt_lookback_months(current: int) -> int:
+    """Read a portfolio returns-window length, keeping `current` on bad input.
+
+    This deliberately matches `portfolio-holdings whatif`: both commands
+    offer the same 24-to-60-month experiment, and a rejected answer costs
+    one prompt rather than destroying the valid window already in force.
+    """
+    raw = input(
+        f"Months of returns to optimize over (24-60, currently {current}): "
+    ).strip()
+    if not raw:
+        return current
+
+    try:
+        months: object = int(raw)
+    except ValueError:
+        months = raw
+
+    try:
+        return validate_lookback_months(months, "the window")
+    except ValueError as e:
+        print(f"Keeping {current} months: {e}")
+        return current
+
+
 def _run_edit_loop(
     candidates: list[str],
     objective: str,
@@ -2107,9 +2149,10 @@ def _run_edit_loop(
     show_summaries: bool = False,
     profile_cache: dict[str, TickerProfile] | None = None,
     archive: ReportArchive | None = None,
+    lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
 ) -> bool:
-    """Prompt in a loop for add/remove/objective/target-return/benchmark/
-    finish; each
+    """Prompt in a loop for add/remove/objective/target-return/window/
+    benchmark/finish; each
     edit recomputes weights and allocation against the current `candidates`
     and reprints them. Returns when the user chooses to finish, reporting
     whether it ever printed a report.
@@ -2153,6 +2196,12 @@ def _run_edit_loop(
     `risk_free_rate_origin` is carried for exactly the same reason as the
     rate: provenance that appeared on the initial report and vanished on the
     first edit would be worse than none at all.
+
+    `lookback_months` starts at the optimizer's unchanged 60-month default
+    and is editable with `[w]indow`. A successful change applies to every
+    later recompute and ticker summary in this loop; an infeasible solve
+    restores it with the other editable values. It is deliberately session
+    state only, never candidate memory or configuration.
 
     `benchmark` is carried for the same reason and re-narrowed to the
     portfolio's window on every recompute, so the comparison line follows
@@ -2199,6 +2248,7 @@ def _run_edit_loop(
             risk_free_rate=risk_free_rate,
             risk_free_rate_origin=risk_free_rate_origin,
             profile_cache=profile_cache,
+            lookback_months=lookback_months,
         )
         print_ticker_summary(summary.profile, summary.stats, summary.risk_free_rate_origin)
 
@@ -2207,7 +2257,8 @@ def _run_edit_loop(
     while True:
         choice = input(
             "\nEdit candidates? [a]dd tickers / [r]emove tickers / [o]bjective / "
-            f"[t]arget-return / [d]ividend / [b]enchmark{summary_offer} / [f]inish: "
+            f"[t]arget-return / [d]ividend / [w]indow / [b]enchmark{summary_offer} / "
+            "[f]inish: "
         ).strip().lower()
 
         if choice in ("", "f", "finish"):
@@ -2224,11 +2275,18 @@ def _run_edit_loop(
             show_summary(symbol)
             continue
 
-        previous_candidates, previous_objective, previous_target, previous_dividend_floor = (
+        (
+            previous_candidates,
+            previous_objective,
+            previous_target,
+            previous_dividend_floor,
+            previous_window,
+        ) = (
             candidates,
             objective,
             target_annual_return,
             dividend_floor,
+            lookback_months,
         )
         if choice in ("a", "add"):
             raw = input("Ticker(s) to add (space-separated): ").strip().upper()
@@ -2286,6 +2344,11 @@ def _run_edit_loop(
             if new_target == target_annual_return:
                 continue
             target_annual_return = new_target
+        elif choice in ("w", "window"):
+            chosen = _prompt_lookback_months(lookback_months)
+            if chosen == lookback_months:
+                continue
+            lookback_months = chosen
         elif choice in ("b", "benchmark"):
             current = benchmark.ticker if benchmark is not None else None
             new_benchmark = _prompt_for_benchmark(
@@ -2314,6 +2377,7 @@ def _run_edit_loop(
                 candidates, objective, portfolio_value, rebalance_date, db_path,
                 target_annual_return=target_annual_return, risk_free_rate=risk_free_rate,
                 dividend_floor=dividend_floor, consult_dividends=consult_dividends,
+                lookback_months=lookback_months,
             )
         except ValueError as e:
             # An edit can be individually valid and still leave the optimizer
@@ -2326,13 +2390,15 @@ def _run_edit_loop(
             # data and the user's confirmed pool along with it.
             print(f"Cannot optimize that edit: {e}")
             print(
-                "Keeping the previous candidates, objective, target return, and dividend floor."
+                "Keeping the previous candidates, objective, target return, dividend floor, "
+                "and returns window."
             )
-            candidates, objective, target_annual_return, dividend_floor = (
+            candidates, objective, target_annual_return, dividend_floor, lookback_months = (
                 previous_candidates,
                 previous_objective,
                 previous_target,
                 previous_dividend_floor,
+                previous_window,
             )
             continue
 
@@ -2340,6 +2406,8 @@ def _run_edit_loop(
             save_candidate_pool(candidates, path=memory_path, currency=currency)
 
         printed_a_report = True
+        if choice in ("w", "window"):
+            print(f"Measuring over {lookback_months} month(s) of returns.")
         # Hoisted out of the call below because the archived facts need the
         # same `BenchmarkStats` the report prints, and re-narrowing the
         # benchmark twice could only ever disagree with itself.
@@ -2363,6 +2431,7 @@ def _run_edit_loop(
                 stats, allocation, objective, currency, portfolio_value=portfolio_value,
                 benchmark=benchmark_stats,
                 risk_free_rate_origin=risk_free_rate_origin,
+                requested_lookback_months=lookback_months,
             )
 
 

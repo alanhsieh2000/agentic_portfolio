@@ -974,6 +974,40 @@ def test_compute_weights_and_allocation_can_skip_consulting_dividends(monkeypatc
     assert stats_spy.call_args.kwargs["dividends_per_share"] is None
 
 
+def test_compute_weights_and_allocation_forwards_the_requested_lookback(monkeypatch):
+    returns_spy = MagicMock(return_value=pd.DataFrame({"AAA": [0.01] * 24}))
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.load_returns_matrix", returns_spy)
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.interactive._require_single_currency", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.interactive.load_dividend_figures",
+        lambda *a, **k: ({}, {}, {}, {}),
+    )
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.interactive.compute_weights_and_stats",
+        lambda *a, **k: _stats_stub(),
+    )
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.interactive.load_latest_prices",
+        lambda *a, **k: pd.Series({"AAA": 10.0}),
+    )
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.interactive.allocate_shares", lambda *a, **k: ({}, 0.0)
+    )
+
+    compute_weights_and_allocation(
+        ["AAA"],
+        "GMV",
+        1000.0,
+        date(2026, 9, 8),
+        "db.duckdb",
+        lookback_months=36,
+    )
+
+    assert returns_spy.call_args.kwargs["lookback_months"] == 36
+
+
 # ---------------------------------------------------------------------------
 # An unsatisfiable optimization is reported, not raised
 # ---------------------------------------------------------------------------
@@ -1261,6 +1295,24 @@ def test_prepare_ticker_summary_reads_a_pool_ticker_from_the_session_database(
     assert summary.stats.unavailable_reason is None
     assert summary.stats.window_months == 36
     assert summary.profile.long_name == "AAA Fund"
+
+
+def test_prepare_ticker_summary_uses_the_requested_returns_window(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "session.duckdb")
+    _insert_returns(db_path, "AAA", _bench_months(36))
+    _fake_profile_fetch(monkeypatch)
+
+    summary = prepare_ticker_summary(
+        "AAA",
+        date(2024, 3, 1),
+        ["AAA"],
+        db_path,
+        rates_path=None,
+        lookback_months=24,
+    )
+
+    assert summary.stats.unavailable_reason is None
+    assert summary.stats.window_months == 24
 
 
 def test_prepare_ticker_summary_ingests_a_non_pool_ticker_into_a_scratch_database(

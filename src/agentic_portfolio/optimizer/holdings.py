@@ -105,12 +105,12 @@ def validate_lookback_months(months: object, source: str) -> int:
     value.
 
     Both bounds are existing facts rather than new numbers. The floor is
-    `HOLDINGS_MIN_MONTHS`, the minimum history a holding needs before it is
-    measured at all - below it `apply_min_history_rule` would drop EVERY
-    holding, because a column cannot have more non-null months than the
-    window has rows, and the report would come back with no figures and a
-    complaint about a `min_months` the person never typed. The ceiling is
-    `DEFAULT_LOOKBACK_MONTHS`, which is all the data an ingest produces.
+    `HOLDINGS_MIN_MONTHS`, the minimum history any return series needs before
+    it is measured at all - below it `apply_min_history_rule` would drop
+    every security, because a column cannot have more non-null months than
+    the window has rows. The ceiling is `DEFAULT_LOOKBACK_MONTHS`, which is
+    all the data an ingest produces. This generic wording matters because the
+    validator is shared by holdings and optimized candidate portfolios.
 
     Booleans are rejected ahead of the numeric check because
     `isinstance(True, int)` is true in Python, so `True` would otherwise
@@ -128,8 +128,8 @@ def validate_lookback_months(months: object, source: str) -> int:
     if not HOLDINGS_MIN_MONTHS <= months <= DEFAULT_LOOKBACK_MONTHS:
         raise ValueError(
             f"{source} must be between {HOLDINGS_MIN_MONTHS} and {DEFAULT_LOOKBACK_MONTHS} "
-            f"months, got {months}; under {HOLDINGS_MIN_MONTHS} every holding would fall below "
-            f"the minimum history a figure needs, and over {DEFAULT_LOOKBACK_MONTHS} there is no "
+            f"months, got {months}; under {HOLDINGS_MIN_MONTHS} every return series would fall "
+            f"below the minimum history a figure needs, and over {DEFAULT_LOOKBACK_MONTHS} there is no "
             "data - an ingest fetches 65 months of prices, which is 60 monthly returns plus a "
             "buffer"
         )

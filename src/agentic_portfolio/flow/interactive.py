@@ -446,9 +446,15 @@ def prepare_ticker_summary(
     risk_free_rate_override: float | None = None,
     profile_cache: dict[str, TickerProfile] | None = None,
     allow_fetch: bool = True,
+    lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
 ) -> TickerSummary:
     """Gather everything needed to print one ticker's summary, doing whatever
     fetching that requires.
+
+    `lookback_months` controls this project's own return, volatility, and
+    Sharpe figures. The portfolio edit loop supplies its active window so a
+    summary read after `[w]indow` remains comparable with the optimizer;
+    other callers retain the 60-month default.
 
     This is the fetching counterpart to `prepare_benchmark` and
     `prepare_holdings` and lives here for the same reason they do: it keeps
@@ -516,7 +522,12 @@ def prepare_ticker_summary(
             rate, origin = resolve_rate()
             return summarize(
                 ticker_stats(
-                    ticker, as_of, session_db_path, currency=found_currency, risk_free_rate=rate
+                    ticker,
+                    as_of,
+                    session_db_path,
+                    currency=found_currency,
+                    risk_free_rate=rate,
+                    lookback_months=lookback_months,
                 ),
                 origin,
             )
@@ -552,7 +563,12 @@ def prepare_ticker_summary(
             found_currency = currencies.get(ticker, found_currency)
             rate, origin = resolve_rate()
             stats = ticker_stats(
-                ticker, as_of, scratch_db_path, currency=found_currency, risk_free_rate=rate
+                ticker,
+                as_of,
+                scratch_db_path,
+                currency=found_currency,
+                risk_free_rate=rate,
+                lookback_months=lookback_months,
             )
         return summarize(stats, origin)
     except Exception as e:  # noqa: BLE001 - duckdb and yfinance raise assorted types here
@@ -1039,6 +1055,7 @@ def compute_weights_and_allocation(
     risk_free_rate: float = settings.risk_free_rate,
     dividend_floor: DividendFloor | None = None,
     consult_dividends: bool = True,
+    lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
     returns_matrix: pd.DataFrame | None = None,
 ) -> tuple[PortfolioStats, tuple[dict[str, int], float]]:
     """`compute_weights_and_stats` + `allocate_shares` for `candidates` as of
@@ -1050,7 +1067,10 @@ def compute_weights_and_allocation(
     Returns the full `PortfolioStats` rather than only its weights so the CLI
     can report the expected returns, volatilities, and Sharpe ratio behind an
     allocation. `target_annual_return` applies only to `objective="MV"`, the
-    one objective defined by a target.
+    one objective defined by a target. `lookback_months` chooses how many of
+    the database's trailing monthly return dates to load when no caller has
+    supplied a preloaded `returns_matrix`; its 60-month default preserves all
+    noninteractive and initial-run behavior.
 
     Raises `MixedCurrencyPoolError` if `candidates` do not all trade in one
     currency. The interactive loops already refuse a cross-currency ticker as
@@ -1067,7 +1087,12 @@ def compute_weights_and_allocation(
     # twice. Left `None` - which is what the edit loop does - it loads its
     # own, so the loop keeps recomputing against the current candidates.
     if returns_matrix is None:
-        returns_matrix = load_returns_matrix(candidates, as_of=rebalance_date, db_path=db_path)
+        returns_matrix = load_returns_matrix(
+            candidates,
+            as_of=rebalance_date,
+            lookback_months=lookback_months,
+            db_path=db_path,
+        )
 
     # Re-read on every call, deliberately never carried by the edit loop:
     # `[a]dd` can introduce a ticker nobody has a yield for yet, and a loop

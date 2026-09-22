@@ -418,7 +418,7 @@ def _stats(**overrides) -> PortfolioStats:
 
 
 def _render(stats, allocation=None, objective="GMV", currency="USD", portfolio_value=None,
-            resolved_objective=None) -> str:
+            resolved_objective=None, requested_lookback_months=None) -> str:
     """`print_weights_and_allocation` captured as a string, so a test can
     assert on the lines it printed.
     """
@@ -434,6 +434,7 @@ def _render(stats, allocation=None, objective="GMV", currency="USD", portfolio_v
             currency,
             portfolio_value=portfolio_value,
             resolved_objective=resolved_objective,
+            requested_lookback_months=requested_lookback_months,
         )
     return buffer.getvalue()
 
@@ -602,6 +603,102 @@ def test_run_edit_loop_switching_objective_to_gmv_does_not_prompt_for_a_target_r
     assert stub_optimizer.call_args.args[1] == "GMV"
 
 
+# ---------------------------------------------------------------------------
+# _run_edit_loop's returns-window command
+# ---------------------------------------------------------------------------
+
+
+def test_run_edit_loop_prompt_offers_the_window_option(monkeypatch, stub_optimizer):
+    prompts = _script_recording(monkeypatch, "f")
+
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+
+    assert prompts and "[w]indow" in prompts[0]
+
+
+@pytest.mark.parametrize("months", [24, 36])
+def test_run_edit_loop_window_recomputes_with_the_requested_lookback(
+    monkeypatch, stub_optimizer, capsys, months
+):
+    _script(monkeypatch, "w", str(months), "f")
+
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+
+    assert stub_optimizer.call_args.kwargs["lookback_months"] == months
+    assert f"Measuring over {months} month(s) of returns." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("typed", ["", "twelve", "12", "61", "60"])
+def test_run_edit_loop_window_rejects_or_skips_an_unchanged_value(
+    monkeypatch, stub_optimizer, typed
+):
+    _script(monkeypatch, "w", typed, "f")
+
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+
+    stub_optimizer.assert_not_called()
+
+
+def test_run_edit_loop_keeps_the_chosen_window_for_later_edits(monkeypatch, stub_optimizer):
+    _script(monkeypatch, "w", "36", "o", "MSR", "f")
+
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+
+    assert [call.kwargs["lookback_months"] for call in stub_optimizer.call_args_list] == [36, 36]
+
+
+def test_run_edit_loop_remeasures_the_benchmark_on_the_changed_window(
+    monkeypatch, stub_optimizer
+):
+    stub_optimizer.return_value = (
+        _stats(
+            returns_window_start=date(2022, 5, 1),
+            returns_window_end=date(2025, 4, 1),
+            returns_window_months=36,
+        ),
+        ({}, 0.0),
+    )
+    benchmark_spy = MagicMock(return_value=None)
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.cli.benchmark_stats_for_window", benchmark_spy
+    )
+    _script(monkeypatch, "w", "36", "f")
+
+    _run_edit_loop(
+        ["AAPL"],
+        "GMV",
+        1000.0,
+        REBALANCE_DATE,
+        "session.duckdb",
+        benchmark=_benchmark_source("SPY"),
+    )
+
+    assert benchmark_spy.call_args.args[1:3] == (date(2022, 5, 1), date(2025, 4, 1))
+
+
+def test_run_edit_loop_reverts_a_window_that_cannot_be_optimized(monkeypatch, capsys):
+    seen: list[int] = []
+
+    def fake_optimizer(*_args, lookback_months=60, **_kwargs):
+        seen.append(lookback_months)
+        if lookback_months == 24:
+            raise ValueError("no candidates have enough common history")
+        return _stats(), ({}, 0.0)
+
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.cli.compute_weights_and_allocation", fake_optimizer
+    )
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.cli.print_weights_and_allocation", lambda *a, **k: None
+    )
+    _script(monkeypatch, "w", "24", "o", "MSR", "f")
+
+    _run_edit_loop(["AAPL"], "GMV", 1000.0, REBALANCE_DATE, "session.duckdb")
+
+    assert seen == [24, 60]
+    assert "and returns window" in capsys.readouterr().out
+
+
 def test_run_edit_loop_an_unoptimizable_edit_is_reverted_instead_of_ending_the_session(
     monkeypatch, capsys
 ):
@@ -631,7 +728,10 @@ def test_run_edit_loop_an_unoptimizable_edit_is_reverted_instead_of_ending_the_s
 
     out = capsys.readouterr().out
     assert "Cannot optimize that edit" in out
-    assert "Keeping the previous candidates, objective, target return, and dividend floor." in out
+    assert (
+        "Keeping the previous candidates, objective, target return, dividend floor, and returns window."
+        in out
+    )
     assert calls == [0.99, 0.10]
 
 
@@ -686,6 +786,19 @@ def test_print_weights_and_allocation_reports_the_figures_behind_the_weights(cap
     assert "Target annual return: 0.1250" in out
     assert "Returns window: 2020-05-01 to 2025-04-01 (60 month(s) of monthly returns)" in out
     assert "Leftover cash: $12.34" in out
+
+
+def test_print_weights_and_allocation_names_a_nondefault_requested_window():
+    out = _render(
+        _stats(
+            returns_window_start=date(2022, 5, 1),
+            returns_window_end=date(2025, 4, 1),
+            returns_window_months=36,
+        ),
+        requested_lookback_months=36,
+    )
+
+    assert "(36 month(s) of monthly returns, 36 requested)" in out
 
 
 def test_run_edit_loop_refuses_a_cross_currency_add_and_does_not_persist(
@@ -2249,7 +2362,10 @@ def test_run_edit_loop_an_unreachable_dividend_floor_reverts_instead_of_ending_t
 
     out = capsys.readouterr().out
     assert "Cannot optimize that edit: the highest-yielding candidate is T at 0.0397" in out
-    assert "Keeping the previous candidates, objective, target return, and dividend floor." in out
+    assert (
+        "Keeping the previous candidates, objective, target return, dividend floor, and returns window."
+        in out
+    )
     # The rejected 0.2 was replaced by the original 0.02, not left in place.
     assert [f.yield_floor for f in seen] == [0.2, 0.02]
 
@@ -3324,6 +3440,28 @@ def test_edit_loop_summary_uses_the_rate_the_session_already_settled_on(
     )
 
     assert "Risk-free rate used: 0.0050 (remembered for USD)" in capsys.readouterr().out
+
+
+def test_edit_loop_summary_uses_the_window_selected_earlier_in_the_loop(
+    monkeypatch, stub_optimizer
+):
+    _fake_ingestion(monkeypatch)
+    _fake_summary_sources(monkeypatch)
+    stats_spy = MagicMock(return_value=_ticker_stats_fixture(ticker="AAPL", window_months=36))
+    monkeypatch.setattr("agentic_portfolio.flow.interactive.ticker_stats", stats_spy)
+    monkeypatch.setattr("agentic_portfolio.flow.cli.save_candidate_pool", MagicMock())
+    _script(monkeypatch, "w", "36", "s", "AAPL", "f")
+
+    _run_edit_loop(
+        ["AAPL"],
+        "GMV",
+        1000.0,
+        REBALANCE_DATE,
+        "session.duckdb",
+        selection="user_provided",
+    )
+
+    assert stats_spy.call_args.kwargs["lookback_months"] == 36
 
 
 # ==========================================================================
