@@ -66,6 +66,7 @@ A **candidate pool** is the list of tickers a person has assembled to build a po
 - [x] (2026-09-06 02:35Z) Documented in `README.md`'s Live Mode section.
 - [x] (2026-09-06 02:40Z) Full suite: 360 passed, up from 290 before this plan.
 - [x] (2026-09-06 03:05Z) Recorded the shrinkage asymmetry — the one thing the ddof fix does NOT make symmetric — in `src/optimizer/benchmark.py`'s module docstring, in `annualized_return_and_volatility`'s docstring, in this plan's Surprises & Discoveries and Decision Log, and as `tests/test_benchmark.py::test_the_benchmark_is_not_shrunk_against_a_pool`. The report deliberately stays silent about it.
+- [x] (2026-09-22 08:24Z) Applied the requested portfolio window's effective minimum, `min(BENCHMARK_MIN_MONTHS, requested_lookback_months)`, when measuring benchmarks for 12-to-23-month interactive windows.
 - [ ] Not done, deliberately out of scope, and re-verified still absent on 2026-09-08 — this
       item is a standing scope record, not a task, so it stays unchecked:
       a `DEFAULT_BENCHMARKS` entry for any currency other than USD (the person is asked
@@ -164,6 +165,10 @@ A **candidate pool** is the list of tickers a person has assembled to build a po
   The caveat this leaves, worth knowing when reading a close call: shrinkage moves the PORTFOLIO's reported volatility and Sharpe ratio by several percent in a direction that depends on its own correlation structure, while leaving the benchmark's untouched, so a Sharpe gap of a couple of hundredths — such as the live USD run's 0.6675 against 0.6921 — sits inside the noise of that choice and is not decisive. A gap like the JPY run's 0.6132 against 1.5486 plainly is. This is recorded in `src/optimizer/benchmark.py`'s module docstring rather than printed on every run, since a caveat that always appears becomes noise rather than information.
   Date/Author: 2026-09-06, raised by the user on reviewing the ddof finding.
 
+- Decision: `BENCHMARK_MIN_MONTHS` remains 24 as the default, but a benchmark beside an explicitly shortened interactive portfolio uses `min(BENCHMARK_MIN_MONTHS, requested_lookback_months)`.
+  Rationale: portfolio and benchmark figures must be comparable over the same months and under the same eligibility rule. A fixed 24 would make a 12-to-23-month benchmark unavailable beside a successfully optimized short-window portfolio; a global 12 would weaken ordinary 60-month reports.
+  Date/Author: 2026-09-22, agreed with the repository owner.
+
 - Decision: `DEFAULT_BENCHMARKS` contains `USD -> SPY` and nothing else. Any other currency is ASKED for, once, and the answer is remembered.
   Rationale: `SPY` is the uncontested stand-in for the US market, so defaulting it costs nobody anything. There is no comparably obvious single answer elsewhere — a yen pool might reasonably be measured against TOPIX (`1306.T`) or the Nikkei 225 (`1321.T`), and those genuinely differ: over the same 60 months this project measured them at 20.09% return / 11.68% volatility and 21.59% / 17.70% respectively, a Sharpe ratio of 1.55 against 1.11. Picking one in code would quietly measure somebody's portfolio against an index they never chose, which is precisely the kind of invisible wrong answer `plans/11` was written to eliminate for currencies. Asking is cheap because the pool-editing loop is already interactive, and the answer is remembered so it is asked at most once per pool.
   Date/Author: 2026-09-06, confirmed with the user.
@@ -234,6 +239,8 @@ There are two databases in play at once, and telling them apart is essential to 
 
 The optimizer is `src/optimizer/portfolio.py`. `load_returns_matrix(tickers, as_of, lookback_months=60, min_months=24, db_path)` reads the `returns` table into a table of months (rows) by tickers (columns) and drops any ticker with fewer than 24 months of history or an internal gap. `compute_weights_and_stats(returns_matrix, objective, target_annual_return, risk_free_rate)` hands that to PyPortfolioOpt and returns a `PortfolioStats` named tuple carrying the weights, each ticker's annualized expected return and volatility, the portfolio's own expected return, volatility and Sharpe ratio, the risk-free rate, the MV target return, and `returns_window_start`/`returns_window_end`/`returns_window_months` describing the months actually used.
 
+That 24-month threshold remains the ordinary default. When an interactive command explicitly requests 12 through 23 months, both the optimizer and benchmark instead receive an effective minimum equal to the requested window. This is a caller override, not a change to `BENCHMARK_MIN_MONTHS` or the optimizer's default.
+
 The statistics come from two PyPortfolioOpt calls, and this plan's whole correctness argument rests on reusing them verbatim:
 
     mu = expected_returns.mean_historical_return(returns_matrix, returns_data=True, frequency=12)
@@ -284,7 +291,7 @@ which does exactly what `build_live_snapshot`'s `user_provided` branch already d
 
 In `src/flow/interactive.py`, add `prepare_benchmark(ticker, currency, rebalance_date, db_path, allow_fetch=True) -> BenchmarkSource`. Its order of operations is: read `db_path` first, because that read is free, offline and read-only, and it hits whenever the benchmark is already a pool member; if that yields fewer than `BENCHMARK_MIN_MONTHS` of history and `allow_fetch` is set, fetch into a `build_scratch_snapshot` database via the existing `validate_and_ingest_tickers` and read the result back out of *that*; then check the resolved currency against `currency` and refuse a mismatch by name. `ticker=None` returns an unavailable source naming `--benchmark`. The whole body is wrapped so that any exception becomes an unavailable source with a logged warning — losing a live session's freshly fetched snapshot over a benchmark would cost far more than the benchmark is worth.
 
-Then give `run_pipeline_against` and `run_pipeline` a `benchmark: BenchmarkSource | None = None` parameter and one new result key, `"benchmark"`, holding `benchmark_stats_for_window(benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate)`. The `None` default is load-bearing: it keeps every existing programmatic caller and hermetic test free of any network access.
+Then give `run_pipeline_against` and `run_pipeline` a `benchmark: BenchmarkSource | None = None` parameter and one new result key, `"benchmark"`, holding `benchmark_stats_for_window(benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate)`. For an explicitly selected interactive window, also pass `min_months=min(BENCHMARK_MIN_MONTHS, requested_lookback_months)`; ordinary calls omit it and retain 24. The `None` benchmark default is load-bearing: it keeps every existing programmatic caller and hermetic test free of any network access.
 
 
 ### Milestone 3: remembering a pool's benchmark
@@ -565,6 +572,8 @@ In `src/optimizer/benchmark.py`:
         min_months: int = BENCHMARK_MIN_MONTHS,
     ) -> BenchmarkStats | None
 
+`BENCHMARK_MIN_MONTHS` remains 24. Callers serving an explicit 12-to-23-month interactive window pass the requested length as `min_months`; callers serving 24-to-60-month or default reports pass or inherit 24.
+
 In `src/flow/live.py`:
 
     @contextmanager
@@ -650,3 +659,5 @@ edit would be worse than one that persists. And a benchmark can out-return every
 pool, so the derived target is clamped to the reachable ceiling; see
 `plans/05_optimizer_and_allocation.md`'s revision note of the same date for what that costs
 and why the report warns about it.
+
+Revision note (2026-09-22): Added the dynamic minimum-history rule for benchmarks displayed beside explicit 12-to-23-month portfolio windows. The 24-month benchmark default remains unchanged for ordinary reports.

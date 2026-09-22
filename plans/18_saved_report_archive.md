@@ -376,7 +376,7 @@ early at line 1026 after printing `Cannot optimize this run: <reason>`.
 
 After the report, `main()` prints the user's own saved holdings (`print_user_portfolio` at line
 785), then enters `_run_edit_loop` at line 1933. That loop prompts
-`[a]dd / [r]emove / [o]bjective / [t]arget-return / [d]ividend / [b]enchmark / [s]ummary /
+`[a]dd / [r]emove / [o]bjective / [t]arget-return / [d]ividend / [w]indow / [b]enchmark / [s]ummary /
 [f]inish`, and after each accepted edit it recomputes and calls `print_weights_and_allocation`
 directly, at line 2175. It never reprints the header and never reprints the holdings block - the
 comments there explain why: an edit to the candidate pool changes neither.
@@ -392,7 +392,7 @@ line 915. `--date` defaults to `today`.
 accepted change it prints the hypothetical portfolio with a `heading` of
 `What if (<CURRENCY>) - not saved`, then `format_holdings_delta` (`src/flow/cli.py:924`) and
 `format_dividend_delta` (`src/flow/cli.py:682`) - the signed change in the figures. `[w]indow`
-varies the length of the returns window between 24 and 60 months and re-measures the baseline too.
+varies the length of the returns window between 12 and 60 months and re-measures the baseline too.
 On `[f]inish` it prints the module constant `NOT_SAVED` at line 422, "Nothing was saved: that was a
 what-if, and your portfolio is unchanged.", and then the exact `set` command that would make the
 experiment real.
@@ -1038,3 +1038,5 @@ display layer has to flatten them, and the display layer is the only layer that 
 four. And `command_line` was added to `src/flow/report_archive.py` rather than inlined at each
 `main()`, so both entry points record a command the same way and the `argv[0]`-basename rule is
 tested once.
+
+Revision note (2026-09-22): Updated the documented interactive prompts and holdings what-if range to 12-60 months. Archive schemas remain unchanged because they already store the actual window dates and month count, and report bodies record the requested nondefault window.

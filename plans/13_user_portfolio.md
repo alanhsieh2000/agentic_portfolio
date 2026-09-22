@@ -66,10 +66,13 @@ Define the terms used throughout, in plain language:
 - [x] (2026-09-06 08:18Z) Milestone 6c — wiring: `_resolve_holdings` and `open_holdings_session` resolve through the cache instead of a throwaway database, `_validate_set_targets` gained `refresh_cache` so a re-tried what-if ticker costs nothing, and both CLIs gained `--holdings-cache-path` and `--refresh-holdings`. `--no-holdings-fetch` now reaches the cache, since reading a local file is not a network call.
 - [x] (2026-09-06 08:52Z) Item 5f — made Milestone 5's new-ticker capability discoverable: `whatif` has always accepted a ticker the user does not own, but nothing the program printed said so, and the repository owner reasonably read the loop as editing existing holdings only. Six user-facing strings reworded in `src/flow/holdings_cli.py`; no logic, no behaviour change, two tests pinning the prompts. Full suite: 569 passed.
 - [x] (2026-09-06 08:26Z) Milestone 6d — documentation: this plan's living sections, a `README.md` bullet, and the superseded `Decision Log` entry marked as such. Full suite: 567 passed.
-- [x] (2026-09-06 09:40Z) Milestone 7a — the window as a validated value: `DEFAULT_LOOKBACK_MONTHS` and `validate_lookback_months` in `src/optimizer/holdings.py`, refusing anything outside 24-60 by name, and `holdings_stats`' bare `60` default replaced by the constant.
+- [x] (2026-09-06 09:40Z) Milestone 7a — the original window as a validated value: `DEFAULT_LOOKBACK_MONTHS` and `validate_lookback_months` in `src/optimizer/holdings.py`, initially refusing anything outside 24-60 by name, and `holdings_stats`' bare `60` default replaced by the constant. The selectable floor is superseded by Milestone 8.
 - [x] (2026-09-06 09:46Z) Milestone 7b — threading: `lookback_months` on `interactive.measure_holdings` and `_holdings_stats_excluding` and their `holdings_stats` call sites. `prepare_holdings` deliberately untouched, which keeps `show`, `set`, `remove` and every `uv run portfolio` block on the fixed 60 - and keeps the tested pool/benchmark/holdings one-scale guarantee true.
 - [x] (2026-09-06 09:55Z) Milestone 7c — the loop: `[w]indow` in `WHATIF_PROMPT` and `_whatif_window` in `src/flow/holdings_cli.py`, with the window as loop state and a re-measure of the baseline on change. Also stopped labelling an unchanged portfolio "What if - not saved", which a window-only edit made newly visible.
 - [x] (2026-09-06 10:02Z) Milestone 7d — saying the window was chosen: `window_origin` on `print_user_portfolio`, so `Returns window: ... (36 month(s) of monthly returns, 36 requested)` separates a chosen window from all the data there was. 21 new tests; full suite 590 passed.
+- [x] (2026-09-22 08:20Z) Milestone 8a — expanded the shared lookback validator and holdings prompt to 12-60 months.
+- [x] (2026-09-22 08:24Z) Milestone 8b — derived `effective_min_months = min(HOLDINGS_MIN_MONTHS, lookback_months)` for every what-if measurement while keeping ordinary 60-month reports at the existing 24-month minimum.
+- [x] (2026-09-22 08:37Z) Milestone 8c — added boundary, exclusion, baseline, and comparability tests for 12-to-23-month windows, updated user documentation, and passed the 1,286-test full suite.
 
 
 ## Surprises & Discoveries
@@ -245,13 +248,17 @@ Define the terms used throughout, in plain language:
   Rationale: chosen by the repository owner, and it is the option that avoids a documented, tested guarantee rather than merely being the smallest. `uv run portfolio` prints the pool's figures, the benchmark's and the holdings' and promises all three describe the same months; `benchmark_stats_for_window` is deliberately anchored to the POOL's window, `README.md` asserts that a one-holding portfolio reports exactly its own benchmark's numbers, and `tests/test_interactive_flow.py` pins `benchmark.window_months == stats.returns_window_months`. A holdings-only window there would silently falsify all three. The whatif loop has no such coupling - it measures through `measure_holdings`, not `prepare_holdings` - which is why the change cost two parameters instead of a re-anchoring of the whole pipeline.
   Date/Author: 2026-09-06, agreed with the repository owner.
 
-- Decision: 24 to 60 months, refusing anything outside by name.
-  Rationale: chosen by the repository owner from three offered ranges, and both bounds are existing facts rather than new numbers. The floor is `HOLDINGS_MIN_MONTHS`, the minimum history a holding needs before it is measured at all: below it `apply_min_history_rule` drops EVERY holding, since a column cannot hold more non-null months than the window has rows, and the report would come back with no figures and a complaint about a `min_months` nobody typed. The ceiling is what the data can support - an ingest fetches 65 months of prices, which is 60 monthly returns plus a buffer month - so a larger request cannot be honoured and is refused rather than silently truncated. Refusing also keeps a zero or negative value away from `_load_window_dates`, whose `LIMIT ?` raises a raw DuckDB `BinderException` that the report layer's blanket handler would surface as an unhelpful "could not measure this variant".
+- Decision: 24 to 60 months, refusing anything outside by name. Superseded by the 2026-09-22 decision below.
+  Rationale: this was the original range because the selectable floor was tied directly to `HOLDINGS_MIN_MONTHS`. The 60-month ceiling remains valid, but the floor no longer needs that coupling once short windows derive a matching effective minimum.
   Date/Author: 2026-09-06, agreed with the repository owner.
 
-- Decision: `min_months` stays at `HOLDINGS_MIN_MONTHS` regardless of the window, with the consequence documented rather than engineered around.
-  Rationale: at a 24-month window the bar equals the window, so a holding needs EVERY month in it - a single missing one leaves it at 23 and it is excluded, and not even a gap is required: one leading null from a recent listing, which `apply_min_history_rule` is designed to tolerate, trips the count branch instead. That narrows `plans/05_optimizer_and_allocation.md`'s "use whatever months a ticker actually has, between 24 and 60" tolerance to nothing at the floor. Scaling the bar down with the window was considered and rejected: 24 is shared by the optimizer, the benchmark and the holdings report, and `plans/13`'s own Surprises section records that `apply_min_history_rule` is unsafe at `min_months=0`, so moving it is not a local change. The existing per-holding exclusion message already explains itself - "23 month(s) of monthly returns in the window, under 24" - so this needs a test and this entry, not new machinery.
+- Decision: `min_months` stays at `HOLDINGS_MIN_MONTHS` regardless of the window. Superseded by the 2026-09-22 decision below.
+  Rationale: this described the original 24-to-60 range. It cannot coexist with a 12-to-23-month window because no series can contain 24 observations inside a shorter matrix.
   Date/Author: 2026-09-06.
+
+- Decision: the selectable holdings window is 12 to 60 whole months, and a measurement uses `effective_min_months = min(HOLDINGS_MIN_MONTHS, lookback_months)`.
+  Rationale: a 12-to-23-month request must lower the threshold far enough to be measurable, but lowering `HOLDINGS_MIN_MONTHS` globally would also admit 12-month holdings into an ordinary 60-month report. The dynamic rule requires every requested month below 24 and preserves the established 24-month threshold at and above 24. The ceiling remains 60 because ingestion supplies only 60 monthly returns plus its price buffer.
+  Date/Author: 2026-09-22, agreed with the repository owner.
 
 - Decision: a window change re-measures the BASELINE as well as the variant.
   Rationale: `format_holdings_delta` withholds a delta when the two sides' windows differ, deliberately, because the difference would then be partly the months rather than the holdings. Leaving the baseline where it was would therefore turn every subsequent comparison into an apology. Re-measuring both keeps the delta meaningful: one window on both sides, different holdings. It also made that guard's docstring wrong - it said reaching the branch "means something has gone wrong upstream", which stops being true once a person can legitimately change the window - so the sentence was corrected while the guard itself stayed exactly as it was.
@@ -384,7 +391,7 @@ Milestone 6 replaces the throwaway database under all of it with a persistent on
 Milestone 7 makes the window itself a choice, in the what-if loop alone:
 
     src/optimizer/holdings.py            <- changed: DEFAULT_LOOKBACK_MONTHS and
-      |                                     validate_lookback_months (24-60, refused outside)
+      |                                     validate_lookback_months (12-60, refused outside)
       v
     src/flow/interactive.py              <- changed: lookback_months on measure_holdings and
       |                                     _holdings_stats_excluding. NOT on prepare_holdings,
@@ -793,17 +800,18 @@ Expect `Total value: ... (priced YYYY-MM-DD)` on every one of them, and `data/po
 ### Milestone 7 — the selectable window
 
 
-Scope: let a person vary the LENGTH of the returns window, not only the holdings. At the end of this milestone `uv run portfolio-holdings whatif` has a `[w]indow` verb that re-measures over any length from 24 to 60 months, and the report names the length that was asked for. Added because for some holdings the window dominates the answer: `PFF` fell hard in roughly the first 12 months of the current 60-month window (the 2022 rate shock hitting preferred stock) and has been broadly stable since, so it reads as a losing position over 60 months and a modestly winning one over 36. Both are true statements about different spans of months, and 2 to 5 years are all defensible choices, so the person needs to see more than one.
+Scope: let a person vary the LENGTH of the returns window, not only the holdings. At the end of the original milestone `uv run portfolio-holdings whatif` gained a `[w]indow` verb for 24 to 60 months. Milestone 8 expands it to every whole-number length from 12 to 60 months while preserving the original 24-month eligibility threshold for windows at least that long. The report names the length that was asked for. Added because for some holdings the window dominates the answer: `PFF` fell hard in roughly the first 12 months of the current 60-month window (the 2022 rate shock hitting preferred stock) and has been broadly stable since, so it reads differently over 60, 36, and 12 months. Each is a true statement about a different span, so the person needs to see more than one.
 
 **Step 7a — the window as a validated value.** In `src/optimizer/holdings.py`, beside `HOLDINGS_MIN_MONTHS`:
 
     DEFAULT_LOOKBACK_MONTHS = 60
+    MIN_LOOKBACK_MONTHS = 12
 
     def validate_lookback_months(months: object, source: str) -> int
 
-Modelled on `src/flow/rate_memory.py`'s `validate_risk_free_rate`: takes `object` so a value from anywhere gets the same scrutiny, names `source` in every message, raises `ValueError`, returns the coerced value. Refuses anything outside `HOLDINGS_MIN_MONTHS .. DEFAULT_LOOKBACK_MONTHS`, and rejects a `bool` ahead of the numeric check since `isinstance(True, int)` is true in Python and would otherwise mean a one-month window. `holdings_stats`' bare `lookback_months: int = 60` becomes the constant while we are there - its neighbour `min_months` already used a named one, and the asymmetry is what made the 60 hard to find.
+Modelled on `src/flow/rate_memory.py`'s `validate_risk_free_rate`: takes `object` so a value from anywhere gets the same scrutiny, names `source` in every message, raises `ValueError`, returns the coerced value. Refuses anything outside `MIN_LOOKBACK_MONTHS .. DEFAULT_LOOKBACK_MONTHS`, and rejects a `bool` ahead of the numeric check since `isinstance(True, int)` is true in Python and would otherwise mean a one-month window. `HOLDINGS_MIN_MONTHS` remains 24 and keeps its different meaning: it is the default eligibility threshold, not the selectable-window floor.
 
-**Step 7b — threading.** `lookback_months` on `interactive.measure_holdings` and `interactive._holdings_stats_excluding`, passed to their `holdings_stats` calls. That is the entire chain: below `src/flow`, `load_returns_matrix_unfiltered`, `load_returns_matrix` and `holdings_stats` all had the parameter already and had simply never been given a value. `prepare_holdings` is deliberately NOT given one - see the `Decision Log` on why a holdings-only window in `uv run portfolio` would falsify a tested guarantee.
+**Step 7b — threading.** `lookback_months` on `interactive.measure_holdings` and `interactive._holdings_stats_excluding`, passed to their `holdings_stats` calls. For the expanded range, derive `effective_min_months = min(HOLDINGS_MIN_MONTHS, lookback_months)` at the measurement boundary and pass that as `min_months` too. Thus 12 requires 12 complete returns, 18 requires 18, and 24 through 60 require 24. `prepare_holdings` remains on its ordinary 60/24 defaults; only an explicit what-if window uses the dynamic value.
 
 **Step 7c — the loop.** `[w]indow` joins `WHATIF_PROMPT`, and `_whatif_window(current)` reads a length, keeping what you had on an unusable answer. It proceeds in this order:
 
@@ -823,8 +831,8 @@ The invariants pinned, and why each is worth a test:
 
 - **A shorter window actually changes the figures.** A parameter that reached the estimator and moved nothing would look like success while being inert, which is precisely what a threading bug produces.
 - **The window is derived, the request is named** - including when fewer months exist than were asked for.
-- **At a 24-month window a holding missing one month is excluded and named**, the documented consequence of keeping the bar at 24.
-- **23, 61, 0, -1, `36.5`, `"abc"` and `True` are all refused by name**, and a zero or negative one never reaches DuckDB's `LIMIT`.
+- **At a 12-month window a holding missing one month is excluded and named**, because short windows require their complete requested history. At 24 through 60 months the threshold remains 24.
+- **11, 61, 0, -1, `36.5`, `"abc"` and `True` are all refused by name**, and a zero or negative one never reaches DuckDB's `LIMIT`.
 - **A window change re-measures the baseline**, so the next delta prints figures rather than the "measured over different windows" apology - the symptom a naive implementation shows.
 - **An unusable answer keeps the previous window** and says so, in the validator's words rather than `int`'s.
 - **An unchanged portfolio is not labelled a what-if**, after a window change or an `[u]ndo all`.
@@ -843,8 +851,9 @@ Commands and acceptance - the loop is interactive, so drive it with `printf`:
     #   60 months: Annual return: -0.0105  Annual volatility: 0.1108  Sharpe: -0.2752
     #   36 months: Annual return:  0.0367  Annual volatility: 0.0802  Sharpe:  0.2079
 
-    printf 'w\n24\nf\n'  | uv run portfolio-holdings whatif   # the tight end of the range
-    printf 'w\n12\nf\n'  | uv run portfolio-holdings whatif   # refused, naming 24-60
+    printf 'w\n12\nf\n'  | uv run portfolio-holdings whatif   # accepted, requiring all 12 months
+    printf 'w\n18\nf\n'  | uv run portfolio-holdings whatif   # accepted, requiring all 18 months
+    printf 'w\n11\nf\n'  | uv run portfolio-holdings whatif   # refused, naming 12-60
     printf 'w\n61\nf\n'  | uv run portfolio-holdings whatif   # refused, naming the 65-month ingest
     printf 'w\nabc\nf\n' | uv run portfolio-holdings whatif   # keeps 60, in the validator's words
 
@@ -852,6 +861,10 @@ Commands and acceptance - the loop is interactive, so drive it with `printf`:
     printf 'w\n36\ns\nSPY 200\nf\n' | uv run portfolio-holdings whatif
 
 If the PFF figures do NOT move between 60 and 36 months, the window is not reaching the estimator and the feature is inert. And `memory/portfolio.json`, `memory/rates.json` and `data/portfolio.duckdb` must all be unchanged, since a what-if still writes nothing.
+
+### Milestone 8 — expand the selectable window to one year
+
+Retain every Milestone 7 interaction and persistence guarantee, but change the accepted range to 12 through 60 and apply the dynamic minimum-history rule at the shared measurement boundary. The portfolio optimizer, benchmark, holdings report, and ticker summary must all receive the same effective threshold for a given requested window; otherwise the command could optimize a ticker that its adjacent comparison declines to measure. Add deterministic tests for 12, 18, 24, and 60 months, for refusal of 11 and 61, and for a series with one missing month at the 12-month floor being excluded by name.
 
 ## Validation and Acceptance
 
@@ -1022,6 +1035,10 @@ In `src/optimizer/portfolio.py`:
 In `src/optimizer/holdings.py`:
 
     HOLDINGS_MIN_MONTHS: int
+    MIN_LOOKBACK_MONTHS: int
+    DEFAULT_LOOKBACK_MONTHS: int
+
+    def validate_lookback_months(months: object, source: str) -> int: ...
 
     class HoldingsStats(NamedTuple): ...      # fields as listed in Milestone 2
     def unavailable_holdings(currency: str, positions: dict[str, float], risk_free_rate: float,
@@ -1035,6 +1052,8 @@ In `src/optimizer/holdings.py`:
                        risk_free_rate: float = settings.risk_free_rate,
                        lookback_months: int = 60,
                        min_months: int = HOLDINGS_MIN_MONTHS) -> HoldingsStats: ...
+
+`HOLDINGS_MIN_MONTHS` remains 24 for ordinary reports. `MIN_LOOKBACK_MONTHS` is 12 and controls only validation of an explicitly selected window. `measure_holdings` passes `min(HOLDINGS_MIN_MONTHS, lookback_months)` into `holdings_stats`, so short what-if windows are usable without weakening the default report.
 
 In `src/flow/interactive.py`:
 
@@ -1177,18 +1196,19 @@ In `pyproject.toml`, under `[project.scripts]`:
   this project is rigorous about never printing a number without its provenance, and had no
   equivalent habit for whether a feature announces itself. A capability documented only in the
   README is, from the prompt, indistinguishable from one that does not exist.
-- 2026-09-06, extended with Milestone 7 (a selectable returns window inside `whatif`): the window
-  length can now be varied from 24 to 60 months in the what-if loop, because for a holding like
+- 2026-09-06, extended with Milestone 7 (a selectable returns window inside `whatif`), then
+  reopened on 2026-09-22 by Milestone 8: the window was originally variable from 24 to 60 months
+  and is now specified as 12 to 60 months, because for a holding like
   `PFF` the choice dominates the answer - 60 months gives a Sharpe of -0.2752 and 36 months, which
   excludes the 2022 rate shock, gives +0.2079.
 
   This does NOT supersede `plans/05_optimizer_and_allocation.md`'s 60-month/24-month decision. The
-  default is unchanged, the optimizer and the candidate pool are untouched, `prepare_holdings` was
+  default is unchanged and `prepare_holdings` still
   deliberately left alone so `show`, `set`, `remove` and every `uv run portfolio` block still
-  measure over the fixed 60, and only an explicitly-requested exploration inside `whatif` can
-  differ. What it does narrow is that plan's second decision - "use whatever months a ticker
-  actually has, between 24 and 60" - at the very bottom of the range, where a 24-month window
-  leaves the 24-month bar no room to tolerate anything; recorded in the `Decision Log` above.
+  measures over the fixed 60/24 defaults. Explicit interactive windows instead use
+  `min(24, requested window)`: a 12-to-23-month window requires every requested month, and a
+  24-to-60-month window keeps the original 24-month bar. The same rule now applies to the
+  `portfolio` edit loop, its benchmark, and its ticker summaries; recorded in the `Decision Log`.
 
   Two things worth carrying forward. The parameter had existed on `load_returns_matrix` and
   `holdings_stats` since those functions were written and had never once been passed by anything in
@@ -1197,3 +1217,5 @@ In `pyproject.toml`, under `[project.scripts]`:
   holdings untouched, so the loop printed the person's real portfolio under `What if - not saved`
   with zero deltas beneath - which had also always happened after `[u]ndo all`, unnoticed because
   nobody had a reason to do it.
+
+Revision note (2026-09-22): Reopened the selectable-window milestone to expand both interactive commands from 24-60 to 12-60 months. The original fixed-24 threshold decision is superseded only for explicitly requested windows below 24; ordinary 60-month reports keep the 24-month threshold.

@@ -1128,12 +1128,12 @@ def test_the_whatif_prompt_offers_the_window(monkeypatch, tmp_path):
 def test_choosing_a_window_measures_over_it(monkeypatch, tmp_path):
     windows: list[int] = []
     path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
-    _script(monkeypatch, "w", "36", "f")
+    _script(monkeypatch, "w", "12", "f")
 
     _run(monkeypatch, path, ["whatif"])
 
-    # Baseline at the default, then the baseline re-measured at 36.
-    assert windows == [60, 36]
+    # Baseline at the default, then the baseline re-measured at 12.
+    assert windows == [60, 12]
 
 
 def test_a_window_change_re_measures_the_baseline_so_the_delta_still_prints(
@@ -1183,13 +1183,13 @@ def test_a_window_outside_the_range_is_refused_and_the_previous_one_kept(
 ):
     windows: list[int] = []
     path = _whatif_setup(monkeypatch, tmp_path, windows=windows)
-    _script(monkeypatch, "w", "12", "f")
+    _script(monkeypatch, "w", "11", "f")
 
     _run(monkeypatch, path, ["whatif"])
     out = capsys.readouterr().out
 
     assert "Keeping 60 months" in out
-    assert "between 24 and 60" in out
+    assert "between 12 and 60" in out
     assert windows == [60]  # never re-measured
 
 

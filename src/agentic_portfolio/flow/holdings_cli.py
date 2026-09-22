@@ -100,6 +100,7 @@ from agentic_portfolio.dataset.holdings_cache import DEFAULT_HOLDINGS_CACHE_PATH
 from agentic_portfolio.optimizer.holdings import (
     DEFAULT_LOOKBACK_MONTHS,
     HoldingsStats,
+    MIN_LOOKBACK_MONTHS,
     validate_lookback_months,
 )
 from agentic_portfolio.flow.interactive import (
@@ -476,7 +477,9 @@ def _whatif_window(current: int) -> int:
     already had. `validate_lookback_months` supplies the message, so the
     bounds are explained once, where they are enforced.
     """
-    raw = input(f"Months of returns to measure over (24-60, currently {current}): ").strip()
+    raw = input(
+        f"Months of returns to measure over ({MIN_LOOKBACK_MONTHS}-60, currently {current}): "
+    ).strip()
     if not raw:
         return current
 
@@ -504,7 +507,7 @@ def _run_whatif(args) -> None:
     The window is a change worth trying because it can dominate the answer.
     A holding that fell hard early in the 60-month window and has been
     stable since reads as poor over 60 months and quite differently over 36;
-    both are true statements about different spans of months, and 2 to 5
+    both are true statements about different spans of months, and 1 to 5
     years are all defensible choices. `[w]indow` is how you see more than
     one, and the report names the length that was asked for so a chosen
     window is never mistaken for all the data there was.

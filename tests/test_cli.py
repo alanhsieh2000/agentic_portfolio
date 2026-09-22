@@ -616,7 +616,7 @@ def test_run_edit_loop_prompt_offers_the_window_option(monkeypatch, stub_optimiz
     assert prompts and "[w]indow" in prompts[0]
 
 
-@pytest.mark.parametrize("months", [24, 36])
+@pytest.mark.parametrize("months", [12, 18, 24, 36])
 def test_run_edit_loop_window_recomputes_with_the_requested_lookback(
     monkeypatch, stub_optimizer, capsys, months
 ):
@@ -628,7 +628,7 @@ def test_run_edit_loop_window_recomputes_with_the_requested_lookback(
     assert f"Measuring over {months} month(s) of returns." in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("typed", ["", "twelve", "12", "61", "60"])
+@pytest.mark.parametrize("typed", ["", "twelve", "11", "61", "60"])
 def test_run_edit_loop_window_rejects_or_skips_an_unchanged_value(
     monkeypatch, stub_optimizer, typed
 ):
@@ -674,6 +674,36 @@ def test_run_edit_loop_remeasures_the_benchmark_on_the_changed_window(
     )
 
     assert benchmark_spy.call_args.args[1:3] == (date(2022, 5, 1), date(2025, 4, 1))
+    assert benchmark_spy.call_args.kwargs["min_months"] == 24
+
+
+def test_run_edit_loop_uses_the_short_window_minimum_for_the_benchmark(
+    monkeypatch, stub_optimizer
+):
+    stub_optimizer.return_value = (
+        _stats(
+            returns_window_start=date(2024, 5, 1),
+            returns_window_end=date(2025, 4, 1),
+            returns_window_months=12,
+        ),
+        ({}, 0.0),
+    )
+    benchmark_spy = MagicMock(return_value=None)
+    monkeypatch.setattr(
+        "agentic_portfolio.flow.cli.benchmark_stats_for_window", benchmark_spy
+    )
+    _script(monkeypatch, "w", "12", "f")
+
+    _run_edit_loop(
+        ["AAPL"],
+        "GMV",
+        1000.0,
+        REBALANCE_DATE,
+        "session.duckdb",
+        benchmark=_benchmark_source("SPY"),
+    )
+
+    assert benchmark_spy.call_args.kwargs["min_months"] == 12
 
 
 def test_run_edit_loop_reverts_a_window_that_cannot_be_optimized(monkeypatch, capsys):

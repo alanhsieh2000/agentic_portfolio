@@ -29,6 +29,8 @@ from agentic_portfolio.optimizer.dividends import NO_DIVIDEND_FIGURES, dividend_
 from agentic_portfolio.optimizer.holdings import (
     DEFAULT_LOOKBACK_MONTHS,
     HOLDINGS_MIN_MONTHS,
+    MIN_LOOKBACK_MONTHS,
+    effective_min_months,
     holdings_stats,
     unavailable_holdings,
     stored_month_counts,
@@ -726,45 +728,40 @@ def test_a_window_shorter_than_the_data_still_reports_what_it_used(tmp_path, mon
 
 
 def test_at_the_shortest_window_a_holding_missing_one_month_is_excluded(tmp_path, monkeypatch):
-    """The documented consequence of keeping `min_months` at 24: when the
-    window is 24 too, a holding needs EVERY month, so a single missing one
-    drops it. `plans/05_optimizer_and_allocation.md`'s "use whatever months
-    a ticker actually has" tolerance has no room to operate at the floor.
-    The exclusion message explains itself, which is why this is documented
-    rather than fixed.
-    """
+    """A short explicit window requires every requested month."""
     db_path = str(tmp_path / "fixture.duckdb")
     full = _monthly_returns(60, "SPY", start="2021-10-01")
-    # 23 of the last 24 months: starts one month late.
-    partial = _monthly_returns(23, "LATE", start="2024-11-01")
+    partial = _monthly_returns(11, "LATE", start="2025-03-01")
     _make_db(db_path, [full, partial], {"SPY": 600.0, "LATE": 50.0})
     _no_fetch(monkeypatch)
 
     with open_holdings_session([], AS_OF, db_path, allow_fetch=False, cache_path=db_path) as s:
-        stats = measure_holdings({"SPY": 100.0, "LATE": 10.0}, "USD", AS_OF, s, 0.02, None, 24)
+        stats = measure_holdings({"SPY": 100.0, "LATE": 10.0}, "USD", AS_OF, s, 0.02, None, 12)
 
-    assert stats.window_months == 24
-    assert "under 24" in stats.excluded["LATE"]
+    assert stats.window_months == 12
+    assert "under 12" in stats.excluded["LATE"]
     assert "LATE" not in stats.weights
 
 
 # --- validate_lookback_months ----------------------------------------------
 
 
-def test_the_default_and_the_ceiling_are_the_same_sixty():
+def test_the_selectable_bounds_and_default_are_explicit():
     assert validate_lookback_months(DEFAULT_LOOKBACK_MONTHS, "x") == 60
     assert validate_lookback_months(HOLDINGS_MIN_MONTHS, "x") == 24
+    assert validate_lookback_months(MIN_LOOKBACK_MONTHS, "x") == 12
 
 
-def test_a_window_below_the_minimum_history_bar_is_refused():
-    """Below 24 every holding falls under `min_months` and the report comes
-    back with no figures at all, complaining about a number the person never
-    typed. Refused at the door instead.
-    """
+def test_a_window_below_the_selectable_floor_is_refused():
     with pytest.raises(ValueError) as excinfo:
-        validate_lookback_months(23, "[w]indow")
+        validate_lookback_months(11, "[w]indow")
 
-    assert "between 24 and 60" in str(excinfo.value)
+    assert "between 12 and 60" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("lookback, expected", [(12, 12), (18, 18), (24, 24), (60, 24)])
+def test_effective_minimum_requires_short_windows_in_full(lookback, expected):
+    assert effective_min_months(lookback) == expected
 
 
 def test_a_window_beyond_what_an_ingest_fetches_is_refused():
@@ -780,7 +777,7 @@ def test_a_zero_or_negative_window_is_refused_before_duckdb_sees_it():
     blanket handler would surface as an unhelpful "could not measure".
     """
     for bad in (0, -1):
-        with pytest.raises(ValueError, match="between 24 and 60"):
+        with pytest.raises(ValueError, match="between 12 and 60"):
             validate_lookback_months(bad, "[w]indow")
 
 

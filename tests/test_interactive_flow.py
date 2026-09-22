@@ -975,7 +975,7 @@ def test_compute_weights_and_allocation_can_skip_consulting_dividends(monkeypatc
 
 
 def test_compute_weights_and_allocation_forwards_the_requested_lookback(monkeypatch):
-    returns_spy = MagicMock(return_value=pd.DataFrame({"AAA": [0.01] * 24}))
+    returns_spy = MagicMock(return_value=pd.DataFrame({"AAA": [0.01] * 12}))
     monkeypatch.setattr("agentic_portfolio.flow.interactive.load_returns_matrix", returns_spy)
     monkeypatch.setattr(
         "agentic_portfolio.flow.interactive._require_single_currency", lambda *a, **k: None
@@ -1002,10 +1002,11 @@ def test_compute_weights_and_allocation_forwards_the_requested_lookback(monkeypa
         1000.0,
         date(2026, 9, 8),
         "db.duckdb",
-        lookback_months=36,
+        lookback_months=12,
     )
 
-    assert returns_spy.call_args.kwargs["lookback_months"] == 36
+    assert returns_spy.call_args.kwargs["lookback_months"] == 12
+    assert returns_spy.call_args.kwargs["min_months"] == 12
 
 
 # ---------------------------------------------------------------------------
@@ -1308,11 +1309,11 @@ def test_prepare_ticker_summary_uses_the_requested_returns_window(tmp_path, monk
         ["AAA"],
         db_path,
         rates_path=None,
-        lookback_months=24,
+        lookback_months=12,
     )
 
     assert summary.stats.unavailable_reason is None
-    assert summary.stats.window_months == 24
+    assert summary.stats.window_months == 12
 
 
 def test_prepare_ticker_summary_ingests_a_non_pool_ticker_into_a_scratch_database(

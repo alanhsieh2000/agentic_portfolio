@@ -81,6 +81,7 @@ from agentic_portfolio.optimizer.holdings import (
     DEFAULT_LOOKBACK_MONTHS,
     HOLDINGS_MIN_MONTHS,
     HoldingsStats,
+    effective_min_months,
     holdings_stats,
     stored_month_counts,
     unavailable_holdings,
@@ -528,6 +529,7 @@ def prepare_ticker_summary(
                     currency=found_currency,
                     risk_free_rate=rate,
                     lookback_months=lookback_months,
+                    min_months=effective_min_months(lookback_months),
                 ),
                 origin,
             )
@@ -569,6 +571,7 @@ def prepare_ticker_summary(
                 currency=found_currency,
                 risk_free_rate=rate,
                 lookback_months=lookback_months,
+                min_months=effective_min_months(lookback_months),
             )
         return summarize(stats, origin)
     except Exception as e:  # noqa: BLE001 - duckdb and yfinance raise assorted types here
@@ -715,7 +718,13 @@ def measure_holdings(
     """
     if not positions:
         return holdings_stats(
-            {}, rebalance_date, session.db_path, currency, risk_free_rate, lookback_months
+            {},
+            rebalance_date,
+            session.db_path,
+            currency,
+            risk_free_rate,
+            lookback_months,
+            effective_min_months(lookback_months),
         )
 
     try:
@@ -821,6 +830,7 @@ def _holdings_stats_excluding(
         currency,
         risk_free_rate,
         lookback_months,
+        effective_min_months(lookback_months),
         dividends_per_share=dividends_per_share,
         dividend_unavailable=dividend_unavailable,
         dividend_yields=dividend_yields,
@@ -1091,6 +1101,7 @@ def compute_weights_and_allocation(
             candidates,
             as_of=rebalance_date,
             lookback_months=lookback_months,
+            min_months=effective_min_months(lookback_months),
             db_path=db_path,
         )
 

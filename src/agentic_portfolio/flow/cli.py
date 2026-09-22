@@ -13,7 +13,7 @@ the ones it kept, and whether all of it beat simply holding the market,
 not just the final number of shares. Then
 enters an interactive loop letting the user add/remove candidate tickers,
 change the objective, change MV's target return, or vary the trailing returns
-window from 24 through 60 months; each edit re-runs only
+window from 12 through 60 months; each edit re-runs only
 `compute_weights_and_allocation` (never LLM-S or LLM-F again - the user is
 overriding the agents' already-given recommendation, not asking them to
 reconsider it) and reprints the updated candidates, weights, and
@@ -113,6 +113,8 @@ from agentic_portfolio.optimizer.dividends import (
 from agentic_portfolio.optimizer.holdings import (
     DEFAULT_LOOKBACK_MONTHS,
     HoldingsStats,
+    MIN_LOOKBACK_MONTHS,
+    effective_min_months,
     validate_lookback_months,
 )
 from agentic_portfolio.optimizer.portfolio import DEFAULT_TARGET_ANNUAL_RETURN, PortfolioStats, VALID_OBJECTIVES
@@ -2109,11 +2111,11 @@ def _prompt_lookback_months(current: int) -> int:
     """Read a portfolio returns-window length, keeping `current` on bad input.
 
     This deliberately matches `portfolio-holdings whatif`: both commands
-    offer the same 24-to-60-month experiment, and a rejected answer costs
+    offer the same 12-to-60-month experiment, and a rejected answer costs
     one prompt rather than destroying the valid window already in force.
     """
     raw = input(
-        f"Months of returns to optimize over (24-60, currently {current}): "
+        f"Months of returns to optimize over ({MIN_LOOKBACK_MONTHS}-60, currently {current}): "
     ).strip()
     if not raw:
         return current
@@ -2412,7 +2414,11 @@ def _run_edit_loop(
         # same `BenchmarkStats` the report prints, and re-narrowing the
         # benchmark twice could only ever disagree with itself.
         benchmark_stats = benchmark_stats_for_window(
-            benchmark, stats.returns_window_start, stats.returns_window_end, risk_free_rate
+            benchmark,
+            stats.returns_window_start,
+            stats.returns_window_end,
+            risk_free_rate,
+            min_months=effective_min_months(lookback_months),
         )
         with record_report(
             archive,
