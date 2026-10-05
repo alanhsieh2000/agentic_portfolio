@@ -40,10 +40,10 @@ dollar rate to both. `--risk-free-rate` overrides it for the run and is
 remembered for that currency; it is refused when the command names no single
 currency to remember it against.
 
-`whatif` is the exception to all of the above, and the exception proves the
-rule: it applies hypothetical changes to a portfolio and reports what the
-figures would become, and it saves NOTHING - not the positions, and not a
-`--risk-free-rate`, which every other subcommand remembers.
+`whatif` applies hypothetical changes to a portfolio and reports what the
+figures would become. It never saves those hypothetical positions or a
+`--risk-free-rate`, but like every holdings report it first persists any
+confirmed stock split needed to make the real baseline current.
 
 A hypothetical change is NOT limited to what you already hold. Naming a
 ticker you do not own is the question the loop mainly earns its keep on -
@@ -82,11 +82,12 @@ from agentic_portfolio.config.settings import settings
 from agentic_portfolio.dataset.ticker_currency import DEFAULT_CURRENCY, partition_by_currency
 from agentic_portfolio.flow.cli import (
     format_dividend_delta,
-    format_stale_share_counts,
+    format_split_reconciliation,
     format_holdings_delta,
     holdings_report_facts,
     parse_date,
     print_user_portfolio,
+    reconcile_saved_share_counts,
 )
 from agentic_portfolio.flow.report_archive import ReportArchive, command_line, record_report
 from agentic_portfolio.flow.rate_memory import (
@@ -199,25 +200,39 @@ def _report(currency: str, args) -> None:
     `_remember_rate`'s job, called at most once per invocation.
     """
     resolved = _resolve_rate(currency, args)
-    # Printed before the report because a share count a split has multiplied
-    # makes every figure below uniformly wrong while leaving them
-    # self-consistent, so a caveat underneath would come too late.
-    stale = format_stale_share_counts(
-        args.path, currency, load_portfolio(args.path, currency), args.holdings_cache_path
+    as_of = parse_date(args.date)
+    positions = load_portfolio(args.path, currency)
+    stats = prepare_holdings(
+        positions,
+        currency,
+        as_of,
+        args.db_path,
+        risk_free_rate=resolved.rate,
+        allow_fetch=not args.no_holdings_fetch,
+        cache_path=args.holdings_cache_path,
+        force_refresh=args.refresh_holdings,
     )
-    if stale is not None:
-        print(stale)
-    print_user_portfolio(
-        prepare_holdings(
-            load_portfolio(args.path, currency),
+    # `prepare_holdings` above refreshes the cache first. Reconcile only
+    # afterwards so a split discovered by THIS invocation affects THIS
+    # report rather than the next one.
+    reconciliation = reconcile_saved_share_counts(
+        args.path, currency, as_of, args.holdings_cache_path
+    )
+    notice = format_split_reconciliation(reconciliation, args.path)
+    if notice is not None:
+        print(notice)
+    if reconciliation.adjustments:
+        stats = prepare_holdings(
+            reconciliation.positions,
             currency,
-            parse_date(args.date),
+            as_of,
             args.db_path,
             risk_free_rate=resolved.rate,
-            allow_fetch=not args.no_holdings_fetch,
+            allow_fetch=False,
             cache_path=args.holdings_cache_path,
-            force_refresh=args.refresh_holdings,
-        ),
+        )
+    print_user_portfolio(
+        stats,
         args.path,
         risk_free_rate_origin=resolved.origin,
     )
@@ -402,7 +417,12 @@ def _run_set(args) -> None:
         if ticker in accepted:
             positions[ticker] = shares
 
-    save_portfolio(positions, path=args.path, currency=currency)
+    save_portfolio(
+        positions,
+        path=args.path,
+        currency=currency,
+        updated_tickers=set(accepted),
+    )
 
     recorded = [(t, s) for t, s in pairs if t in accepted and s > 0]
     if recorded:
@@ -422,9 +442,7 @@ WHATIF_PROMPT = (
     "\nWhat if? [s]et shares (any ticker) / [r]emove / [w]indow / [u]ndo all / [f]inish: "
 )
 
-NOT_SAVED = (
-    "Nothing was saved: that was a what-if, and your portfolio is unchanged."
-)
+NOT_SAVED = "Nothing was saved from the what-if: hypothetical positions were discarded."
 
 
 def _whatif_apply(
@@ -502,7 +520,8 @@ def _whatif_window(current: int) -> int:
 def _run_whatif(args) -> None:
     """`whatif`: try hypothetical changes to the saved holdings - including
     adding a ticker you do not own, and including the length of the returns
-    window itself - and see the three figures move, without saving anything.
+    window itself - and see the three figures move, without saving those
+    hypothetical changes.
 
     The window is a change worth trying because it can dominate the answer.
     A holding that fell hard early in the 60-month window and has been
@@ -512,19 +531,19 @@ def _run_whatif(args) -> None:
     one, and the report names the length that was asked for so a chosen
     window is never mistaken for all the data there was.
 
-    The one interactive subcommand, and the one that changes nothing - those
-    two facts are related. Every other subcommand is a single edit that is
+    The one interactive subcommand, and the one that never saves an
+    experiment - those two facts are related. Every other subcommand is a single edit that is
     better expressed as one scriptable line, whereas the point here is to try
     five variations in a row and watch the numbers, which a flag-per-run
     shape would make unbearable: each variation would re-pay the Yahoo
     Finance round trip that `open_holdings_session` pays once.
 
-    Writes no state. Not to `memory/portfolio.json`, and - the easier one to
-    miss - not to `memory/rates.json` either: `--risk-free-rate` works here
-    as a run-only override, useful for asking what a different riskless
-    return would do to the Sharpe ratio, but `_remember_rate` is
-    deliberately not called, because a command whose whole promise is
-    changing nothing must not leave a rate behind.
+    A confirmed stock split may update `memory/portfolio.json` before the
+    baseline is measured; that is maintenance of the real holding, not a
+    what-if edit. The command never writes `memory/rates.json`:
+    `--risk-free-rate` works here as a run-only override, useful for asking
+    what a different riskless return would do to the Sharpe ratio, but
+    `_remember_rate` is deliberately not called.
 
     The one thing it does write is a copy of each report it prints, under
     `--output-dir` (see `src/agentic_portfolio/flow/report_archive.py`), and that is not an
@@ -541,8 +560,8 @@ def _run_whatif(args) -> None:
     Imitates `src/agentic_portfolio/flow/cli.py`'s `_run_edit_loop` throughout: snapshot the
     positions before an edit so a rejected one reverts, `continue` on
     unparseable input keeping what you had, and recompute-then-report. It is
-    strictly simpler than that loop in one respect - there is no persist step
-    to order correctly, because there is no persist step at all.
+    strictly simpler than that loop in one respect - no hypothetical persist
+    step exists after the baseline's corporate-action maintenance.
     """
     currency = _rate_currency_for_report(args)
     if currency is None:
@@ -585,6 +604,13 @@ def _run_whatif(args) -> None:
         cache_path=args.holdings_cache_path,
         force_refresh=args.refresh_holdings,
     ) as session:
+        reconciliation = reconcile_saved_share_counts(
+            args.path, currency, parse_date(args.date), args.holdings_cache_path
+        )
+        notice = format_split_reconciliation(reconciliation, args.path)
+        if notice is not None:
+            print(notice)
+        baseline_positions = reconciliation.positions
         known: dict[str, str] = {}
         window = DEFAULT_LOOKBACK_MONTHS
 
@@ -599,19 +625,8 @@ def _run_whatif(args) -> None:
             return None if window == DEFAULT_LOOKBACK_MONTHS else f"{window} requested"
 
         baseline = measure(baseline_positions)
-        # On the baseline only: the hypothetical variants below are the
-        # user's own inventions, so repeating a warning about the SAVED
-        # counts after every edit would be noise.
-        stale = format_stale_share_counts(
-            args.path, currency, baseline_positions, args.holdings_cache_path
-        )
-        if stale is not None:
-            print(stale)
-        # The stale warning is deliberately OUTSIDE the archived block: it is
-        # a fact about `memory/portfolio.json` and the price cache rather than
-        # about the portfolio's figures, so including it would give the same
-        # holdings two different digests depending on cache state, and the
-        # same baseline would be stored twice across two days.
+        # Corporate-action maintenance is deliberately OUTSIDE the archived
+        # block: it is a fact about the saved record, not the figures.
         with record_report(archive, **holdings_report_facts("baseline", baseline)):
             print_user_portfolio(
                 baseline, args.path, risk_free_rate_origin=origin, window_origin=window_note()
@@ -816,6 +831,7 @@ def _run_remove(args) -> None:
             {t: s for t, s in positions.items() if t not in removed},
             path=args.path,
             currency=currency,
+            updated_tickers=set(),
         )
         print(f"Removed from the {currency} portfolio: {', '.join(removed)}.")
     if missing:
@@ -870,7 +886,7 @@ def main() -> None:
         choices=VALID_COMMANDS,
         help="What to do. Defaults to 'show', so a bare invocation reports every saved portfolio. "
              "'whatif' opens a loop for trying hypothetical changes and seeing the figures move - "
-             "including for a ticker you do not own yet - and saves nothing at all.",
+             "including for a ticker you do not own yet - and never saves hypothetical edits.",
     )
     parser.add_argument(
         "args",

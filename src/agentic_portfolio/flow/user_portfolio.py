@@ -16,15 +16,17 @@ PER CURRENCY rather than one flat list, since prices in two different units
 cannot be weighed against one total:
 
     {"portfolios": {"USD": {"positions": {"SPY": 1000.0, "T": 500.0},
+                            "position_updated_at": {"SPY": "...", "T": "..."},
+                            "applied_splits": {},
                             "updated_at": "..."},
                     "JPY": {"positions": {"1321.T": 50.0},
                             "updated_at": "..."}}}
 
 The top-level key is `"portfolios"`, not `"pools"`, so that a person who
-opens either file can tell at a glance which one they have. There is no
-earlier shape to migrate: this file did not exist before
-`plans/13_user_portfolio.md`, so unlike `candidate_memory.py` there is no
-legacy branch and no migration command.
+opens either file can tell at a glance which one they have. Old entries that
+predate per-ticker split tracking remain readable: their portfolio-level
+`updated_at` is the initial basis for every ticker, and the richer metadata
+is materialized on the next write rather than by a separate migration.
 
 Share counts are floats, not ints, because brokers sell fractional shares.
 A non-positive count is never stored: zero means "retire this holding" (it
@@ -131,13 +133,62 @@ def _load_raw_portfolios(path: str) -> dict[str, dict]:
 
     data = json.loads(file_path.read_text())
     raw = data.get("portfolios", {})
-    return {
-        currency: {
-            "positions": _validate_positions(path, currency, entry.get("positions")),
+    portfolios: dict[str, dict] = {}
+    for currency, entry in raw.items():
+        positions = _validate_positions(path, currency, entry.get("positions"))
+        position_updated_at = entry.get("position_updated_at", {})
+        if not isinstance(position_updated_at, dict):
+            raise ValueError(
+                f"{path!r}'s {currency!r} portfolio has 'position_updated_at' that must be "
+                f"an object, got {position_updated_at!r}"
+            )
+        applied_splits = entry.get("applied_splits", {})
+        if not isinstance(applied_splits, dict):
+            raise ValueError(
+                f"{path!r}'s {currency!r} portfolio has 'applied_splits' that must be an "
+                f"object, got {applied_splits!r}"
+            )
+
+        clean_applied: dict[str, dict[str, float]] = {}
+        for ticker, events in applied_splits.items():
+            normalized = str(ticker).strip().upper()
+            if normalized not in positions:
+                continue
+            if not isinstance(events, dict):
+                raise ValueError(
+                    f"{path!r}'s {currency!r} portfolio has applied splits for {ticker!r} "
+                    f"that must map dates to ratios, got {events!r}"
+                )
+            clean_events: dict[str, float] = {}
+            for event_date, ratio in events.items():
+                try:
+                    date.fromisoformat(str(event_date))
+                    numeric_ratio = float(ratio)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"{path!r}'s {currency!r} portfolio has an invalid applied split "
+                        f"for {ticker!r}: {event_date!r} -> {ratio!r}"
+                    ) from None
+                if not math.isfinite(numeric_ratio) or numeric_ratio <= 0:
+                    raise ValueError(
+                        f"{path!r}'s {currency!r} portfolio has a split ratio for {ticker!r} "
+                        f"that must be finite and positive, got {ratio!r}"
+                    )
+                clean_events[str(event_date)] = numeric_ratio
+            if clean_events:
+                clean_applied[normalized] = clean_events
+
+        portfolios[currency] = {
+            "positions": positions,
             "updated_at": entry.get("updated_at"),
+            "position_updated_at": {
+                str(ticker).strip().upper(): stamp
+                for ticker, stamp in position_updated_at.items()
+                if str(ticker).strip().upper() in positions
+            },
+            "applied_splits": clean_applied,
         }
-        for currency, entry in raw.items()
-    }
+    return portfolios
 
 
 def load_all_portfolios(path: str = DEFAULT_PORTFOLIO_PATH) -> dict[str, dict[str, float]]:
@@ -165,6 +216,9 @@ def portfolio_updated_at(
 ) -> datetime | None:
     """When `currency`'s portfolio at `path` was last written, or `None` when
     it has never been saved or carries no timestamp.
+
+    Retained for callers of the original warning-only split API. Current
+    report reconciliation uses each ticker's `position_updated_at` instead.
 
     `load_portfolio` deliberately returns only the positions, since that is
     all a measurement needs. This exists for the one question the positions
@@ -210,6 +264,23 @@ class StaleShareCount(NamedTuple):
     ex_date: date
 
 
+class SplitAdjustment(NamedTuple):
+    """One saved position changed by one or more newly observed splits."""
+
+    ticker: str
+    before_shares: float
+    after_shares: float
+    events: tuple[tuple[date, float], ...]
+
+
+class SplitReconciliation(NamedTuple):
+    """The corrected positions and an audit trail for one reconciliation."""
+
+    positions: dict[str, float]
+    adjustments: tuple[SplitAdjustment, ...]
+    undated_tickers: tuple[str, ...]
+
+
 def stale_share_counts(
     positions: dict[str, float],
     updated_at: datetime | None,
@@ -218,6 +289,10 @@ def stale_share_counts(
     """Which of `positions` were recorded before a split, as
     `{ticker: StaleShareCount}` - empty in the ordinary case where nothing
     split since the portfolio was written.
+
+    This legacy pure detector remains for compatibility and tests of the old
+    warning calculation. Reports now call `reconcile_portfolio_splits`,
+    which has per-ticker bases and persists confirmed events idempotently.
 
     Why this is needed at all: `memory/portfolio.json` stores raw share
     counts with no split awareness. Record 1,000 shares, have the stock
@@ -241,9 +316,9 @@ def stale_share_counts(
     MISS a stale count but can never invent one, and that asymmetry is
     deliberate: telling somebody to quadruple a holding that is already
     right would be a far worse failure than staying quiet. Per-ticker
-    timestamps would close the gap and are a `memory/portfolio.json` format
-    change, not attempted here. And an absent `updated_at` yields nothing
-    at all, for the same reason - an undated count cannot be judged.
+    timestamps close this gap in the current persistence format, but this
+    compatibility helper accepts only one timestamp. An absent `updated_at`
+    yields nothing at all, for the same reason - an undated count cannot be judged.
 
     Pure, no I/O.
     """
@@ -275,13 +350,137 @@ def stale_share_counts(
     return stale
 
 
+def _parse_timestamp(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _write_portfolios(path: str, portfolios: dict[str, dict]) -> None:
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(json.dumps({"portfolios": portfolios}, indent=2))
+
+
+def reconcile_portfolio_splits(
+    path: str,
+    currency: str,
+    as_of: date,
+    splits: dict[str, "pd.Series"],
+) -> SplitReconciliation:
+    """Apply confirmed splits to a saved portfolio exactly once.
+
+    A ticker's manual basis is its own `position_updated_at`, falling back
+    to the legacy portfolio-level `updated_at`. Split dates after that basis
+    and on or before `as_of` multiply the stored count unless their date is
+    already in `applied_splits`. The manual basis deliberately does not move
+    when this function writes: if an older event arrives from Yahoo late, it
+    still qualifies while already-applied dates remain idempotent.
+
+    Tickers with split history but no trustworthy basis are returned in
+    `undated_tickers` and never guessed. The file is written at most once.
+    """
+    portfolios = _load_raw_portfolios(path)
+    entry = portfolios.get(currency)
+    if not entry or not entry["positions"]:
+        return SplitReconciliation(dict(entry["positions"]) if entry else {}, (), ())
+
+    positions = dict(entry["positions"])
+    bases = dict(entry.get("position_updated_at", {}))
+    applied = {
+        ticker: dict(events) for ticker, events in entry.get("applied_splits", {}).items()
+    }
+    adjustments: list[SplitAdjustment] = []
+    undated: list[str] = []
+
+    for ticker, before in positions.items():
+        series = splits.get(ticker)
+        if series is None or series.empty:
+            continue
+
+        # Yahoo supplies at most one event per date, but multiplying a group
+        # makes the persistence contract deterministic if duplicate rows are
+        # ever present.
+        events_by_date: dict[date, float] = {}
+        for timestamp, raw_ratio in series.items():
+            event_date = pd.Timestamp(timestamp).date()
+            if event_date > as_of:
+                continue
+            ratio = float(raw_ratio)
+            if not math.isfinite(ratio) or ratio <= 0:
+                raise ValueError(
+                    f"split ratio for {ticker} on {event_date} must be finite and positive, "
+                    f"got {raw_ratio!r}"
+                )
+            events_by_date[event_date] = events_by_date.get(event_date, 1.0) * ratio
+
+        if not events_by_date:
+            continue
+        basis_value = bases.get(ticker, entry.get("updated_at"))
+        basis = _parse_timestamp(basis_value)
+        if basis is None:
+            undated.append(ticker)
+            continue
+        # Materialize the legacy fallback without changing its meaning.
+        bases[ticker] = str(basis_value)
+
+        already = applied.setdefault(ticker, {})
+        new_events = tuple(
+            (event_date, ratio)
+            for event_date, ratio in sorted(events_by_date.items())
+            if event_date > basis.date() and event_date.isoformat() not in already
+        )
+        if not new_events:
+            continue
+
+        combined_ratio = math.prod(ratio for _event_date, ratio in new_events)
+        after = float(before) * combined_ratio
+        positions[ticker] = after
+        for event_date, ratio in new_events:
+            already[event_date.isoformat()] = ratio
+        adjustments.append(
+            SplitAdjustment(ticker, float(before), after, new_events)
+        )
+
+    if adjustments:
+        now = datetime.now(timezone.utc).isoformat()
+        portfolios[currency] = {
+            "positions": positions,
+            "position_updated_at": {
+                ticker: bases[ticker] for ticker in positions if ticker in bases
+            },
+            "applied_splits": {
+                ticker: applied[ticker]
+                for ticker in positions
+                if applied.get(ticker)
+            },
+            "updated_at": now,
+        }
+        _write_portfolios(path, portfolios)
+
+    return SplitReconciliation(
+        positions,
+        tuple(adjustments),
+        tuple(sorted(undated)),
+    )
+
+
 def save_portfolio(
     positions: dict[str, float],
     path: str = DEFAULT_PORTFOLIO_PATH,
     currency: str = DEFAULT_CURRENCY,
+    updated_tickers: set[str] | None = None,
 ) -> None:
     """Write `positions` as `currency`'s portfolio at `path`, together with
     the current UTC timestamp, creating `path`'s parent directory if needed.
+
+    `updated_tickers` identifies a partial manual edit. Those tickers get a
+    fresh per-position basis and their applied-split history is cleared;
+    every other ticker preserves both. `None` retains the original whole-
+    snapshot API by treating every surviving ticker as manually updated.
 
     Every other currency already saved at `path` is read first and carried
     over untouched, keeping its own positions AND its own `updated_at`, so
@@ -294,11 +493,35 @@ def save_portfolio(
     leaves the file describing exactly what the caller said.
     """
     portfolios = _load_raw_portfolios(path)
-    portfolios[currency] = {
-        "positions": _validate_positions(path, currency, positions),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    previous = portfolios.get(currency, {})
+    validated = _validate_positions(path, currency, positions)
+    normalized_updated = (
+        set(validated)
+        if updated_tickers is None
+        else {ticker.strip().upper() for ticker in updated_tickers}
+    )
+    now = datetime.now(timezone.utc).isoformat()
 
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(json.dumps({"portfolios": portfolios}, indent=2))
+    previous_bases = previous.get("position_updated_at", {})
+    legacy_basis = previous.get("updated_at")
+    bases = {
+        ticker: previous_bases.get(ticker, legacy_basis)
+        for ticker in validated
+        if previous_bases.get(ticker, legacy_basis)
+    }
+    applied = {
+        ticker: dict(events)
+        for ticker, events in previous.get("applied_splits", {}).items()
+        if ticker in validated
+    }
+    for ticker in normalized_updated & set(validated):
+        bases[ticker] = now
+        applied.pop(ticker, None)
+
+    portfolios[currency] = {
+        "positions": validated,
+        "position_updated_at": bases,
+        "applied_splits": applied,
+        "updated_at": now,
+    }
+    _write_portfolios(path, portfolios)

@@ -743,62 +743,49 @@ def _as_argument(shares: float) -> str:
     return f"{shares:.4f}".rstrip("0").rstrip(".")
 
 
-def format_stale_share_counts(
+def reconcile_saved_share_counts(
     path: str,
     currency: str,
-    positions: dict[str, float],
+    as_of: date,
     db_path: str,
-) -> str | None:
-    """A warning naming every holding whose stored share count predates a
-    split, or `None` when there is nothing to warn about.
-
-    Printed ABOVE the report, because it qualifies every figure below it -
-    the same position the `Portfolio currency` line occupies, and for the
-    same reason. A share count that a split has multiplied leaves the whole
-    report internally consistent and uniformly wrong, so a caveat printed
-    underneath would be read after the numbers it invalidates.
-
-    Never writes anything. The suggested count is `stored * ratio`, which is
-    right only if nothing else changed, and a split is exactly the kind of
-    event around which people also buy and sell - so the command to apply it
-    is printed for the reader to run deliberately rather than executed on
-    their behalf. `memory/portfolio.json` is theirs.
-
-    Reads the timestamp from `path` and the splits from `db_path`, so a
-    database with no `splits` table (or a portfolio with no `updated_at`)
-    yields `None` and changes no existing output.
-    """
+) -> "SplitReconciliation":
+    """Apply cached split events to one saved portfolio and return its audit trail."""
     from agentic_portfolio.dataset.dividends import load_splits_long, split_series_by_ticker
-    from agentic_portfolio.flow.user_portfolio import portfolio_updated_at, stale_share_counts
+    from agentic_portfolio.flow.user_portfolio import (
+        load_portfolio,
+        reconcile_portfolio_splits,
+    )
 
+    positions = load_portfolio(path, currency)
     if not positions:
-        return None
-
-    updated_at = portfolio_updated_at(path, currency)
-    if updated_at is None:
-        return None
+        return reconcile_portfolio_splits(path, currency, as_of, {})
 
     splits = split_series_by_ticker(load_splits_long(sorted(positions), db_path))
-    stale = stale_share_counts(positions, updated_at, splits)
-    if not stale:
+    return reconcile_portfolio_splits(path, currency, as_of, splits)
+
+
+def format_split_reconciliation(reconciliation: "SplitReconciliation", path: str) -> str | None:
+    """Describe automatic split maintenance before figures use the new counts."""
+    if not reconciliation.adjustments and not reconciliation.undated_tickers:
         return None
 
     lines = [""]
-    for ticker in sorted(stale):
-        entry = stale[ticker]
-        lines.append(
-            f"WARNING: {ticker} split {entry.ratio:g}:1 on {entry.ex_date}, after this "
-            f"portfolio was last updated ({updated_at.date()}). The stored "
-            f"{format_share_count(entry.stored_shares)} shares is likely a pre-split count "
-            f"and the position is probably {format_share_count(entry.likely_shares)} now, "
-            f"which would understate every figure below by {entry.ratio:g}x. To confirm it:"
+    for adjustment in reconciliation.adjustments:
+        events = " and ".join(
+            f"{ratio:g}:1 split on {event_date}"
+            for event_date, ratio in adjustment.events
         )
-        # A bare number, NOT `format_share_count`: that adds thousands
-        # separators for readability, and `set 9984.T 4,000` is not a command
-        # anybody can run. A suggestion that has to be edited before it works
-        # is worse than no suggestion.
         lines.append(
-            f"  uv run portfolio-holdings set {ticker} {_as_argument(entry.likely_shares)}"
+            f"Adjusted {adjustment.ticker} from "
+            f"{format_share_count(adjustment.before_shares)} to "
+            f"{format_share_count(adjustment.after_shares)} shares for its {events}; "
+            f"saved to {path}."
+        )
+    if reconciliation.undated_tickers:
+        lines.append(
+            "WARNING: Could not automatically reconcile split history for "
+            f"{', '.join(reconciliation.undated_tickers)} because the saved share count has "
+            "no trustworthy date; set the current count explicitly with portfolio-holdings."
         )
     return "\n".join(lines)
 
@@ -2830,25 +2817,38 @@ def main() -> None:
         # beneath. It costs a fetch, and the reason and the edit prompt are
         # what the reader needs next.
         if not args.no_holdings and produced_report:
-            stale = format_stale_share_counts(
+            saved_positions = load_portfolio(args.holdings_path, currency)
+            saved_holdings = prepare_holdings(
+                saved_positions,
+                currency,
+                rebalance_date,
+                session_db_path,
+                risk_free_rate=args.risk_free_rate,
+                allow_fetch=not args.no_holdings_fetch,
+                cache_path=args.holdings_cache_path,
+                force_refresh=args.refresh_holdings,
+            )
+            reconciliation = reconcile_saved_share_counts(
                 args.holdings_path,
                 currency,
-                load_portfolio(args.holdings_path, currency),
+                rebalance_date,
                 args.holdings_cache_path,
             )
-            if stale is not None:
-                print(stale)
-            print_user_portfolio(
-                prepare_holdings(
-                    load_portfolio(args.holdings_path, currency),
+            notice = format_split_reconciliation(reconciliation, args.holdings_path)
+            if notice is not None:
+                print(notice)
+            if reconciliation.adjustments:
+                saved_holdings = prepare_holdings(
+                    reconciliation.positions,
                     currency,
                     rebalance_date,
                     session_db_path,
                     risk_free_rate=args.risk_free_rate,
-                    allow_fetch=not args.no_holdings_fetch,
+                    allow_fetch=False,
                     cache_path=args.holdings_cache_path,
-                    force_refresh=args.refresh_holdings,
-                ),
+                )
+            print_user_portfolio(
+                saved_holdings,
                 args.holdings_path,
                 risk_free_rate_origin=resolved_rate.origin,
             )

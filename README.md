@@ -169,7 +169,7 @@ Subcommands (positional `command`, default `show`):
 - `show` — report every saved portfolio (default when no subcommand is given).
 - `set TICKER SHARES [TICKER SHARES ...]` — record or update holdings; `SHARES 0` retires a holding. Which per-currency portfolio is edited follows from the ticker itself unless `--currency` is given.
 - `remove TICKER [TICKER ...]` — drop holdings.
-- `whatif` — interactive, saves nothing: `[s]et` shares (any ticker, including ones you don't own) / `[r]emove` / `[w]indow` (12–60 months) / `[u]ndo all` / `[f]inish`. Prints the exact `set` command that would apply the experiment.
+- `whatif` — interactive and never saves hypothetical edits: `[s]et` shares (any ticker, including ones you don't own) / `[r]emove` / `[w]indow` (12–60 months) / `[u]ndo all` / `[f]inish`. Prints the exact `set` command that would apply the experiment. Like every holdings report, it may first save a confirmed stock-split adjustment to the real baseline.
 
 Flags:
 
@@ -227,6 +227,8 @@ The backtest period is from 2020-01-01 to 2024-04-30. There are 2 stages:
 # Live Mode
 
 After we use the Backtest Mode to find effective and efficient values for hyper-paraments and see a promising result, we will be ready to use the Live Mode.
+
+**Stock-split maintenance (current behavior).** Before any saved holdings are reported, the holdings cache is refreshed and confirmed splits effective by the report date are incorporated into `memory/portfolio.json`. Each ticker has its own manual-update timestamp and applied-split dates, so editing another holding cannot hide a split, repeated reports cannot apply one twice, and a split discovered late can still be incorporated. The command announces each before/after count before measuring the corrected portfolio. A legacy or hand-edited count with no trustworthy date is named but never guessed. This behavior supersedes the older warning-only and “whatif writes no position state” wording later in this historical feature narrative: `whatif` still never saves hypothetical edits or a risk-free-rate, but it performs the same real-baseline split maintenance as every other holdings report.
 
 - LLM-S generate scan rules using currently available fundamental data of S&P 500 members and stores them in memory/rules.json, if the file is missing or rules in the file are out of date. The system decides whether LLM-S is needed or not automatically and shows the progress. When the timestamp of the latest rules is in the previous year or even earlier, they are out of date.
 - These LLM-S rules are applied to the current S&P 500 members to generate the candidate set $S$. $S$ should be stored in memory/candidates.json. If the file is missing or $S$ in the file is out of date, the system refreshes them automatically and shows the progress. When the timestamp of the latest $S$ is in the previous season or even earlier, the are out of date. Seasons are defined as 1/1 - 3/31, 4/1 - 6/30, 7/1 - 9/30, 10/1 - 12/31. The system should make a summary for each candidate in $S$ and store this information in memory/S-summary.md. The old memory/S-summary.md will be removed.

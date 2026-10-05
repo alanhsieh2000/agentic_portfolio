@@ -42,7 +42,8 @@ from agentic_portfolio.flow.cli import (
     format_trailing_return_rows,
     print_ticker_summary,
     format_split_restatement,
-    format_stale_share_counts,
+    format_split_reconciliation,
+    reconcile_saved_share_counts,
     main,
     print_weights_and_allocation,
     print_pipeline_result,
@@ -2522,20 +2523,14 @@ def test_print_weights_and_allocation_omits_the_split_line_when_nothing_split():
     assert "CURRENT share basis" not in out
 
 
-def test_format_stale_share_counts_warns_and_prints_a_runnable_command(tmp_path):
-    """The suggested command has to work verbatim: a share count with
-    thousands separators would not parse, so a suggestion that has to be
-    edited first is no suggestion at all.
-    """
+def test_reconcile_saved_share_counts_persists_and_formats_the_adjustment(tmp_path):
     from agentic_portfolio.dataset.dividends import write_dividends_tables, coverage_frame
-    from agentic_portfolio.flow.user_portfolio import save_portfolio
 
     portfolio = str(tmp_path / "p.json")
-    save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
-    # Backdate the save to before the split.
-    raw = json.loads(Path(portfolio).read_text())
-    raw["portfolios"]["JPY"]["updated_at"] = "2025-11-02T00:00:00+00:00"
-    Path(portfolio).write_text(json.dumps(raw))
+    Path(portfolio).write_text(json.dumps({"portfolios": {"JPY": {
+        "positions": {"9984.T": 1000.0},
+        "updated_at": "2025-11-02T00:00:00+00:00",
+    }}}))
 
     db = str(tmp_path / "cache.duckdb")
     write_dividends_tables(
@@ -2547,16 +2542,17 @@ def test_format_stale_share_counts_warns_and_prints_a_runnable_command(tmp_path)
         ),
     )
 
-    warning = format_stale_share_counts(portfolio, "JPY", {"9984.T": 1000.0}, db)
-    assert "9984.T split 4:1 on 2025-12-29" in warning
-    assert "last updated (2025-11-02)" in warning
-    assert "understate every figure below by 4x" in warning
-    assert "uv run portfolio-holdings set 9984.T 4000" in warning
-    assert "4,000 now" in warning  # readable in prose
-    assert "set 9984.T 4,000" not in warning  # but never in the command
+    reconciliation = reconcile_saved_share_counts(
+        portfolio, "JPY", date(2026, 9, 8), db
+    )
+    notice = format_split_reconciliation(reconciliation, portfolio)
+    assert reconciliation.positions == {"9984.T": 4000.0}
+    assert "Adjusted 9984.T from 1,000 to 4,000 shares" in notice
+    assert "4:1 split on 2025-12-29" in notice
+    assert f"saved to {portfolio}" in notice
 
 
-def test_format_stale_share_counts_is_silent_when_the_count_postdates_the_split(tmp_path):
+def test_reconcile_saved_share_counts_is_silent_when_the_count_postdates_the_split(tmp_path):
     from agentic_portfolio.dataset.dividends import write_dividends_tables, coverage_frame
     from agentic_portfolio.flow.user_portfolio import save_portfolio
 
@@ -2572,10 +2568,12 @@ def test_format_stale_share_counts_is_silent_when_the_count_postdates_the_split(
             {"ex_date": pd.to_datetime(["2025-12-29"]), "ticker": ["9984.T"], "ratio": [4.0]}
         ),
     )
-    assert format_stale_share_counts(portfolio, "JPY", {"9984.T": 1000.0}, db) is None
+    reconciliation = reconcile_saved_share_counts(portfolio, "JPY", date(2026, 9, 8), db)
+    assert reconciliation.adjustments == ()
+    assert format_split_reconciliation(reconciliation, portfolio) is None
 
 
-def test_format_stale_share_counts_is_silent_without_a_splits_table(tmp_path):
+def test_reconcile_saved_share_counts_is_silent_without_a_splits_table(tmp_path):
     """A database predating the splits table must change no existing
     output.
     """
@@ -2583,13 +2581,18 @@ def test_format_stale_share_counts_is_silent_without_a_splits_table(tmp_path):
 
     portfolio = str(tmp_path / "p.json")
     save_portfolio({"9984.T": 1000.0}, path=portfolio, currency="JPY")
-    assert format_stale_share_counts(
-        portfolio, "JPY", {"9984.T": 1000.0}, str(tmp_path / "absent.duckdb")
-    ) is None
+    reconciliation = reconcile_saved_share_counts(
+        portfolio, "JPY", date(2026, 9, 8), str(tmp_path / "absent.duckdb")
+    )
+    assert format_split_reconciliation(reconciliation, portfolio) is None
 
 
-def test_format_stale_share_counts_is_silent_for_an_empty_portfolio(tmp_path):
-    assert format_stale_share_counts(str(tmp_path / "p.json"), "JPY", {}, "x.duckdb") is None
+def test_reconcile_saved_share_counts_is_silent_for_an_empty_portfolio(tmp_path):
+    portfolio = str(tmp_path / "p.json")
+    reconciliation = reconcile_saved_share_counts(
+        portfolio, "JPY", date(2026, 9, 8), "x.duckdb"
+    )
+    assert format_split_reconciliation(reconciliation, portfolio) is None
 
 
 # ==========================================================================

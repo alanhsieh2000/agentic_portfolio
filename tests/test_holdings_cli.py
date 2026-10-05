@@ -12,9 +12,11 @@ or the real `memory/portfolio.json`.
 
 from contextlib import contextmanager
 from datetime import date
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import duckdb
 import pytest
 
 from agentic_portfolio.config.settings import settings
@@ -313,6 +315,38 @@ def test_show_with_nothing_saved_still_reports_usd_so_the_hint_is_printed(monkey
     _run(monkeypatch, path, ["show"])
 
     assert [(c, p) for c, p, _ in seen] == [("USD", {})]
+
+
+def test_show_uses_a_split_discovered_by_its_own_cache_refresh(monkeypatch, tmp_path, capsys):
+    """Regression for 8035.T: preparation refreshes first, reconciliation
+    persists 500, and the visible measurement is recomputed from 500 during
+    the same invocation rather than waiting for the next command.
+    """
+    path = tmp_path / "portfolio.json"
+    path.write_text(json.dumps({"portfolios": {"JPY": {
+        "positions": {"8035.T": 100.0},
+        "updated_at": "2026-09-06T05:26:22+00:00",
+    }}}))
+    seen: list[dict[str, float]] = []
+
+    def fake_prepare(positions, currency, rebalance_date, db_path, risk_free_rate=0.02, **kwargs):
+        seen.append(dict(positions))
+        if len(seen) == 1:
+            cache = kwargs["cache_path"]
+            con = duckdb.connect(cache)
+            con.execute("CREATE TABLE splits (ex_date DATE, ticker VARCHAR, ratio DOUBLE)")
+            con.execute("INSERT INTO splits VALUES ('2026-09-29', '8035.T', 5.0)")
+            con.close()
+        return unavailable_holdings(currency, dict(positions), risk_free_rate, "stubbed")
+
+    monkeypatch.setattr("agentic_portfolio.flow.holdings_cli.prepare_holdings", fake_prepare)
+    _run(monkeypatch, path, ["show", "--currency", "JPY", "--date", "2026-10-05"])
+
+    assert seen == [{"8035.T": 100.0}, {"8035.T": 500.0}]
+    assert load_portfolio(str(path), "JPY") == {"8035.T": 500.0}
+    out = capsys.readouterr().out
+    assert "Adjusted 8035.T from 100 to 500 shares" in out
+    assert "5:1 split on 2026-09-29" in out
 
 
 # --- print_user_portfolio ---------------------------------------------------

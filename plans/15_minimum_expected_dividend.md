@@ -1296,3 +1296,14 @@ LLM rule, the scanner branch and the candidate list all still print, and the ses
 open so `[t]` or `[d]` fixes the number against the snapshot already paid for. Verified end to
 end - the reported command now prints its reason and then produces a full report after
 typing `t` and `0.10`, with no refetch, exiting 0; finishing without a correction exits 1.
+
+
+## Revision Note: stale split warnings superseded (2026-10-05)
+
+The 2026-09-08 warning-only policy above is retained as history but is no longer current.
+`plans/22_automatic_split_reconciliation.md` replaces it after a real 8035.T 5:1 split showed
+the cost of leaving a known count stale. Reports now refresh split data first, automatically
+multiply and persist dated share counts exactly once, and measure the corrected positions in
+the same invocation. Per-ticker manual timestamps replace the old currency-wide timestamp,
+so editing an unrelated holding can no longer hide a pending split. `whatif` continues never
+to save hypothetical edits, but may perform this same maintenance on its real baseline.

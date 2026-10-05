@@ -19,6 +19,7 @@ from agentic_portfolio.flow.user_portfolio import (
     load_portfolio,
     save_portfolio,
     portfolio_updated_at,
+    reconcile_portfolio_splits,
     stale_share_counts,
 )
 
@@ -261,3 +262,109 @@ def test_stale_share_counts_flags_only_the_affected_ticker():
         _splits(),
     )
     assert set(stale) == {"9984.T"}
+
+
+# --- automatic split reconciliation ----------------------------------------
+
+
+def test_reconciliation_updates_and_persists_the_reported_8035_position(tmp_path):
+    path = str(tmp_path / "portfolio.json")
+    _write(path, {
+        "portfolios": {
+            "JPY": {
+                "positions": {"9984.T": 1000.0, "8035.T": 100.0},
+                "updated_at": "2026-09-06T05:26:22+00:00",
+            }
+        }
+    })
+
+    result = reconcile_portfolio_splits(
+        path,
+        "JPY",
+        date(2026, 10, 5),
+        {"8035.T": pd.Series([3.0, 5.0], index=pd.to_datetime(["2023-03-30", "2026-09-29"]))},
+    )
+
+    assert result.positions == {"9984.T": 1000.0, "8035.T": 500.0}
+    assert result.adjustments[0].events == ((date(2026, 9, 29), 5.0),)
+    assert load_portfolio(path, "JPY")["8035.T"] == 500.0
+    stored = json.loads(Path(path).read_text())["portfolios"]["JPY"]
+    assert stored["position_updated_at"]["8035.T"] == "2026-09-06T05:26:22+00:00"
+    assert stored["applied_splits"]["8035.T"] == {"2026-09-29": 5.0}
+
+
+def test_reconciliation_is_idempotent_and_can_apply_a_late_older_event(tmp_path):
+    path = str(tmp_path / "portfolio.json")
+    _write(path, {"portfolios": {"USD": {
+        "positions": {"X": 100.0},
+        "updated_at": "2024-01-01T00:00:00+00:00",
+    }}})
+    first = reconcile_portfolio_splits(
+        path, "USD", date(2026, 1, 1),
+        {"X": pd.Series([3.0], index=pd.to_datetime(["2025-06-01"]))},
+    )
+    second = reconcile_portfolio_splits(
+        path, "USD", date(2026, 1, 1),
+        {"X": pd.Series([2.0, 3.0], index=pd.to_datetime(["2024-06-01", "2025-06-01"]))},
+    )
+    third = reconcile_portfolio_splits(
+        path, "USD", date(2026, 1, 1),
+        {"X": pd.Series([2.0, 3.0], index=pd.to_datetime(["2024-06-01", "2025-06-01"]))},
+    )
+
+    assert first.positions["X"] == 300.0
+    assert second.positions["X"] == 600.0
+    assert [event[0] for event in second.adjustments[0].events] == [date(2024, 6, 1)]
+    assert third.adjustments == ()
+    assert third.positions["X"] == 600.0
+
+
+def test_reconciliation_compounds_forward_and_reverse_splits_by_the_report_date(tmp_path):
+    path = str(tmp_path / "portfolio.json")
+    _write(path, {"portfolios": {"USD": {
+        "positions": {"X": 7.5},
+        "updated_at": "2025-01-01T00:00:00+00:00",
+    }}})
+    result = reconcile_portfolio_splits(
+        path, "USD", date(2025, 7, 1),
+        {"X": pd.Series(
+            [2.0, 0.1, 3.0],
+            index=pd.to_datetime(["2025-02-01", "2025-06-01", "2025-08-01"]),
+        )},
+    )
+    assert result.positions["X"] == pytest.approx(1.5)
+    assert len(result.adjustments[0].events) == 2
+
+
+def test_partial_manual_edit_preserves_other_tickers_split_provenance(tmp_path):
+    path = str(tmp_path / "portfolio.json")
+    _write(path, {"portfolios": {"JPY": {
+        "positions": {"8035.T": 500.0, "9984.T": 1000.0},
+        "updated_at": "2026-10-01T00:00:00+00:00",
+        "position_updated_at": {
+            "8035.T": "2026-09-06T00:00:00+00:00",
+            "9984.T": "2026-09-06T00:00:00+00:00",
+        },
+        "applied_splits": {"8035.T": {"2026-09-29": 5.0}},
+    }}})
+
+    save_portfolio(
+        {"8035.T": 500.0, "9984.T": 1200.0}, path=path, currency="JPY",
+        updated_tickers={"9984.T"},
+    )
+    stored = json.loads(Path(path).read_text())["portfolios"]["JPY"]
+    assert stored["position_updated_at"]["8035.T"] == "2026-09-06T00:00:00+00:00"
+    assert stored["applied_splits"]["8035.T"] == {"2026-09-29": 5.0}
+    assert stored["position_updated_at"]["9984.T"] != "2026-09-06T00:00:00+00:00"
+
+
+def test_reconciliation_does_not_guess_when_a_split_count_has_no_date(tmp_path):
+    path = str(tmp_path / "portfolio.json")
+    _write(path, {"portfolios": {"USD": {"positions": {"X": 100.0}}}})
+    result = reconcile_portfolio_splits(
+        path, "USD", date(2026, 1, 1),
+        {"X": pd.Series([2.0], index=pd.to_datetime(["2025-06-01"]))},
+    )
+    assert result.positions == {"X": 100.0}
+    assert result.adjustments == ()
+    assert result.undated_tickers == ("X",)
